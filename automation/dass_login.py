@@ -81,6 +81,65 @@ def login(page) -> None:
     print(f"当前地址：{page.url}")
 
 
+def _click_menu_in_any_frame(page, text: str) -> bool:
+    """Click a menu item whose visible text CONTAINS `text`, searching every
+    frame (the decision-platform menu lives inside an iframe, and labels may be
+    prefixed by an icon glyph like \ue61f). Returns True if clicked."""
+    for fr in page.frames:
+        try:
+            loc = fr.get_by_text(text, exact=False)
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                try:
+                    if el.is_visible():
+                        el.scroll_into_view_if_needed(timeout=2000)
+                        el.click()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _dump_visible_menu(page) -> None:
+    print("  未点中。当前可见的菜单/文字项（供校准）：")
+    seen = set()
+    for fr in page.frames:
+        try:
+            loc = fr.locator("a, li, span, div[role='menuitem']")
+            for i in range(min(loc.count(), 200)):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    t = (el.inner_text() or "").strip().replace("\n", " ")
+                    if t and len(t) <= 24 and t not in seen:
+                        seen.add(t)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    for t in list(seen)[:60]:
+        print(f"    - {t!r}")
+
+
+def navigate_to_fillin(page) -> None:
+    """Auto-navigate: click 『OTA』then『安卓升级状态填报』in the left menu."""
+    print("\n自动导航：点击左侧菜单 OTA ...")
+    if not _click_menu_in_any_frame(page, "OTA"):
+        print("⚠ 未找到 'OTA' 菜单。")
+        _dump_visible_menu(page)
+    page.wait_for_timeout(2000)
+
+    print("点击『安卓升级状态填报』...")
+    if not _click_menu_in_any_frame(page, "安卓升级状态填报"):
+        print("⚠ 未找到『安卓升级状态填报』子项。")
+        _dump_visible_menu(page)
+    # FineReport report loads slowly.
+    page.wait_for_timeout(8000)
+
+
 def inspect_fillin(page) -> None:
     print("\n==================== 页面结构探测 ====================")
     frames = page.frames
@@ -138,17 +197,9 @@ def main() -> int:
             if config.DASS_REPORT_URL:
                 print(f"\n直接打开填报表：{config.DASS_REPORT_URL}")
                 page.goto(config.DASS_REPORT_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(6000)  # FineReport 报表加载较慢
+                page.wait_for_timeout(6000)
             else:
-                print("\n" + "=" * 56)
-                print("请现在在浏览器里手动点进：OTA → 安卓升级状态填报")
-                print("要看到那张带『插入行 / Submit』的填报表格显示出来。")
-                print("脚本将等待 60 秒，请在倒计时内完成导航。")
-                print("=" * 56)
-                if config.HEADED:
-                    for remaining in range(60, 0, -10):
-                        print(f"  还剩 {remaining} 秒... （点进填报表后可继续等待）")
-                        time.sleep(10)
+                navigate_to_fillin(page)
             _shot(page, "fillin_page")
             inspect_fillin(page)
             print("\n✅ 探测完成，请把以上输出和 artifacts/ 截图发回。")
