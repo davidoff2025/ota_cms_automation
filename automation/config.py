@@ -37,3 +37,19 @@ def cms_username() -> str:
 
 def cms_password() -> str:
     return _req("CMS_PASSWORD")
+
+
+# DASS (FineReport fill-in site).
+DASS_LOGIN_URL = get(
+    "DASS_LOGIN_URL",
+    "http://52.24.159.106:8080/dass/ReportServer?op=fs_load&cmd=fs_signin",
+)
+DASS_URL = get("DASS_URL", "http://52.24.159.106:8080/dass/ReportServer?op=fs")
+
+
+def dass_username() -> str:
+    return _req("DASS_USERNAME")
+
+
+def dass_password() -> str:
+    return _req("DASS_PASSWORD")
