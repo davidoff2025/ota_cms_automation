@@ -140,11 +140,15 @@ def main() -> int:
                 page.goto(config.DASS_REPORT_URL, wait_until="domcontentloaded")
                 page.wait_for_timeout(6000)  # FineReport 报表加载较慢
             else:
-                print("\n未配置 DASS_REPORT_URL。请在浏览器里手动进入"
-                      "『OTA → 安卓升级状态填报』页面，并把地址栏 URL 复制给我。")
-                print("40 秒后自动探测当前页面结构...")
+                print("\n" + "=" * 56)
+                print("请现在在浏览器里手动点进：OTA → 安卓升级状态填报")
+                print("要看到那张带『插入行 / Submit』的填报表格显示出来。")
+                print("脚本将等待 60 秒，请在倒计时内完成导航。")
+                print("=" * 56)
                 if config.HEADED:
-                    time.sleep(40)
+                    for remaining in range(60, 0, -10):
+                        print(f"  还剩 {remaining} 秒... （点进填报表后可继续等待）")
+                        time.sleep(10)
             _shot(page, "fillin_page")
             inspect_fillin(page)
             print("\n✅ 探测完成，请把以上输出和 artifacts/ 截图发回。")
