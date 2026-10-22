@@ -82,48 +82,63 @@ def main() -> int:
             print(f"插入后 <td> 数量：{tds_after}（变化 {tds_after - tds_before}）")
             _shot(page, "probe_after_insert")
 
-            # Click the first data cell (row 2). We locate editable cells by the
-            # FineReport editable-cell class; fall back to the 2nd row's cells.
-            print("尝试单击第 2 行第 1 个数据单元格，观察编辑控件 ...")
-            # Common FineReport editable cell containers.
-            candidates = [
-                "td.x-editor-cell", "td[class*='editor']", "td[class*='x-cell']",
-            ]
-            clicked = False
-            for sel in candidates:
-                loc = fr.locator(sel)
-                if loc.count() > 0:
-                    print(f"  找到可编辑单元格选择器：{sel}（{loc.count()} 个）")
-                    loc.first.click()
-                    clicked = True
-                    break
-            if not clicked:
-                # Just click a cell in the body table near the top.
-                body_tds = fr.locator("td")
-                print("  用通用 td 兜底：单击靠前的一个单元格")
-                body_tds.nth(min(60, body_tds.count() - 1)).click()
+            # The report body cells are <td> that carry a value span; the first
+            # data row is the newly inserted blank row near the top. We locate the
+            # grid body table and click a cell, then edit via the SHARED
+            # 'fr-texteditor' floating editor (NOT the read-only sortable-* ones).
+            print("\n定位数据单元格并用 fr-texteditor 填值 ...")
 
-            page.wait_for_timeout(1200)
-            # After clicking, an editor input/textarea usually appears.
-            editors = fr.locator("input:visible, textarea:visible")
-            print(f"单击后可见 input/textarea：{editors.count()}")
-            for i in range(min(editors.count(), 6)):
-                el = editors.nth(i)
+            # FineReport body cells usually live in table.x-table td, and each
+            # editable cell has an inner div. Try to click the cell that currently
+            # shows empty (the inserted row). As a robust approach, click the cell
+            # just below the first visible 记录id value cell.
+            body = fr.locator("table td")
+            print(f"  body td 总数：{body.count()}")
+
+            # Strategy: click a mid-grid cell (data area) and see the editor.
+            target = None
+            for idx in range(body.count()):
                 try:
-                    print(f"  editor[{i}] tag={el.evaluate('e=>e.tagName.toLowerCase()')} "
-                          f"class={el.get_attribute('class')!r} "
-                          f"id={el.get_attribute('id')!r}")
+                    el = body.nth(idx)
+                    if not el.is_visible():
+                        continue
+                    txt = (el.inner_text() or "").strip()
+                    # The inserted blank data row has empty cells; pick the first
+                    # empty, editable-looking body cell after the header area.
+                    if idx > 40 and txt == "":
+                        target = el
+                        print(f"  选中空单元格：index={idx}")
+                        break
                 except Exception:
                     continue
+            if target is None:
+                target = body.nth(min(70, body.count() - 1))
+                print("  未找到空单元格，兜底选一个靠中部的单元格")
 
-            # Try typing a test value into the first visible editor.
-            if editors.count() > 0:
+            target.click()
+            page.wait_for_timeout(800)
+
+            editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
+            vis = None
+            for i in range(editor.count()):
                 try:
-                    editors.first.fill("TESTVALUE")
+                    e = editor.nth(i)
+                    if e.is_visible():
+                        vis = e
+                        break
+                except Exception:
+                    continue
+            if vis is None:
+                print("  ✗ 单击后未出现可见的 fr-texteditor 编辑框。")
+            else:
+                print(f"  ✓ 出现 fr-texteditor 编辑框，class={vis.get_attribute('class')!r}")
+                try:
+                    vis.click()
+                    vis.fill("TEST123")
                     page.keyboard.press("Enter")
-                    print("  已向第一个编辑框输入 'TESTVALUE' 并回车。")
+                    print("  ✓ 已填入 'TEST123' 并回车。请在截图/页面确认值是否进入该单元格。")
                 except Exception as e:
-                    print(f"  输入测试值失败：{e}")
+                    print(f"  ✗ 填值失败：{e}")
             _shot(page, "probe_after_type")
 
             print("\n✅ 预演完成。请把终端输出和 artifacts/probe_* 截图发回。")
