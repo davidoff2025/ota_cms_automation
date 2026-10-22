@@ -113,13 +113,14 @@ def main() -> int:
 
             hb = header.bounding_box()
             print(f"  表头『方案号』位置：{hb}")
-            # Click a point in the same column, one row height below the header.
+            # The inserted blank row sits DIRECTLY below the header row. Click the
+            # same column, just below the header's bottom edge (first data row).
             row_h = hb["height"] if hb else 22
             click_x = hb["x"] + hb["width"] / 2
-            click_y = hb["y"] + row_h * 1.5  # center of the first data row
+            click_y = hb["y"] + hb["height"] + row_h * 0.5  # middle of first row under header
             print(f"  单击数据行坐标：x={click_x:.0f} y={click_y:.0f}")
             page.mouse.click(click_x, click_y)
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(900)
 
             editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
             vis = None
