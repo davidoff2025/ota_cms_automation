@@ -82,23 +82,37 @@ def login(page) -> None:
 
 
 def _click_menu_in_any_frame(page, text: str) -> bool:
-    """Click a menu item whose visible text CONTAINS `text`, searching every
-    frame (the decision-platform menu lives inside an iframe, and labels may be
-    prefixed by an icon glyph like \ue61f). Returns True if clicked."""
+    """Click the menu item that best matches `text`, searching every frame
+    (the menu lives inside an iframe; labels may carry an icon glyph like \ue61f).
+    Prefers the candidate whose trimmed text most closely equals `text` (so 'OTA'
+    does not wrongly match 'Mobile Phone OTA'). Returns True if clicked."""
+    best = None            # (score, element)
     for fr in page.frames:
         try:
             loc = fr.get_by_text(text, exact=False)
             for i in range(loc.count()):
                 el = loc.nth(i)
                 try:
-                    if el.is_visible():
-                        el.scroll_into_view_if_needed(timeout=2000)
-                        el.click()
-                        return True
+                    if not el.is_visible():
+                        continue
+                    raw = (el.inner_text() or "").strip()
+                    # Strip leading icon glyph(s) in the private-use area.
+                    cleaned = "".join(ch for ch in raw if ch < "\ue000" or ch > "\uf8ff").strip()
+                    # score: 0 = exact match (best), else extra-length penalty.
+                    score = 0 if cleaned == text else len(cleaned)
+                    if best is None or score < best[0]:
+                        best = (score, el)
                 except Exception:
                     continue
         except Exception:
             continue
+    if best is not None:
+        try:
+            best[1].scroll_into_view_if_needed(timeout=2000)
+            best[1].click()
+            return True
+        except Exception:
+            return False
     return False
 
 
@@ -125,19 +139,22 @@ def _dump_visible_menu(page) -> None:
 
 
 def navigate_to_fillin(page) -> None:
-    """Auto-navigate: click 『OTA』then『安卓升级状态填报』in the left menu."""
-    print("\n自动导航：点击左侧菜单 OTA ...")
-    if not _click_menu_in_any_frame(page, "OTA"):
-        print("⚠ 未找到 'OTA' 菜单。")
-        _dump_visible_menu(page)
-    page.wait_for_timeout(2000)
-
-    print("点击『安卓升级状态填报』...")
-    if not _click_menu_in_any_frame(page, "安卓升级状态填报"):
-        print("⚠ 未找到『安卓升级状态填报』子项。")
-        _dump_visible_menu(page)
-    # FineReport report loads slowly.
-    page.wait_for_timeout(8000)
+    """Auto-navigate the 3-level left menu:
+    『Android New』(expand) -> 『OTA』(expand) -> 『安卓升级状态填报』(open report).
+    """
+    steps = [
+        ("Android New", 1500),   # top-level group — expand
+        ("OTA", 1500),           # sub-group — expand
+        ("安卓升级状态填报", 9000),  # leaf — opens the fill-in report (slow)
+    ]
+    for text, wait_ms in steps:
+        print(f"\n点击菜单：{text} ...")
+        if _click_menu_in_any_frame(page, text):
+            print(f"  ✓ 已点击 {text}")
+        else:
+            print(f"  ⚠ 未找到菜单项：{text}")
+            _dump_visible_menu(page)
+        page.wait_for_timeout(wait_ms)
 
 
 def inspect_fillin(page) -> None:
