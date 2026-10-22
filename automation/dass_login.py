@@ -84,31 +84,46 @@ def login(page) -> None:
 def inspect_fillin(page) -> None:
     print("\n==================== 页面结构探测 ====================")
     frames = page.frames
-    print(f"iframe 数量（含主框架）：{len(frames)}")
+    print(f"iframe 数量（含所有层级）：{len(frames)}")
     for i, fr in enumerate(frames):
-        print(f"  frame[{i}] name={fr.name!r} url={fr.url[:80]!r}")
+        print(f"  frame[{i}] name={fr.name!r} url={fr.url[:90]!r}")
 
-    # Try to find the fill-in grid and toolbar in each frame.
     for i, fr in enumerate(frames):
         try:
-            btns = fr.locator("button, a, div[role='button']")
+            # Report/fill-in cells: FineReport renders a big <table> of <td>.
+            tds = fr.locator("td")
+            inputs = fr.locator("input, textarea")
+            editors = fr.locator("div.x-table-cell, div[class*='cell'], div[class*='editor']")
+            print(f"\n  frame[{i}] <td>={tds.count()}  input/textarea={inputs.count()}  "
+                  f"cell/editor-div={editors.count()}")
+
+            # Toolbar / action buttons in this frame.
+            btns = fr.locator("button, a, div[role='button'], input[type='button']")
             labels = []
-            for j in range(min(btns.count(), 60)):
+            for j in range(min(btns.count(), 120)):
                 el = btns.nth(j)
                 try:
                     if not el.is_visible():
                         continue
                     t = (el.inner_text() or "").strip().replace("\n", " ")
-                    if t and len(t) <= 20:
+                    if t and len(t) <= 24:
                         labels.append(t)
                 except Exception:
                     continue
             if labels:
-                uniq = list(dict.fromkeys(labels))
-                print(f"\n  frame[{i}] 可见按钮/链接：{uniq[:40]}")
-            # FineReport fill-in cells are usually <td> inside a report table.
-            tds = fr.locator("td")
-            print(f"  frame[{i}] <td> 数量：{tds.count()}")
+                print(f"  frame[{i}] 按钮：{list(dict.fromkeys(labels))[:40]}")
+
+            # If this frame has a real grid, print the first row's cell texts to
+            # help map columns.
+            if tds.count() > 20:
+                sample = []
+                for j in range(min(tds.count(), 40)):
+                    try:
+                        t = (tds.nth(j).inner_text() or "").strip().replace("\n", " ")
+                        sample.append(t[:16])
+                    except Exception:
+                        continue
+                print(f"  frame[{i}] 前若干单元格文本：{sample}")
         except Exception as e:
             print(f"  frame[{i}] 探测失败：{e}")
 
@@ -120,10 +135,16 @@ def main() -> int:
         page = context.new_page()
         try:
             login(page)
-            print("\n请在浏览器里手动进入『OTA → 安卓升级状态填报』页面（如未自动到达）。")
-            print("40 秒后自动探测当前页面结构...")
-            if config.HEADED:
-                time.sleep(40)
+            if config.DASS_REPORT_URL:
+                print(f"\n直接打开填报表：{config.DASS_REPORT_URL}")
+                page.goto(config.DASS_REPORT_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(6000)  # FineReport 报表加载较慢
+            else:
+                print("\n未配置 DASS_REPORT_URL。请在浏览器里手动进入"
+                      "『OTA → 安卓升级状态填报』页面，并把地址栏 URL 复制给我。")
+                print("40 秒后自动探测当前页面结构...")
+                if config.HEADED:
+                    time.sleep(40)
             _shot(page, "fillin_page")
             inspect_fillin(page)
             print("\n✅ 探测完成，请把以上输出和 artifacts/ 截图发回。")

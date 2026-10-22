@@ -45,6 +45,9 @@ DASS_LOGIN_URL = get(
     "http://52.24.159.106:8080/dass/ReportServer?op=fs_load&cmd=fs_signin",
 )
 DASS_URL = get("DASS_URL", "http://52.24.159.106:8080/dass/ReportServer?op=fs")
+# The exact URL of the "安卓升级状态填报" report (copy it from the address bar
+# after opening that report). When set, the inspector opens it directly.
+DASS_REPORT_URL = get("DASS_REPORT_URL", "")
 
 
 def dass_username() -> str:
