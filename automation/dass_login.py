@@ -203,6 +203,36 @@ def inspect_fillin(page) -> None:
         except Exception as e:
             print(f"  frame[{i}] 探测失败：{e}")
 
+    # Specifically hunt for the 『插入行』button (the only way to add rows).
+    print("\n---- 查找『插入行』按钮 ----")
+    for i, fr in enumerate(frames):
+        try:
+            for sel in ("text=插入行", "*:has-text('插入行')"):
+                loc = fr.locator(sel)
+                cnt = loc.count()
+                if cnt:
+                    # Report the smallest (leaf) matches.
+                    shown = 0
+                    for j in range(cnt):
+                        el = loc.nth(j)
+                        try:
+                            if not el.is_visible():
+                                continue
+                            t = (el.inner_text() or "").strip().replace("\n", " ")
+                            if t == "插入行" or (len(t) <= 8 and "插入行" in t):
+                                tag = el.evaluate("e=>e.tagName.toLowerCase()")
+                                cls = el.get_attribute("class") or ""
+                                print(f"  frame[{i}] <{tag}> class={cls[:50]!r} text={t!r}")
+                                shown += 1
+                                if shown >= 3:
+                                    break
+                        except Exception:
+                            continue
+                    if shown:
+                        break
+        except Exception:
+            continue
+
 
 def main() -> int:
     with sync_playwright() as p:
@@ -211,12 +241,21 @@ def main() -> int:
         page = context.new_page()
         try:
             login(page)
-            if config.DASS_REPORT_URL:
-                print(f"\n直接打开填报表：{config.DASS_REPORT_URL}")
-                page.goto(config.DASS_REPORT_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(6000)
-            else:
+            # Try auto-navigation first; it's fine if it doesn't fully work —
+            # you then have time to finish manually during the wait below.
+            try:
                 navigate_to_fillin(page)
+            except Exception as e:
+                print(f"  自动导航出错（忽略，改为手动）：{e}")
+
+            print("\n" + "=" * 60)
+            print("请确认『安卓升级状态填报』表格已显示；并把表格横向滚动到最右，")
+            print("让每行末尾的『插入行』按钮露出来。脚本将等待 90 秒后探测结构。")
+            print("=" * 60)
+            if config.HEADED:
+                for remaining in range(90, 0, -15):
+                    print(f"  还剩 {remaining} 秒...")
+                    time.sleep(15)
             _shot(page, "fillin_page")
             inspect_fillin(page)
             print("\n✅ 探测完成，请把以上输出和 artifacts/ 截图发回。")
