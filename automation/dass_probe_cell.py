@@ -82,40 +82,43 @@ def main() -> int:
             print(f"插入后 <td> 数量：{tds_after}（变化 {tds_after - tds_before}）")
             _shot(page, "probe_after_insert")
 
-            # The report body cells are <td> that carry a value span; the first
-            # data row is the newly inserted blank row near the top. We locate the
-            # grid body table and click a cell, then edit via the SHARED
-            # 'fr-texteditor' floating editor (NOT the read-only sortable-* ones).
-            print("\n定位数据单元格并用 fr-texteditor 填值 ...")
+            # IMPORTANT: the page has TWO areas — an upper query/filter strip
+            # (大区域/方案号/... search boxes) and the lower fill-in GRID. Both use
+            # fr-texteditor, so we must target the GRID only. We anchor on the
+            # grid HEADER cell '方案号', get its geometry, then click the cell in
+            # the SAME column, ONE data row below the header (the inserted blank
+            # row). This never hits the upper filter boxes.
+            print("\n用表头『方案号』锚定填报网格，定位其下方的数据单元格 ...")
 
-            # FineReport body cells usually live in table.x-table td, and each
-            # editable cell has an inner div. Try to click the cell that currently
-            # shows empty (the inserted row). As a robust approach, click the cell
-            # just below the first visible 记录id value cell.
-            body = fr.locator("table td")
-            print(f"  body td 总数：{body.count()}")
-
-            # Strategy: click a mid-grid cell (data area) and see the editor.
-            target = None
-            for idx in range(body.count()):
+            # Find the grid header cell whose exact text is 方案号 and is NOT a
+            # filter label (filter labels end with '：').
+            header = None
+            cells = fr.locator("td")
+            for idx in range(cells.count()):
                 try:
-                    el = body.nth(idx)
+                    el = cells.nth(idx)
                     if not el.is_visible():
                         continue
-                    txt = (el.inner_text() or "").strip()
-                    # The inserted blank data row has empty cells; pick the first
-                    # empty, editable-looking body cell after the header area.
-                    if idx > 40 and txt == "":
-                        target = el
-                        print(f"  选中空单元格：index={idx}")
+                    t = (el.inner_text() or "").strip()
+                    if t == "方案号":  # grid header (filter label is '方案号：')
+                        header = el
+                        print(f"  找到表头『方案号』：td index={idx}")
                         break
                 except Exception:
                     continue
-            if target is None:
-                target = body.nth(min(70, body.count() - 1))
-                print("  未找到空单元格，兜底选一个靠中部的单元格")
+            if header is None:
+                print("  ✗ 未找到表头『方案号』，无法安全定位网格。")
+                _shot(page, "probe_no_header")
+                raise SystemExit(0)
 
-            target.click()
+            hb = header.bounding_box()
+            print(f"  表头『方案号』位置：{hb}")
+            # Click a point in the same column, one row height below the header.
+            row_h = hb["height"] if hb else 22
+            click_x = hb["x"] + hb["width"] / 2
+            click_y = hb["y"] + row_h * 1.5  # center of the first data row
+            print(f"  单击数据行坐标：x={click_x:.0f} y={click_y:.0f}")
+            page.mouse.click(click_x, click_y)
             page.wait_for_timeout(800)
 
             editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
