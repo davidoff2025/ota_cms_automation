@@ -36,6 +36,26 @@ EXCEL_TO_DASS = {
     "升级日期": "当前阶段时间",   # tentative — confirm
 }
 
+# How a Excel "区域组" value maps to DASS 大区域 / 国家. Extend as needed.
+# Confirmed rule: 区域组=全球 -> 国家=全球 (and 大区域=全球).
+REGION_TO_DASS = {
+    "全球": {"大区域": "全球", "国家": "全球"},
+}
+
+
+def map_region(region_group: str) -> dict:
+    """Split a 区域组 value into DASS 大区域 / 国家.
+
+    Known values use REGION_TO_DASS; unknown non-empty values default to filling
+    国家 with the raw value and leaving 大区域 blank (so nothing is silently lost).
+    """
+    rg = str(region_group or "").strip()
+    if not rg:
+        return {"大区域": "", "国家": ""}
+    if rg in REGION_TO_DASS:
+        return dict(REGION_TO_DASS[rg])
+    return {"大区域": "", "国家": rg}
+
 
 def read_updated_excel(path: str, sheet_name: str = "升级规则") -> list[dict]:
     """Return a list of DASS records (one per data row).
@@ -62,6 +82,14 @@ def read_updated_excel(path: str, sheet_name: str = "升级规则") -> list[dict
             if idx is not None and idx < len(row):
                 val = row[idx]
                 rec[dass_col] = "" if val is None else str(val).strip()
+
+        # 区域组 -> 大区域 / 国家 (confirmed rule).
+        rg_idx = col_index.get("区域组")
+        region_group = "" if rg_idx is None or rg_idx >= len(row) else (row[rg_idx] or "")
+        region = map_region(region_group)
+        rec["大区域"] = region["大区域"]
+        rec["国家"] = region["国家"]
+
         records.append(rec)
     wb.close()
     return records
