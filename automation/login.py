@@ -38,24 +38,44 @@ def login(page) -> None:
     page.goto(config.CMS_LOGIN_URL, wait_until="domcontentloaded")
     _shot(page, "login_page")
 
-    # Locate fields by placeholder (robust to id/class changes). Fall back to
-    # positional inputs if placeholders differ.
-    user = page.get_by_placeholder("User name")
-    pwd = page.get_by_placeholder("Password")
-    if user.count() == 0:
-        user = page.locator("input[type='text'], input:not([type])").first
-    if pwd.count() == 0:
-        pwd = page.locator("input[type='password']").first
+    # The page may render duplicate inputs (same id), so always target the first
+    # VISIBLE match. Prefer stable ids seen on the page (#username / #password),
+    # fall back to placeholder, then to generic input types.
+    def first_visible(*locators):
+        for loc in locators:
+            n = loc.count()
+            for i in range(n):
+                item = loc.nth(i)
+                try:
+                    if item.is_visible():
+                        return item
+                except Exception:
+                    continue
+        # Nothing visible — just return the first of the first locator.
+        return locators[0].first
+
+    user = first_visible(
+        page.locator("#username"),
+        page.get_by_placeholder("User name"),
+        page.locator("input[type='text'], input:not([type])"),
+    )
+    pwd = first_visible(
+        page.locator("#password"),
+        page.get_by_placeholder("Password"),
+        page.locator("input[type='password']"),
+    )
 
     user.fill(config.cms_username())
     pwd.fill(config.cms_password())
     print("已填入用户名/密码。")
 
-    # Click the confirm button (by visible text, case-insensitive).
-    btn = page.get_by_role("button", name="confirm")
-    if btn.count() == 0:
-        btn = page.get_by_text("confirm", exact=False)
-    btn.first.click()
+    # Click the confirm button (first visible match by role/text).
+    btn = first_visible(
+        page.get_by_role("button", name="confirm"),
+        page.get_by_text("confirm", exact=False),
+        page.locator("button"),
+    )
+    btn.click()
     print("已点击 confirm，等待登录完成...")
 
     # Wait for navigation away from the login page.
