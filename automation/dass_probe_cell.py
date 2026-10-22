@@ -82,65 +82,80 @@ def main() -> int:
             print(f"插入后 <td> 数量：{tds_after}（变化 {tds_after - tds_before}）")
             _shot(page, "probe_after_insert")
 
-            # IMPORTANT: the page has TWO areas — an upper query/filter strip
-            # (大区域/方案号/... search boxes) and the lower fill-in GRID. Both use
-            # fr-texteditor, so we must target the GRID only. We anchor on the
-            # grid HEADER cell '方案号', get its geometry, then click the cell in
-            # the SAME column, ONE data row below the header (the inserted blank
-            # row). This never hits the upper filter boxes.
-            print("\n用表头『方案号』锚定填报网格，定位其下方的数据单元格 ...")
+            # Locate the DATA cell purely via DOM table geometry (no screen
+            # coordinates, which kept hitting the upper filter boxes).
+            #
+            # The fill-in grid is a <table>. Find the header row that contains a
+            # <td> whose text is EXACTLY '方案号' (the grid header; the filter
+            # label is '方案号：'). Then take that same column index in the NEXT
+            # table row — that's the first data cell (the inserted blank row).
+            print("\n用 DOM 行列关系定位填报网格数据单元格（列=方案号，行=表头下一行）...")
 
-            # Find the grid header cell whose exact text is 方案号 and is NOT a
-            # filter label (filter labels end with '：').
-            header = None
-            cells = fr.locator("td")
-            for idx in range(cells.count()):
-                try:
-                    el = cells.nth(idx)
-                    if not el.is_visible():
-                        continue
-                    t = (el.inner_text() or "").strip()
-                    if t == "方案号":  # grid header (filter label is '方案号：')
-                        header = el
-                        print(f"  找到表头『方案号』：td index={idx}")
-                        break
-                except Exception:
-                    continue
-            if header is None:
-                print("  ✗ 未找到表头『方案号』，无法安全定位网格。")
-                _shot(page, "probe_no_header")
+            handle = fr.evaluate_handle(
+                """() => {
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    for (const tbl of tables) {
+                        const rows = Array.from(tbl.rows);
+                        for (let r = 0; r < rows.length; r++) {
+                            const cells = Array.from(rows[r].cells);
+                            const ci = cells.findIndex(c => (c.innerText||'').trim() === '方案号');
+                            if (ci >= 0 && r + 1 < rows.length) {
+                                const dataRow = rows[r + 1];
+                                if (dataRow.cells[ci]) return dataRow.cells[ci];
+                            }
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            cell = handle.as_element()
+            if cell is None:
+                print("  ✗ 未能在任何 <table> 中找到『方案号』表头+数据行。")
+                _shot(page, "probe_no_grid_cell")
                 raise SystemExit(0)
-
-            hb = header.bounding_box()
-            print(f"  表头『方案号』位置：{hb}")
-            # The inserted blank row sits DIRECTLY below the header row. Click the
-            # same column, just below the header's bottom edge (first data row).
-            row_h = hb["height"] if hb else 22
-            click_x = hb["x"] + hb["width"] / 2
-            click_y = hb["y"] + hb["height"] + row_h * 0.5  # middle of first row under header
-            print(f"  单击数据行坐标：x={click_x:.0f} y={click_y:.0f}")
-            page.mouse.click(click_x, click_y)
+            try:
+                print(f"  命中数据单元格，文本={cell.inner_text()!r}")
+            except Exception:
+                pass
+            cell.scroll_into_view_if_needed()
+            cell.click()
             page.wait_for_timeout(900)
 
+            # Pick the fr-texteditor that overlaps the clicked grid cell (so we
+            # never type into an upper filter box).
+            cb = cell.bounding_box()
             editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
             vis = None
             for i in range(editor.count()):
                 try:
                     e = editor.nth(i)
-                    if e.is_visible():
+                    if not e.is_visible():
+                        continue
+                    eb = e.bounding_box()
+                    if cb and eb and abs(eb["y"] - cb["y"]) < 30 and abs(eb["x"] - cb["x"]) < 200:
                         vis = e
                         break
                 except Exception:
                     continue
+            if vis is None:  # fallback: first visible editor
+                for i in range(editor.count()):
+                    e = editor.nth(i)
+                    try:
+                        if e.is_visible():
+                            vis = e
+                            break
+                    except Exception:
+                        continue
+
             if vis is None:
                 print("  ✗ 单击后未出现可见的 fr-texteditor 编辑框。")
             else:
-                print(f"  ✓ 出现 fr-texteditor 编辑框，class={vis.get_attribute('class')!r}")
+                eb = vis.bounding_box()
+                print(f"  ✓ 出现 fr-texteditor 编辑框，位置={eb}（单元格位置={cb}）")
                 try:
-                    vis.click()
                     vis.fill("TEST123")
                     page.keyboard.press("Enter")
-                    print("  ✓ 已填入 'TEST123' 并回车。请在截图/页面确认值是否进入该单元格。")
+                    print("  ✓ 已填入 'TEST123' 并回车。请确认值进入了表格『方案号』列的数据行。")
                 except Exception as e:
                     print(f"  ✗ 填值失败：{e}")
             _shot(page, "probe_after_type")
