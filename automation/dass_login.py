@@ -239,6 +239,15 @@ def main() -> int:
         browser = p.chromium.launch(headless=not config.HEADED)
         context = browser.new_context()
         page = context.new_page()
+
+        # FineReport's 『插入行』shows a JS prompt ("请输入插入行数"). Playwright
+        # auto-dismisses dialogs by default, which cancels it. Log it instead so
+        # it stays visible / doesn't disrupt your manual exploration.
+        def _on_dialog(dialog):
+            print(f"  [对话框] type={dialog.type} message={dialog.message!r}")
+            # Do NOT dismiss automatically during inspection — leave it be.
+        page.on("dialog", _on_dialog)
+
         try:
             login(page)
             # Try auto-navigation first; it's fine if it doesn't fully work —
@@ -259,8 +268,14 @@ def main() -> int:
             _shot(page, "fillin_page")
             inspect_fillin(page)
             print("\n✅ 探测完成，请把以上输出和 artifacts/ 截图发回。")
+            # Keep the browser OPEN so you can keep exploring (e.g. click 插入行,
+            # type a row count, see the dialog). It closes only when you press
+            # Enter here in the terminal.
             if config.HEADED:
-                time.sleep(10)
+                try:
+                    input("\n浏览器保持打开。查看完毕后，回到此终端按回车键关闭... ")
+                except EOFError:
+                    time.sleep(120)
             return 0
         except Exception as e:
             print(f"✗ 出错：{e}")
