@@ -1,0 +1,5 @@
+config/.env
+artifacts/
+.venv/
+__pycache__/
+*.pyc
