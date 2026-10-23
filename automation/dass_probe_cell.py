@@ -91,14 +91,11 @@ def main() -> int:
             # table row — that's the first data cell (the inserted blank row).
             print("\n用 DOM 行列关系定位填报网格数据单元格（列=方案号，行=表头下一行）...")
 
-            # FineReport frozen fill-in: header and data are SEPARATE tables with
-            # class 'x-table', both 32 columns. Find the header table (contains
-            # '方案号') and the data table (the x-table with the most rows), match
-            # by column index, and return the first data row's cell in that column.
-            handle = fr.evaluate_handle(
+            # Dump the data table's rows (col of 方案号) so we can see WHICH row is
+            # the editable blank one (inserted). Also return the 方案号 column index.
+            info = fr.evaluate(
                 """() => {
                     const xts = Array.from(document.querySelectorAll('table.x-table'));
-                    // header table: the x-table whose row 0 contains a cell '方案号'
                     let headerTbl=null, colIndex=-1;
                     for (const t of xts) {
                         if (!t.rows.length) continue;
@@ -106,30 +103,36 @@ def main() -> int:
                         const ci = cells.findIndex(c => (c.innerText||'').trim()==='方案号');
                         if (ci >= 0) { headerTbl=t; colIndex=ci; break; }
                     }
-                    if (!headerTbl) return null;
-                    // data table: the x-table with the most rows (excludes header)
                     let dataTbl=null, maxRows=-1;
                     for (const t of xts) {
                         if (t === headerTbl) continue;
                         if (t.rows.length > maxRows) { maxRows=t.rows.length; dataTbl=t; }
                     }
-                    if (!dataTbl || !dataTbl.rows.length) return null;
-                    const cell = dataTbl.rows[0].cells[colIndex];
-                    return cell || null;
+                    const rows = [];
+                    if (dataTbl) {
+                        for (let r=0; r<dataTbl.rows.length; r++){
+                            const c = dataTbl.rows[r].cells[colIndex];
+                            const rect = c ? c.getBoundingClientRect() : null;
+                            rows.push({r, id: c? c.id : '', text: c? (c.innerText||'').trim() : '(no cell)',
+                                       y: rect? Math.round(rect.y): null, x: rect? Math.round(rect.x): null});
+                        }
+                    }
+                    return {colIndex, rowCount: dataTbl? dataTbl.rows.length : 0, rows};
                 }"""
             )
-            cell = handle.as_element()
-            if cell is None:
-                print("  ✗ 未能按 x-table 表头/数据列对齐定位到单元格。")
-                _shot(page, "probe_no_grid_cell")
-                raise SystemExit(0)
-            try:
-                print(f"  命中数据单元格 id={cell.get_attribute('id')!r} 文本={cell.inner_text()!r}")
-            except Exception:
-                pass
-            cell.scroll_into_view_if_needed()
-            cell.click()
-            page.wait_for_timeout(900)
+            print(f"  方案号 列号={info['colIndex']}  数据表行数={info['rowCount']}")
+            print("  数据表『方案号』列各行（找空行=插入行）：")
+            for row in info["rows"][:25]:
+                print(f"    r={row['r']:>2} id={row['id']!r} y={row['y']} 文本={row['text']!r}")
+
+            print("\n  （本次仅转储数据行，未填值。请把以上输出发回，确认哪一行是空的插入行。）")
+            _shot(page, "probe_rows")
+            if config.HEADED:
+                try:
+                    input("\n浏览器保持打开，查看完毕按回车关闭... ")
+                except EOFError:
+                    time.sleep(60)
+            return 0
 
             # Pick the fr-texteditor that overlaps the clicked grid cell (so we
             # never type into an upper filter box).
