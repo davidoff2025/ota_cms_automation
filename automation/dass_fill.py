@@ -318,11 +318,13 @@ def main() -> int:
                         ok_all = False
 
             _shot(page, "fill_done")
-            print(f"\n{'✅' if ok_all else '⚠'} 填写完成（尚未提交）。请在浏览器核对每一行。")
+            print(f"\n{'✅' if ok_all else '⚠'} 填写完成（尚未验证、尚未提交）。")
 
             if config.HEADED:
-                print("\n核对无误后，输入 approve 回车即执行『验证/批复 -> 提交』；")
-                print("输入其他任意内容（或直接回车）则不提交、仅关闭浏览器。")
+                print("\n======== 人工核对环节 ========")
+                print("请先在浏览器里逐行检查刚填入的数据是否正确。")
+                print("确认无误后，输入 approve 回车，脚本才会执行『验证 -> 提交』；")
+                print("若发现问题，输入其它任意内容（或直接回车）即取消，不做任何验证/提交。")
                 try:
                     ans = input("是否批复并提交？[approve/提交 确认，其它取消]：").strip().lower()
                 except EOFError:
