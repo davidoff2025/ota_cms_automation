@@ -16,16 +16,17 @@ from openpyxl import load_workbook
 
 # DASS fill-in table columns (left to right), excluding the auto 记录id column.
 DASS_COLUMNS = [
-    "大区域", "国家", "方案号", "OTA类型", "featurecode", "机型", "设备扩展信息",
-    "品牌", "所有人", "是否展示", "ruleid", "源版本", "目标版本",
+    "大区域", "国家", "方案号", "升级类型", "OTA类型", "featurecode", "机型",
+    "设备扩展信息", "品牌", "所有人", "是否展示", "ruleid", "源版本", "目标版本",
     "当前阶段", "当前阶段时间", "状态", "停止时间", "场测时间", "场测mac", "备注",
     "50", "200", "1,000", "5,000", "10,000", "完全开放",
 ]
 
 # Excel header -> DASS column (direct, confirmed mappings).
+# NOTE: the human-readable 升级方式 (正常升级/强制升级) goes into DASS 升级类型.
 EXCEL_TO_DASS = {
     "设备类型代码": "方案号",
-    "升级方式": "OTA类型",
+    "升级方式": "升级类型",
     "特征码": "featurecode",
     "内部机型信息": "机型",
     "设备扩展信息": "设备扩展信息",

@@ -26,11 +26,17 @@ from . import config
 from .dass_login import login, navigate_to_fillin, _shot
 from .dass_data import read_updated_excel
 
-# 要填写的 DASS 列（其余列：所有人/是否展示/状态/各时间/灰度档位 一律留空）。
+# 要填写的 DASS 列（其余列：OTA类型/所有人/是否展示/状态/各时间/灰度档位 一律留空）。
+# 『升级类型』填 Excel 的『升级方式』文本（正常升级/强制升级）。
 FILL_COLUMNS = [
-    "大区域", "国家", "方案号", "OTA类型", "featurecode", "机型",
+    "大区域", "国家", "方案号", "升级类型", "featurecode", "机型",
     "设备扩展信息", "品牌", "ruleid", "源版本", "目标版本", "当前阶段时间",
 ]
+
+# 若实际表头不叫某个标准名，用这里的候选名去表头里匹配（取第一个存在的）。
+HEADER_ALIASES = {
+    "升级类型": ["升级类型", "OTA类型", "升级方式"],
+}
 
 OTA_V4_OUTPUTS = str(Path.home() / "my_python_project" / "ota_v4" / "data" / "outputs")
 
@@ -195,11 +201,18 @@ def main() -> int:
             if len(rows_n) < n:
                 print(f"⚠ 只找到 {len(rows_n)} 个空行，少于 {n}；按可用的填。")
 
+            def resolve_anchor(col):
+                """Find the column anchor, trying header aliases if needed."""
+                for name in HEADER_ALIASES.get(col, [col]):
+                    if name in anchors:
+                        return anchors[name], name
+                return None, None
+
             ok_all = True
             for rec, row_n in zip(records, rows_n):
                 print(f"\n填写行 D{row_n}：")
                 for col in FILL_COLUMNS:
-                    anchor = anchors.get(col)
+                    anchor, header_name = resolve_anchor(col)
                     if not anchor:
                         continue
                     val = rec.get(col, "")
