@@ -56,27 +56,40 @@ def _report_frame(page):
     return best
 
 
-def read_column_anchors(fr) -> dict:
-    """{表头文字: 列锚}，从表头 x-table 的单元格 id 'D1-0-<锚>' 提取。"""
-    return fr.evaluate(
-        """() => {
+def read_column_anchors(fr, debug: bool = False) -> dict:
+    """{表头文字: 列锚}。表头可能跨多行/多个 table，故扫描所有 x-table 的所有
+    表头单元格（innerText 命中已知列名的），从其 id 'D{行}-{?}-{锚}' 提取 <锚>。
+    debug=True 时返回所有命中单元格的 (文字,id) 以便诊断。
+    """
+    known = ["记录id", "大区域", "国家", "方案号", "OTA类型", "升级类型", "升级方式",
+             "featurecode", "机型", "设备扩展信息", "品牌", "所有人", "ruleid",
+             "源版本", "目标版本", "当前阶段时间"]
+    result = fr.evaluate(
+        """(known) => {
+            const out = {anchors: {}, dump: []};
             const xts = Array.from(document.querySelectorAll('table.x-table'));
-            let headerTbl=null;
             for (const t of xts) {
-                if (!t.rows.length) continue;
-                const texts = Array.from(t.rows[0].cells).map(c => (c.innerText||'').trim());
-                if (texts.includes('方案号')) { headerTbl=t; break; }
+                for (let r = 0; r < Math.min(t.rows.length, 2); r++) {
+                    for (const c of t.rows[r].cells) {
+                        const txt = (c.innerText||'').trim();
+                        if (!txt) continue;
+                        if (known.includes(txt)) {
+                            const m = (c.id||'').match(/^D\\d+-\\d+-(.+)$/);
+                            out.dump.push({txt, id: c.id||''});
+                            if (m && !(txt in out.anchors)) out.anchors[txt] = m[1];
+                        }
+                    }
+                }
             }
-            if (!headerTbl) return {};
-            const map = {};
-            for (const c of headerTbl.rows[0].cells) {
-                const txt = (c.innerText||'').trim();
-                const m = (c.id||'').match(/^D\\d+-\\d+-(.+)$/);
-                if (txt && m) map[txt] = m[1];
-            }
-            return map;
-        }"""
+            return out;
+        }""",
+        known,
     )
+    if debug:
+        print("  表头单元格转储（文字 / id）：")
+        for d in result["dump"]:
+            print(f"    {d['txt']!r:20} id={d['id']!r}")
+    return result["anchors"]
 
 
 def blank_row_numbers(fr, count: int) -> list[int]:
@@ -188,13 +201,19 @@ def main() -> int:
 
             anchors = read_column_anchors(fr)
             print("列锚映射：", {c: anchors.get(c) for c in FILL_COLUMNS})
+            # If more than one target column is missing, dump the header cells so
+            # we can see the real id format of the other columns.
+            missing0 = [c for c in FILL_COLUMNS if c not in anchors
+                        and not any(a in anchors for a in HEADER_ALIASES.get(c, []))]
+            if len(missing0) > 1:
+                print("  多列未读到锚，转储表头单元格 id 以便诊断：")
+                read_column_anchors(fr, debug=True)
             if "方案号" not in anchors:
                 print("✗ 未读到表头列锚，终止。")
                 _shot(page, "fill_no_anchor")
                 return 1
-            missing = [c for c in FILL_COLUMNS if c not in anchors]
-            if missing:
-                print(f"⚠ 以下列在表头未找到，将跳过：{missing}")
+            if missing0:
+                print(f"⚠ 以下列在表头未找到，将跳过：{missing0}")
 
             rows_n = blank_row_numbers(fr, n)
             print(f"空白插入行（D编号）：{rows_n}")
