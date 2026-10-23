@@ -121,12 +121,52 @@ def main() -> int:
                 }"""
             )
             print(f"  方案号 列号={info['colIndex']}  数据表行数={info['rowCount']}")
-            print("  数据表『方案号』列各行（找空行=插入行）：")
-            for row in info["rows"][:25]:
-                print(f"    r={row['r']:>2} id={row['id']!r} y={row['y']} 文本={row['text']!r}")
+            # The inserted blank row is the FIRST data row whose 方案号 is empty
+            # (r=1 / id like D3-...). Pick it by empty text, nearest the top.
+            blank = next((row for row in info["rows"] if row["text"] == ""), None)
+            if blank is None:
+                print("  ✗ 未找到空白插入行。")
+                raise SystemExit(0)
+            cell_id = blank["id"]
+            print(f"  选中空白插入行：r={blank['r']} id={cell_id!r} y={blank['y']}")
 
-            print("\n  （本次仅转储数据行，未填值。请把以上输出发回，确认哪一行是空的插入行。）")
-            _shot(page, "probe_rows")
+            # Click that exact cell by id and fill via the editor that lands on it.
+            cell = fr.locator(f"#{cell_id}")
+            cell.scroll_into_view_if_needed()
+            cb = cell.bounding_box()
+            cell.click()
+            page.wait_for_timeout(900)
+
+            editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
+            vis = None
+            for i in range(editor.count()):
+                try:
+                    e = editor.nth(i)
+                    if not e.is_visible():
+                        continue
+                    eb = e.bounding_box()
+                    if cb and eb and abs(eb["y"] - cb["y"]) < 30:
+                        vis = e
+                        break
+                except Exception:
+                    continue
+            if vis is None:
+                print("  ✗ 点击空行后未出现对位的 fr-texteditor。打印所有可见编辑框位置：")
+                for i in range(editor.count()):
+                    e = editor.nth(i)
+                    try:
+                        if e.is_visible():
+                            print(f"    editor[{i}] box={e.bounding_box()}")
+                    except Exception:
+                        pass
+            else:
+                eb = vis.bounding_box()
+                print(f"  ✓ 对位编辑框 box={eb}（单元格 box={cb}）")
+                vis.fill("TEST123")
+                page.keyboard.press("Enter")
+                print("  ✓ 已向空白插入行『方案号』填入 TEST123 并回车。")
+            _shot(page, "probe_after_type")
+
             if config.HEADED:
                 try:
                     input("\n浏览器保持打开，查看完毕按回车关闭... ")
