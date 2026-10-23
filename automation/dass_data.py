@@ -24,9 +24,13 @@ DASS_COLUMNS = [
 
 # Excel header -> DASS column (direct, confirmed mappings).
 # NOTE: the human-readable 升级方式 (正常升级/强制升级) goes into DASS 升级类型.
+# Some workbooks name columns differently (e.g. 升级模式/时间 instead of
+# 升级方式/升级日期). Multiple Excel headers can map to the same DASS column; the
+# first one found in the sheet wins.
 EXCEL_TO_DASS = {
     "设备类型代码": "方案号",
     "升级方式": "升级类型",
+    "升级模式": "升级类型",       # 别名
     "特征码": "featurecode",
     "内部机型信息": "机型",
     "设备扩展信息": "设备扩展信息",
@@ -34,7 +38,8 @@ EXCEL_TO_DASS = {
     "Rule ID": "ruleid",
     "源版本": "源版本",
     "目标版本": "目标版本",
-    "升级日期": "当前阶段时间",   # tentative — confirm
+    "升级日期": "当前阶段时间",
+    "时间": "当前阶段时间",       # 别名
 }
 
 # How a Excel "区域组" value maps to DASS 大区域 / 国家. Extend as needed.
@@ -83,9 +88,14 @@ def read_updated_excel(path: str, sheet_name: str = "升级规则") -> list[dict
         rec = {c: "" for c in DASS_COLUMNS}
         for excel_col, dass_col in EXCEL_TO_DASS.items():
             idx = col_index.get(excel_col)
-            if idx is not None and idx < len(row):
-                val = row[idx]
-                rec[dass_col] = "" if val is None else str(val).strip()
+            if idx is None or idx >= len(row):
+                continue
+            val = row[idx]
+            val = "" if val is None else str(val).strip()
+            # 别名列：若该 DASS 列已被先前的别名填上非空值，则不要用空值覆盖它。
+            if val == "" and rec[dass_col] != "":
+                continue
+            rec[dass_col] = val
 
         # 区域组 -> 大区域 / 国家 (confirmed rule).
         rg_idx = col_index.get("区域组")
