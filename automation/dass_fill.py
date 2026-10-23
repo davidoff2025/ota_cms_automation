@@ -13,7 +13,8 @@
   行号从 1(表头) 递增（首条数据=2，插入的空行从 3 起），会话锚全表一致、每次会话会变。
   列字母与会话锚都在运行时从表头实时读出。
 - 单元格需【双击】进入编辑态，再 fill + 回车。
-- 本脚本【不点 Submit】，填完截图并暂停，由你人工核对后手动提交。
+- 填完后先截图并暂停，等你在终端输入 approve 才会执行『验证/批复 -> 提交』；
+  输入其它内容则不提交。绝不在未经确认时自动提交。
 """
 from __future__ import annotations
 
@@ -123,6 +124,79 @@ def blank_row_numbers(fr, count: int) -> list[int]:
         }"""
     )
     return [r["n"] for r in rows if r["text"] == "" and r["n"] is not None][:count]
+
+
+def list_toolbar_buttons(fr) -> list[dict]:
+    """列出填报表里可见的按钮（文字 + class），用于定位验证/提交等操作。"""
+    return fr.evaluate(
+        """() => {
+            const out = [];
+            const els = document.querySelectorAll(
+                "button, input[type=button], input[type=submit], .x-button, [class*='fr-btn'], [class*='x-emb']");
+            for (const e of els) {
+                const r = e.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                const txt = (e.innerText || e.value || '').trim();
+                out.push({text: txt, cls: e.className || '', tag: e.tagName.toLowerCase()});
+            }
+            return out;
+        }"""
+    )
+
+
+def _click_button_by_text(fr, page, keywords: list[str], label: str) -> bool:
+    """点击文字包含 keywords 之一的可见按钮。成功返回 True。"""
+    for kw in keywords:
+        loc = fr.locator(
+            "button, input[type=button], input[type=submit], .x-button, "
+            "[class*='fr-btn'], [class*='x-emb']",
+            has_text=kw,
+        )
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.is_visible():
+                    el.scroll_into_view_if_needed(timeout=2000)
+                    el.click()
+                    print(f"  ✓ 已点击『{label}』按钮（匹配 {kw!r}）")
+                    page.wait_for_timeout(1500)
+                    return True
+            except Exception:
+                continue
+    # input[type=submit] 的文字在 value 上，has_text 匹配不到，补一轮 value 匹配
+    for kw in keywords:
+        loc = fr.locator(f"input[type=submit][value*='{kw}'], input[type=button][value*='{kw}']")
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.is_visible():
+                    el.click()
+                    print(f"  ✓ 已点击『{label}』按钮（value 匹配 {kw!r}）")
+                    page.wait_for_timeout(1500)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def approve_and_submit(fr, page) -> bool:
+    """验证/批复 -> 提交。找不到对应按钮时安全返回 False，绝不盲目提交。"""
+    btns = list_toolbar_buttons(fr)
+    print("  当前可见按钮：")
+    for b in btns:
+        print(f"    {b['text']!r:14} <{b['tag']} class={b['cls']!r}>")
+
+    # 1) 验证 / 批复（若存在）
+    _click_button_by_text(fr, page, ["验证", "校验", "批复", "审批", "通过"], "验证/批复")
+
+    # 2) 提交 / Submit
+    submitted = _click_button_by_text(fr, page, ["提交", "Submit", "submit", "保存"], "提交")
+    if not submitted:
+        print("  ✗ 未找到『提交』按钮，未提交。请手动在页面提交。")
+        return False
+    _shot(page, "submitted")
+    print("  ✅ 已提交。")
+    return True
 
 
 def fill_cell(fr, page, row_n: int, letter: str, session: str, value: str) -> bool:
@@ -244,13 +318,34 @@ def main() -> int:
                         ok_all = False
 
             _shot(page, "fill_done")
-            print(f"\n{'✅' if ok_all else '⚠'} 填写完成（未点 Submit）。请在浏览器核对。")
-            print("确认无误后，请在 DASS 页面手动点击 Submit 提交。")
+            print(f"\n{'✅' if ok_all else '⚠'} 填写完成（尚未提交）。请在浏览器核对每一行。")
+
             if config.HEADED:
+                print("\n核对无误后，输入 approve 回车即执行『验证/批复 -> 提交』；")
+                print("输入其他任意内容（或直接回车）则不提交、仅关闭浏览器。")
                 try:
-                    input("\n浏览器保持打开。核对完毕后按回车关闭（不会自动提交）... ")
+                    ans = input("是否批复并提交？[approve/提交 确认，其它取消]：").strip().lower()
                 except EOFError:
-                    time.sleep(120)
+                    ans = ""
+                if ans in ("approve", "提交", "submit", "yes", "y"):
+                    print("\n开始批复并提交 ...")
+                    ok_submit = approve_and_submit(fr, page)
+                    if ok_submit:
+                        print("\n✅ 记录已提交。可在浏览器确认结果。")
+                    else:
+                        print("\n⚠ 未能自动提交，请在浏览器手动完成。")
+                    try:
+                        input("\n按回车关闭浏览器 ... ")
+                    except EOFError:
+                        time.sleep(60)
+                else:
+                    print("已取消提交（未做任何批复/提交操作）。")
+                    try:
+                        input("按回车关闭浏览器 ... ")
+                    except EOFError:
+                        time.sleep(30)
+            else:
+                print("非可见模式（HEADED=0），不进行交互提交；请人工核对后提交。")
             return 0
         except Exception as e:
             print(f"✗ 出错：{e}")
