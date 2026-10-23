@@ -130,42 +130,64 @@ def main() -> int:
             cell_id = blank["id"]
             print(f"  选中空白插入行：r={blank['r']} id={cell_id!r} y={blank['y']}")
 
-            # Click that exact cell by id and fill via the editor that lands on it.
             cell = fr.locator(f"#{cell_id}")
             cell.scroll_into_view_if_needed()
             cb = cell.bounding_box()
-            cell.click()
-            page.wait_for_timeout(900)
+            print(f"  空行单元格 box={cb}")
 
-            editor = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
-            vis = None
-            for i in range(editor.count()):
-                try:
-                    e = editor.nth(i)
-                    if not e.is_visible():
-                        continue
-                    eb = e.bounding_box()
-                    if cb and eb and abs(eb["y"] - cb["y"]) < 30:
-                        vis = e
-                        break
-                except Exception:
-                    continue
-            if vis is None:
-                print("  ✗ 点击空行后未出现对位的 fr-texteditor。打印所有可见编辑框位置：")
-                for i in range(editor.count()):
-                    e = editor.nth(i)
+            def aligned_editor():
+                ed = fr.locator("input.fr-texteditor, textarea.fr-texteditor")
+                for i in range(ed.count()):
                     try:
-                        if e.is_visible():
-                            print(f"    editor[{i}] box={e.bounding_box()}")
+                        e = ed.nth(i)
+                        if not e.is_visible():
+                            continue
+                        eb = e.bounding_box()
+                        if cb and eb and abs(eb["y"] - cb["y"]) < 30 and abs(eb["x"] - cb["x"]) < 250:
+                            return e, eb
                     except Exception:
-                        pass
-            else:
-                eb = vis.bounding_box()
-                print(f"  ✓ 对位编辑框 box={eb}（单元格 box={cb}）")
-                vis.fill("TEST123")
+                        continue
+                return None, None
+
+            # Attempt 1: single click, then check for an aligned editor.
+            cell.click()
+            page.wait_for_timeout(700)
+            ed, eb = aligned_editor()
+            how = "single-click"
+
+            # Attempt 2: double click to enter edit mode (common in FineReport).
+            if ed is None:
+                print("  单击未激活编辑框，尝试双击 ...")
+                cell.dblclick()
+                page.wait_for_timeout(700)
+                ed, eb = aligned_editor()
+                how = "double-click"
+
+            # Attempt 3: click + type directly (cell-selected then keyboard).
+            if ed is None:
+                print("  双击仍无对位编辑框，尝试单击后直接键盘输入 ...")
+                cell.click()
+                page.wait_for_timeout(300)
+                page.keyboard.type("TEST123", delay=40)
+                page.wait_for_timeout(300)
                 page.keyboard.press("Enter")
-                print("  ✓ 已向空白插入行『方案号』填入 TEST123 并回车。")
-            _shot(page, "probe_after_type")
+                how = "keyboard-type"
+                print(f"  （已用键盘直接输入；请看截图确认是否进入 {cell_id} 空行）")
+                _shot(page, "probe_after_type")
+            else:
+                print(f"  ✓ [{how}] 对位编辑框 box={eb}")
+                ed.fill("TEST123")
+                page.keyboard.press("Enter")
+                print(f"  ✓ [{how}] 已向空行『方案号』填入 TEST123。")
+                _shot(page, "probe_after_type")
+
+            # Re-read the cell text to verify the value actually landed.
+            page.wait_for_timeout(500)
+            try:
+                final_text = fr.locator(f"#{cell_id}").inner_text().strip()
+                print(f"  ★ 填后该单元格文本 = {final_text!r}（方式：{how}）")
+            except Exception as e:
+                print(f"  读取填后文本失败：{e}")
 
             if config.HEADED:
                 try:
