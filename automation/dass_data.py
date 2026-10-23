@@ -38,9 +38,12 @@ EXCEL_TO_DASS = {
 }
 
 # How a Excel "区域组" value maps to DASS 大区域 / 国家. Extend as needed.
-# Confirmed rule: 区域组=全球 -> 国家=全球 (and 大区域=全球).
+# Confirmed rules:
+#   区域组=全球   -> 大区域=全球, 国家=全球
+#   区域组=不区分 -> 大区域 与 国家 都留空（不需要填写）
 REGION_TO_DASS = {
     "全球": {"大区域": "全球", "国家": "全球"},
+    "不区分": {"大区域": "", "国家": ""},
 }
 
 
