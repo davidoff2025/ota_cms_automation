@@ -9,8 +9,9 @@
 - 填报表在 URL 含 'entry_report' 的 iframe 内。
 - 『插入行』是 <button class="x-emb-add">，点后弹 JS prompt『请输入插入行数』，自动应答 N。
 - 表头/数据是两张 table.x-table（均 32 列，按列对齐）。
-- 单元格 id = 'D{行}-0-{列锚}'：表头行 D1，首条数据 D2，插入的空行从 D3 起。
-  列锚每次会话都变，故运行时从表头实时读出。
+- 单元格 id = '{列字母}{行号}-0-{会话锚}'：列字母标识列（方案号=D、国家=C…），
+  行号从 1(表头) 递增（首条数据=2，插入的空行从 3 起），会话锚全表一致、每次会话会变。
+  列字母与会话锚都在运行时从表头实时读出。
 - 单元格需【双击】进入编辑态，再 fill + 回车。
 - 本脚本【不点 Submit】，填完截图并暂停，由你人工核对后手动提交。
 """
@@ -56,27 +57,32 @@ def _report_frame(page):
     return best
 
 
-def read_column_anchors(fr, debug: bool = False) -> dict:
-    """{表头文字: 列锚}。表头可能跨多行/多个 table，故扫描所有 x-table 的所有
-    表头单元格（innerText 命中已知列名的），从其 id 'D{行}-{?}-{锚}' 提取 <锚>。
-    debug=True 时返回所有命中单元格的 (文字,id) 以便诊断。
+def read_column_layout(fr, debug: bool = False) -> dict:
+    """解析表头，返回 {col_letters: {列名: 列字母}, session: 会话锚}。
+
+    FineReport 单元格 id 形如 '{列字母}{行号}-0-{会话锚}'，例如：
+      记录id=A1-0-1431  国家=C1-0-1431  方案号=D1-0-1431  OTA类型=E1-0-1431
+      机型=G1-0-1431   ruleid=L1-0-1431  目标版本=N1-0-1431 ...
+    列字母标识列，行号从 1(表头) 递增，会话锚全表一致、每次会话会变。
     """
     known = ["记录id", "大区域", "国家", "方案号", "OTA类型", "升级类型", "升级方式",
              "featurecode", "机型", "设备扩展信息", "品牌", "所有人", "ruleid",
              "源版本", "目标版本", "当前阶段时间"]
     result = fr.evaluate(
         """(known) => {
-            const out = {anchors: {}, dump: []};
+            const out = {letters: {}, session: null, dump: []};
             const xts = Array.from(document.querySelectorAll('table.x-table'));
             for (const t of xts) {
                 for (let r = 0; r < Math.min(t.rows.length, 2); r++) {
                     for (const c of t.rows[r].cells) {
                         const txt = (c.innerText||'').trim();
-                        if (!txt) continue;
-                        if (known.includes(txt)) {
-                            const m = (c.id||'').match(/^D\\d+-\\d+-(.+)$/);
-                            out.dump.push({txt, id: c.id||''});
-                            if (m && !(txt in out.anchors)) out.anchors[txt] = m[1];
+                        if (!txt || !known.includes(txt)) continue;
+                        // id = <letters><rownum>-0-<session>
+                        const m = (c.id||'').match(/^([A-Z]+)\\d+-\\d+-(.+)$/);
+                        out.dump.push({txt, id: c.id||''});
+                        if (m) {
+                            if (!(txt in out.letters)) out.letters[txt] = m[1];
+                            if (out.session === null) out.session = m[2];
                         }
                     }
                 }
@@ -89,7 +95,7 @@ def read_column_anchors(fr, debug: bool = False) -> dict:
         print("  表头单元格转储（文字 / id）：")
         for d in result["dump"]:
             print(f"    {d['txt']!r:20} id={d['id']!r}")
-    return result["anchors"]
+    return {"letters": result["letters"], "session": result["session"]}
 
 
 def blank_row_numbers(fr, count: int) -> list[int]:
@@ -119,11 +125,11 @@ def blank_row_numbers(fr, count: int) -> list[int]:
     return [r["n"] for r in rows if r["text"] == "" and r["n"] is not None][:count]
 
 
-def fill_cell(fr, page, row_n: int, anchor: str, value: str) -> bool:
-    """双击 #D{row_n}-0-{anchor} 进入编辑，填 value，回读校验。"""
+def fill_cell(fr, page, row_n: int, letter: str, session: str, value: str) -> bool:
+    """双击 #{letter}{row_n}-0-{session} 进入编辑，填 value，回读校验。"""
     if value is None or str(value) == "":
         return True
-    cell_id = f"D{row_n}-0-{anchor}"
+    cell_id = f"{letter}{row_n}-0-{session}"
     cell = fr.locator(f"#{cell_id}")
     try:
         cell.scroll_into_view_if_needed(timeout=3000)
@@ -199,45 +205,42 @@ def main() -> int:
             fr.locator("button.x-emb-add", has_text="插入行").first.click()
             page.wait_for_timeout(2500)
 
-            anchors = read_column_anchors(fr)
-            print("列锚映射：", {c: anchors.get(c) for c in FILL_COLUMNS})
-            # If more than one target column is missing, dump the header cells so
-            # we can see the real id format of the other columns.
-            missing0 = [c for c in FILL_COLUMNS if c not in anchors
-                        and not any(a in anchors for a in HEADER_ALIASES.get(c, []))]
-            if len(missing0) > 1:
-                print("  多列未读到锚，转储表头单元格 id 以便诊断：")
-                read_column_anchors(fr, debug=True)
-            if "方案号" not in anchors:
-                print("✗ 未读到表头列锚，终止。")
+            layout = read_column_layout(fr, debug=True)
+            letters, session = layout["letters"], layout["session"]
+            print(f"会话锚：{session}")
+
+            def resolve_letter(col):
+                """把目标列解析到它的列字母；必要时用表头别名回退。"""
+                for name in HEADER_ALIASES.get(col, [col]):
+                    if name in letters:
+                        return letters[name], name
+                return None, None
+
+            print("列字母映射：", {c: resolve_letter(c)[0] for c in FILL_COLUMNS})
+            missing0 = [c for c in FILL_COLUMNS if resolve_letter(c)[0] is None]
+            if session is None or "方案号" not in letters:
+                print("✗ 未读到表头列布局，终止。")
                 _shot(page, "fill_no_anchor")
                 return 1
             if missing0:
                 print(f"⚠ 以下列在表头未找到，将跳过：{missing0}")
 
             rows_n = blank_row_numbers(fr, n)
-            print(f"空白插入行（D编号）：{rows_n}")
+            print(f"空白插入行（行号）：{rows_n}")
             if len(rows_n) < n:
                 print(f"⚠ 只找到 {len(rows_n)} 个空行，少于 {n}；按可用的填。")
 
-            def resolve_anchor(col):
-                """Find the column anchor, trying header aliases if needed."""
-                for name in HEADER_ALIASES.get(col, [col]):
-                    if name in anchors:
-                        return anchors[name], name
-                return None, None
-
             ok_all = True
             for rec, row_n in zip(records, rows_n):
-                print(f"\n填写行 D{row_n}：")
+                print(f"\n填写行 {row_n}：")
                 for col in FILL_COLUMNS:
-                    anchor, header_name = resolve_anchor(col)
-                    if not anchor:
+                    letter, header_name = resolve_letter(col)
+                    if not letter:
                         continue
                     val = rec.get(col, "")
                     if val == "":
                         continue
-                    if not fill_cell(fr, page, row_n, anchor, val):
+                    if not fill_cell(fr, page, row_n, letter, session, val):
                         ok_all = False
 
             _shot(page, "fill_done")
