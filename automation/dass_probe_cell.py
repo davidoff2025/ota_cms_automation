@@ -91,35 +91,46 @@ def main() -> int:
             # table row — that's the first data cell (the inserted blank row).
             print("\n用 DOM 行列关系定位填报网格数据单元格（列=方案号，行=表头下一行）...")
 
-            handle = fr.evaluate_handle(
+            # First, DUMP the grid DOM structure so we understand how FineReport
+            # lays out header vs data (often separate tables / nested layers).
+            info = fr.evaluate(
                 """() => {
+                    const out = {tables: [], hits: []};
                     const tables = Array.from(document.querySelectorAll('table'));
-                    for (const tbl of tables) {
-                        const rows = Array.from(tbl.rows);
-                        for (let r = 0; r < rows.length; r++) {
-                            const cells = Array.from(rows[r].cells);
-                            const ci = cells.findIndex(c => (c.innerText||'').trim() === '方案号');
-                            if (ci >= 0 && r + 1 < rows.length) {
-                                const dataRow = rows[r + 1];
-                                if (dataRow.cells[ci]) return dataRow.cells[ci];
-                            }
+                    tables.forEach((tbl, ti) => {
+                        out.tables.push({ti, rows: tbl.rows.length,
+                                          cols: tbl.rows[0] ? tbl.rows[0].cells.length : 0,
+                                          cls: tbl.className||''});
+                    });
+                    // find any element whose exact text is 方案号
+                    const all = Array.from(document.querySelectorAll('td,th,div,span'));
+                    all.forEach(el => {
+                        const t = (el.innerText||'').trim();
+                        if (t === '方案号') {
+                            out.hits.push({tag: el.tagName, cls: el.className||'',
+                                           id: el.id||'',
+                                           rect: (()=>{const r=el.getBoundingClientRect();return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};})()});
                         }
-                    }
-                    return null;
+                    });
+                    return out;
                 }"""
             )
-            cell = handle.as_element()
-            if cell is None:
-                print("  ✗ 未能在任何 <table> 中找到『方案号』表头+数据行。")
-                _shot(page, "probe_no_grid_cell")
-                raise SystemExit(0)
-            try:
-                print(f"  命中数据单元格，文本={cell.inner_text()!r}")
-            except Exception:
-                pass
-            cell.scroll_into_view_if_needed()
-            cell.click()
-            page.wait_for_timeout(900)
+            print(f"  frame 内 <table> 数量：{len(info['tables'])}")
+            for t in info["tables"][:20]:
+                print(f"    table#{t['ti']} rows={t['rows']} cols={t['cols']} class={t['cls'][:40]!r}")
+            print(f"  文本='方案号' 的元素（{len(info['hits'])} 个）：")
+            for h in info["hits"]:
+                print(f"    <{h['tag']}> class={h['cls'][:40]!r} id={h['id']!r} rect={h['rect']}")
+
+            print("\n  （本次仅转储结构，未填值。请把以上输出和 probe_no_grid_cell 截图发回。）")
+            _shot(page, "probe_structure")
+            # Stop here for this run.
+            if config.HEADED:
+                try:
+                    input("\n浏览器保持打开，查看完毕按回车关闭... ")
+                except EOFError:
+                    time.sleep(60)
+            return 0
 
             # Pick the fr-texteditor that overlaps the clicked grid cell (so we
             # never type into an upper filter box).
