@@ -84,6 +84,16 @@ HEADER_ALIASES = {
 
 OTA_V4_OUTPUTS = str(Path.home() / "my_python_project" / "ota_v4" / "data" / "outputs")
 
+
+def norm_ruleid(value) -> str:
+    """归一化 ruleid 以便两边精确比较。
+
+    DASS 页面把 ruleid 当数字展示，带千分位逗号（如 '65,197'），而 Excel 里是纯数字
+    '65197'。直接字符串比较永远不相等，导致匹配全部落空。这里去掉逗号与首尾空白，
+    使 '65,197' 与 '65197' 归一化为同一个键。不做其它改写（不转 int，避免前导零等语义丢失）。
+    """
+    return str(value or "").replace(",", "").replace("，", "").strip()
+
 # —— 查询(筛选) UI 选择器（来自只读探测 .agents/tasks/probe-findings.md）——
 # 顶部红色标注的过滤框：把方案号/目标版本/设备扩展信息/当前阶段填进去，点绿色『查询』，
 # 查询返回的行即为后续匹配/更新的数据来源（不再扫描默认显示的那十来行）。
@@ -607,9 +617,11 @@ def run_update(fr, page, records, option: str) -> dict:
     # —— 构建 Excel 侧集合与按 ruleid 的记录索引（整批构建一次，不逐行重算）——
     excel_targets = {rec.get("目标版本", "") for rec in records if rec.get("目标版本", "")}
     excel_scheme_nos = {rec.get("方案号", "") for rec in records if rec.get("方案号", "")}
+    # ruleid 统一用 norm_ruleid 归一化（去千分位逗号）后作为键，
+    # 以便与 DASS 页面展示的『65,197』正确对上。
     excel_by_ruleid: dict[str, dict] = {}
     for rec in records:
-        rid = rec.get("ruleid", "")
+        rid = norm_ruleid(rec.get("ruleid", ""))
         if not rid:
             print(f"⚠ 跳过 ruleid 为空的 Excel 记录（无法作为可靠匹配键）：方案号={rec.get('方案号', '')!r}")
             continue
@@ -677,7 +689,7 @@ def run_update(fr, page, records, option: str) -> dict:
                 stats["truncation_warnings"] += 1
 
             for row in rows:
-                rid = row.get("ruleid", "")
+                rid = norm_ruleid(row.get("ruleid", ""))  # 归一化 DASS 侧『65,197』
                 if rid in satisfied_ruleids:
                     print(f"  · 结果行 {row['n']} 的 ruleid={rid!r} 已更新过，跳过。")
                     continue
@@ -714,7 +726,7 @@ def run_update(fr, page, records, option: str) -> dict:
             print(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。")
             stats["truncation_warnings"] += 1
 
-        matches = [r for r in rows if r.get("ruleid", "") == rid]
+        matches = [r for r in rows if norm_ruleid(r.get("ruleid", "")) == rid]
         if len(matches) == 1:
             if _write_row(matches[0]["n"], letters, session, "Stage2", rid):
                 stats["stage2_updated"] += 1
