@@ -34,7 +34,6 @@ OPTION 取值（直接写关键字，不加 --update 前缀）：
 """
 from __future__ import annotations
 
-import argparse
 import sys
 import time
 from datetime import datetime
