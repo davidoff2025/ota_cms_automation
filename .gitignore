@@ -3,3 +3,4 @@ artifacts/
 .venv/
 __pycache__/
 *.pyc
+.agents/
