@@ -9,14 +9,17 @@
 OPTION 取值（直接写关键字，不加 --update 前缀）：
     init    插入 N 行并逐格填入（默认，等同于不传 OPTION）。
     ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
-            数据行已存在，不插入行：用『粗筛批量匹配 + 精准回退』两阶段定位已存在行。
-            Stage1（粗筛）按 方案号 ∈ Excel集合、目标版本 ∈ Excel集合、
-            （递进选项再加）当前阶段 == 上一阶段(PREV_STAGE) 圈出候选行，再用 ruleid
-            确认是否属于本批 Excel（在集合内才更新，不在则不动）。Stage2（回退）对
-            Stage1 未命中的 ruleid，按 方案号+目标版本+设备扩展信息 三字段精确匹配
-            （恰好一行才更新；零行报警跳过；多行歧义跳过不猜）。ota50 无上一阶段，
-            Stage1 不过滤『当前阶段』。命中行更新『当前阶段』『当前阶段时间』（以及
-            ota50 另写『是否展示』=1；ota-all 等其它选项不触碰『是否展示』）。
+            数据行已存在，不插入行：用【查询驱动】的『粗筛批量匹配 + 精选回退』两阶段定位。
+            报表默认只显示有限的一页（显示行数 limit 10），所以不扫描默认显示的行，而是把
+            条件填进顶部红色过滤框（方案号/目标版本/设备扩展信息/当前阶段）、点绿色『查询』，
+            以查询返回的行作为匹配来源。显示行数先设 'limit 50'，若结果数 >=50 升到 100。
+            Stage1（粗筛查询）按 方案号 + 目标版本 +（递进选项再加）当前阶段==上一阶段
+            (PREV_STAGE) 查询，再用 ruleid 确认是否属于本批 Excel（在集合内才更新，不在则
+            不动）；Stage1 不填设备扩展信息。Stage2（精选回退）对 Stage1 未命中的 ruleid，
+            用 方案号+目标版本+设备扩展信息 三字段查询并按 ruleid 定位（恰好一行才更新；
+            零行报警跳过；多行歧义跳过不猜）。ota50 无上一阶段，Stage1 不过滤『当前阶段』。
+            命中行更新『当前阶段』『当前阶段时间』（以及 ota50 另写『是否展示』=1；ota-all
+            等其它选项不触碰『是否展示』）。每次查询后会话锚会变，实现会在查询后重读表头布局。
 
 确认过的机制（见探测过程）：
 - 填报表在 URL 含 'entry_report' 的 iframe 内。
@@ -80,6 +83,134 @@ HEADER_ALIASES = {
 }
 
 OTA_V4_OUTPUTS = str(Path.home() / "my_python_project" / "ota_v4" / "data" / "outputs")
+
+# —— 查询(筛选) UI 选择器（来自只读探测 .agents/tasks/probe-findings.md）——
+# 顶部红色标注的过滤框：把方案号/目标版本/设备扩展信息/当前阶段填进去，点绿色『查询』，
+# 查询返回的行即为后续匹配/更新的数据来源（不再扫描默认显示的那十来行）。
+FILTER_INPUTS = {
+    "方案号": "input[name='PLANCODE']",
+    "目标版本": "input[name='NEXTVERSION']",   # UI 标签显示为『标版本』
+    "设备扩展信息": "input[name='DEVICEMSG']",
+    "当前阶段": "input[name='CURRENTSTAGE']",
+}
+# 其余过滤框（清空用，避免上一次查询的残留条件干扰本次）。
+FILTER_INPUTS_OTHERS = {
+    "大区域": "input[name='REGION']",
+    "国家": "input[name='COUNTRYCODE']",
+    "机型": "input[name='DEVICECODE']",
+    "源版本": "input[name='CURRENTVERSION']",
+}
+# 显示行数输入框：其内容被原样拼进数据集 SQL 的 LIMIT 子句，必须写完整片段
+# 'limit N'（只写数字会报 SQL 语法错误）。见探测结论。
+LIMIT_INPUT = "input[name='LIMIT']"
+# 绿色『查询』按钮（FineReport 自由按钮 div id）。
+QUERY_BUTTON = "#fr-btn-BTNSUBMIT"
+# 粗筛起始显示行数；查询结果数 >= 此值视为可能被截断，升到 LIMIT_MAX 重查。
+LIMIT_START = 50
+LIMIT_MAX = 100
+
+
+def set_display_limit(fr, page, n: int) -> bool:
+    """设置『显示行数』过滤框为完整 SQL 片段 'limit N'（探测确认只写数字会报错）。"""
+    loc = fr.locator(LIMIT_INPUT).first
+    try:
+        loc.scroll_into_view_if_needed(timeout=2000)
+        loc.click()
+        loc.fill("")
+        loc.fill(f"limit {int(n)}")
+        page.wait_for_timeout(150)
+        print(f"  显示行数 已设为 'limit {int(n)}'")
+        return True
+    except Exception as e:
+        print(f"  ✗ 设置显示行数失败（{LIMIT_INPUT}）：{e}")
+        return False
+
+
+def set_filter(fr, page, values: dict) -> None:
+    """按 字段->值 填充顶部过滤框，并清空其它过滤框（避免残留条件干扰）。
+
+    values 只含本次需要的字段（方案号/目标版本/设备扩展信息/当前阶段）；其余 FILTER_INPUTS
+    与 FILTER_INPUTS_OTHERS 一律清空。值为空串的字段也会被清空。
+    """
+    def _set_one(sel: str, val: str) -> None:
+        loc = fr.locator(sel).first
+        try:
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.click()
+            loc.fill("")
+            if val:
+                loc.fill(str(val))
+        except Exception as e:
+            print(f"  ⚠ 过滤框 {sel} 设置失败：{e}")
+
+    for field, sel in FILTER_INPUTS.items():
+        _set_one(sel, values.get(field, ""))
+    # 清空非本次使用的过滤框。
+    for sel in FILTER_INPUTS_OTHERS.values():
+        _set_one(sel, "")
+    shown = {k: v for k, v in values.items() if v}
+    print(f"  过滤条件：{shown}")
+
+
+def click_query(fr, page) -> bool:
+    """点击绿色『查询』按钮并等待网格重绘（显式等待表头重现，超时兜底 sleep）。
+
+    探测确认：查询后网格 detach 重绘、会话锚会变；用 read_column_layout 轮询表头恢复。
+    """
+    loc = fr.locator(QUERY_BUTTON).first
+    try:
+        loc.scroll_into_view_if_needed(timeout=2000)
+        loc.click()
+    except Exception as e:
+        print(f"  ✗ 点击『查询』失败（{QUERY_BUTTON}）：{e}")
+        return False
+    print("  ✓ 已点击『查询』，等待结果网格重绘 ...")
+    waited, step, timeout_ms = 0, 800, 20000
+    while waited < timeout_ms:
+        page.wait_for_timeout(step)
+        waited += step
+        try:
+            lay = read_column_layout(fr, debug=False)
+            if lay.get("session") is not None and "方案号" in lay.get("letters", {}):
+                page.wait_for_timeout(600)  # 略等数据行绘制完成
+                return True
+        except Exception:
+            continue
+    print(f"  ⚠ 等待 {timeout_ms}ms 后网格表头仍未就绪；已兜底继续。")
+    return False
+
+
+def read_query_results(fr) -> tuple[list[dict], dict, str]:
+    """查询后重读表头布局并读取结果行。
+
+    返回 (rows, letters, session)：rows 为 existing_row_info 读到的结果数据行；
+    letters/session 来自查询后重读的 read_column_layout（探测确认查询后会话锚会变，
+    必须重读，再用新的 letters/session 拼单元格 id）。
+    """
+    layout = read_column_layout(fr, debug=False)
+    letters, session = layout["letters"], layout["session"]
+    rows = existing_row_info(fr, letters) if letters.get("方案号") else []
+    return rows, letters, session
+
+
+def _run_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
+    """设 limit=50 -> 填过滤框 -> 查询 -> 读结果；若结果数 >= 50 则升到 100 重查。
+
+    返回 (rows, letters, session)。截断警告在调用方按业务语义处理，这里只负责升档重查。
+    """
+    set_display_limit(fr, page, LIMIT_START)
+    set_filter(fr, page, filters)
+    click_query(fr, page)
+    rows, letters, session = read_query_results(fr)
+    print(f"  查询结果行数（limit {LIMIT_START}）：{len(rows)}")
+    if len(rows) >= LIMIT_START:
+        print(f"  结果数 >= {LIMIT_START}，疑似被截断，升到 'limit {LIMIT_MAX}' 重查 ...")
+        set_display_limit(fr, page, LIMIT_MAX)
+        set_filter(fr, page, filters)
+        click_query(fr, page)
+        rows, letters, session = read_query_results(fr)
+        print(f"  查询结果行数（limit {LIMIT_MAX}）：{len(rows)}")
+    return rows, letters, session
 
 
 def _report_frame(page):
@@ -410,25 +541,55 @@ def run_init(fr, page, records) -> bool:
     return ok_all
 
 
+def _header_guard(letters: dict, option: str, phase: str) -> list[str]:
+    """校验某阶段所需的列字母是否齐备；返回缺失列名列表（空列表=齐备）。
+
+    phase='stage1' 需要 方案号/目标版本/ruleid（+递进选项的 当前阶段）与待写列；
+    phase='stage2' 需要 方案号/目标版本/设备扩展信息/ruleid 与待写列。
+    待写列：当前阶段/当前阶段时间（+ota50 的 是否展示）。两阶段都要能读 ruleid 做确认键。
+    """
+    if phase == "stage1":
+        needed = ["方案号", "目标版本", "ruleid"]
+        if option != "ota50":
+            needed.append("当前阶段")
+    else:  # stage2
+        needed = ["方案号", "目标版本", "设备扩展信息", "ruleid"]
+    write_cols = ["当前阶段", "当前阶段时间"]
+    if option == "ota50":
+        write_cols.append("是否展示")
+    for c in write_cols:
+        if c not in needed:
+            needed.append(c)
+    return [c for c in needed if c not in letters]
+
+
 def run_update(fr, page, records, option: str) -> dict:
-    """update 路径：两阶段『粗筛批量匹配 + 精准回退』更新已存在行。返回统计字典。
+    """update 路径：查询驱动的两阶段『粗筛批量匹配 + 精准回退』更新已存在行。返回统计字典。
 
     不插入行、不应答任何 prompt。本批次的权威标识是 Excel 所有记录的 ruleid 集合。
+    报表默认只显示有限的一页（显示行数 limit 10），所以不再扫描默认显示的行，而是把条件
+    填进顶部红色过滤框、点绿色『查询』，以查询返回的行作为匹配/更新来源。
 
-    Stage1（粗筛批量匹配 + ruleid 确认）：扫描 DASS 已存在行，候选条件须全部满足——
-      · 方案号 非空且 ∈ Excel 方案号集合；
-      · 目标版本 ∈ Excel 目标版本集合；
-      · （递进选项 option != ota50）当前阶段 == PREV_STAGE[option]；ota50 跳过此条件。
-    对候选行按 ruleid 确认：ruleid ∈ Excel 集合 -> 更新（Stage1 命中）；
-    ∉ 集合 -> 不动（仅 debug 提示）。
+    前置（约定：一个 Excel = 同一个方案号、同一个目标版本）：
+      · 方案号集合（正常应为 1 个；若 >1 则分组逐个处理，并告警）；
+      · 目标版本集合（正常 1 个），作为 Stage1 的目标版本过滤值；
+      · Excel ruleid 集合，以及按 ruleid 的记录索引（Stage2 取其 设备扩展信息）。
 
-    Stage2（精准回退）：对 Stage1 未命中的每个 Excel ruleid，用其 Excel 记录的
-      方案号 + 目标版本 + 设备扩展信息 三字段精确相等匹配已存在行——
-      恰好一行 -> 更新（Stage2 命中）；零行 -> WARNING 跳过；多于一行 -> WARNING 歧义跳过不猜。
+    Stage1（粗筛查询 + ruleid 确认）：
+      查询条件 = 方案号 + 目标版本 +（递进选项再加 当前阶段=PREV_STAGE[option]；ota50 留空）。
+      不填设备扩展信息（它只用于 Stage2 精选）。查询返回行中，ruleid ∈ Excel 集合且未更新过
+      -> 更新（Stage1 命中）；ruleid ∉ Excel 集合 -> 不动。
+
+    Stage2（精选查询，仅针对 Stage1 未满足的 ruleid）：
+      对每个未满足 ruleid，用其 Excel 记录的 方案号 + 目标版本 + 设备扩展信息 三字段查询
+      （当前阶段留空，避免手工改过的阶段把行藏起来）。在结果中按 ruleid 定位：
+      恰好一行 -> 更新（Stage2 命中）；零行 -> WARNING 跳过；多行 -> WARNING 歧义跳过不猜。
 
     命中行写入：当前阶段=STAGE_LABELS[option]，当前阶段时间=今日 YYYYMMDD；
     ota50 额外写 是否展示=1（ota-all 及其它选项不触碰 是否展示）。
     每个 Excel ruleid 至多更新一次（Stage1 已满足者不进入 Stage2）。
+    列字母/会话锚在【每次查询后】重读（探测确认查询会改变会话锚），用对应查询的
+    letters/session 去拼单元格 id 并 fill_cell（双击进入编辑态 + 回读校验，保持不变）。
     所有比较均为对单元格显示文本的精确相等（仅沿用 existing_row_info 的 .trim()）。
     """
     stats = {
@@ -437,35 +598,8 @@ def run_update(fr, page, records, option: str) -> dict:
         "skipped_no_match": 0,
         "skipped_ambiguous": 0,
         "candidates_skipped_not_in_excel": 0,
+        "truncation_warnings": 0,
     }
-
-    layout = read_column_layout(fr, debug=True)
-    letters, session = layout["letters"], layout["session"]
-    print(f"会话锚：{session}")
-    if session is None or "方案号" not in letters:
-        print("✗ 未读到表头列布局，终止。")
-        _shot(page, "update_no_anchor")
-        return stats
-
-    # —— 匹配所需列的表头保证：缺任何一个都报错终止，绝不退化为更弱的匹配键 ——
-    # Stage1 用 方案号+目标版本[+当前阶段]，Stage2 用 方案号+目标版本+设备扩展信息，
-    # 两阶段都需要 ruleid 做确认/回退键；机型不参与新匹配，故不要求。
-    required_match = ["方案号", "目标版本", "设备扩展信息", "ruleid"]
-    if option != "ota50":
-        required_match.append("当前阶段")  # 递进选项 Stage1 需按上一阶段过滤
-    missing_match = [c for c in required_match if c not in letters]
-    if missing_match:
-        print(f"✗ 表头缺少匹配所需列 {missing_match}，无法安全匹配，终止更新。")
-        return stats
-
-    # —— 待写列的表头保证：缺任何一个都报错终止，绝不静默跳过该字段 ——
-    write_cols = ["当前阶段", "当前阶段时间"]
-    if option == "ota50":
-        write_cols.append("是否展示")
-    missing_write = [c for c in write_cols if c not in letters]
-    if missing_write:
-        print(f"✗ 表头缺少待写列 {missing_write}，无法更新对应字段，终止更新。")
-        return stats
 
     stage_label = STAGE_LABELS[option]
     stage_time = datetime.now().strftime("%Y%m%d")
@@ -486,17 +620,29 @@ def run_update(fr, page, records, option: str) -> dict:
     if not excel_ruleids:
         print("✗ Excel 中没有可用的 ruleid（全为空或无数据），没有可靠匹配键，终止更新。")
         return stats
+    if not excel_scheme_nos:
+        print("✗ Excel 中没有可用的方案号，无法作为查询条件，终止更新。")
+        return stats
     if not excel_targets:
-        print("⚠ Excel 的『目标版本』集合为空，Stage1 粗筛无法按目标版本圈定，"
-              "所有 ruleid 将直接走 Stage2 精准回退。")
+        print("⚠ Excel 的『目标版本』集合为空，Stage1 粗筛将不带目标版本条件，"
+              "所有 ruleid 可能直接走 Stage2 精选。")
 
-    existing = existing_row_info(fr, letters)
-    print(f"已存在数据行数：{len(existing)}")
+    # 约定一个 Excel 对应一个方案号；若不止一个，告警并对每个方案号分组各跑一轮 Stage1。
+    if len(excel_scheme_nos) > 1:
+        print(f"⚠ 本 Excel 出现多个方案号 {sorted(excel_scheme_nos)!r}（约定应只有一个），"
+              "将对每个方案号分别执行 Stage1 粗筛。")
+    # 目标版本正常只有一个；若多个则把它们都作为 Stage1 过滤值（逐个方案号×目标版本查询）。
+    if len(excel_targets) > 1:
+        print(f"⚠ 本 Excel 出现多个目标版本 {sorted(excel_targets)!r}（约定应只有一个），"
+              "将对每个目标版本分别查询。")
 
     satisfied_ruleids: set[str] = set()
 
-    def _write_row(row_n: int, tag: str, ruleid: str) -> bool:
-        """对一行写入本次更新字段；全部 fill_cell 成功才算更新成功。"""
+    def _write_row(row_n: int, letters: dict, session: str, tag: str, ruleid: str) -> bool:
+        """对一行写入本次更新字段；全部 fill_cell 成功才算更新成功。
+
+        letters/session 必须来自【定位到该行的那次查询】重读的表头布局。
+        """
         updates = {"当前阶段": stage_label, "当前阶段时间": stage_time}
         if option == "ota50":
             updates["是否展示"] = "1"
@@ -507,60 +653,89 @@ def run_update(fr, page, records, option: str) -> dict:
                 ok_row = False
         return ok_row
 
-    # ———— Stage1：粗筛批量匹配 + ruleid 确认 ————
-    for row in existing:
-        scheme = row.get("方案号", "")
-        if not (scheme and scheme in excel_scheme_nos):
-            continue
-        if row.get("目标版本", "") not in excel_targets:
-            continue
-        if option != "ota50" and row.get("当前阶段", "") != PREV_STAGE[option]:
-            continue
+    # ———— Stage1：按 方案号×目标版本（+上一阶段）粗筛查询 ————
+    # 目标版本为空时用单元素空串，表示 Stage1 不带目标版本条件（见上文告警）。
+    target_values = sorted(excel_targets) if excel_targets else [""]
+    for scheme in sorted(excel_scheme_nos):
+        for target in target_values:
+            print(f"\n====== Stage1 粗筛查询：方案号={scheme!r} 目标版本={target!r} ======")
+            filters = {"方案号": scheme, "目标版本": target}
+            if option != "ota50":
+                filters["当前阶段"] = PREV_STAGE[option]  # 递进选项按上一阶段过滤
+            rows, letters, session = _run_query(fr, page, filters)
 
-        rid = row.get("ruleid", "")
-        if rid in satisfied_ruleids:
-            # 同一 ruleid 已更新过（DASS 可能存在重复行），不重复写。
-            print(f"  · 候选行 {row['n']} 的 ruleid={rid!r} 已更新过，跳过。")
-            continue
-        if rid in excel_ruleids:
-            if _write_row(row["n"], "Stage1", rid):
-                stats["stage1_updated"] += 1
-                satisfied_ruleids.add(rid)
-        else:
-            stats["candidates_skipped_not_in_excel"] += 1
-            print(f"  · 候选行 {row['n']} 的 ruleid={rid!r} 不在 Excel 集合，跳过不动。")
+            if session is None or "方案号" not in letters:
+                print("✗ 查询后未读到表头列布局，跳过此次 Stage1 查询。")
+                _shot(page, "update_no_anchor")
+                continue
+            missing = _header_guard(letters, option, "stage1")
+            if missing:
+                print(f"✗ 表头缺少 Stage1 所需列 {missing}，无法安全匹配，终止更新。")
+                return stats
+            if len(rows) >= LIMIT_MAX:
+                print(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。")
+                stats["truncation_warnings"] += 1
 
-    # ———— Stage2：对 Stage1 未命中的 ruleid 精准回退 ————
-    for rid in excel_ruleids - satisfied_ruleids:
+            for row in rows:
+                rid = row.get("ruleid", "")
+                if rid in satisfied_ruleids:
+                    print(f"  · 结果行 {row['n']} 的 ruleid={rid!r} 已更新过，跳过。")
+                    continue
+                if rid in excel_ruleids:
+                    if _write_row(row["n"], letters, session, "Stage1", rid):
+                        stats["stage1_updated"] += 1
+                        satisfied_ruleids.add(rid)
+                else:
+                    stats["candidates_skipped_not_in_excel"] += 1
+                    print(f"  · 结果行 {row['n']} 的 ruleid={rid!r} 不在 Excel 集合，跳过不动。")
+
+    # ———— Stage2：对 Stage1 未命中的 ruleid 逐个精选查询 ————
+    for rid in sorted(excel_ruleids - satisfied_ruleids):
         rec = excel_by_ruleid[rid]
         k_scheme = rec.get("方案号", "")
         k_target = rec.get("目标版本", "")
         k_ext = rec.get("设备扩展信息", "")
-        matches = [
-            r for r in existing
-            if r.get("方案号", "") == k_scheme
-            and r.get("目标版本", "") == k_target
-            and r.get("设备扩展信息", "") == k_ext
-        ]
+        print(f"\n====== Stage2 精选查询：ruleid={rid!r} 方案号={k_scheme!r} "
+              f"目标版本={k_target!r} 设备扩展信息={k_ext!r} ======")
+        # 精选三字段查询；当前阶段留空（手工改过的阶段不应把行藏起来）。
+        rows, letters, session = _run_query(
+            fr, page,
+            {"方案号": k_scheme, "目标版本": k_target, "设备扩展信息": k_ext},
+        )
+        if session is None or "方案号" not in letters:
+            print(f"✗ 查询后未读到表头列布局，Rule ID={rid!r} 跳过。")
+            stats["skipped_no_match"] += 1
+            continue
+        missing = _header_guard(letters, option, "stage2")
+        if missing:
+            print(f"✗ 表头缺少 Stage2 所需列 {missing}，无法安全匹配，终止更新。")
+            return stats
+        if len(rows) >= LIMIT_MAX:
+            print(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。")
+            stats["truncation_warnings"] += 1
+
+        matches = [r for r in rows if r.get("ruleid", "") == rid]
         if len(matches) == 1:
-            if _write_row(matches[0]["n"], "Stage2", rid):
+            if _write_row(matches[0]["n"], letters, session, "Stage2", rid):
                 stats["stage2_updated"] += 1
                 satisfied_ruleids.add(rid)
         elif len(matches) == 0:
-            print(f"⚠ Rule ID={rid!r} 精准匹配未找到任何行，跳过。"
+            print(f"⚠ Rule ID={rid!r} 精选查询结果中未找到该 ruleid，跳过。"
                   f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
             stats["skipped_no_match"] += 1
         else:
-            print(f"⚠ Rule ID={rid!r} 精准匹配到多行（歧义 {len(matches)} 行），跳过不猜。"
+            print(f"⚠ Rule ID={rid!r} 精选查询命中多行（歧义 {len(matches)} 行），跳过不猜。"
                   f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
             stats["skipped_ambiguous"] += 1
 
     print("\n======== 更新汇总 ========")
     print(f"  Stage-1 批量更新：{stats['stage1_updated']}")
-    print(f"  Stage-2 精准回退更新：{stats['stage2_updated']}")
+    print(f"  Stage-2 精选回退更新：{stats['stage2_updated']}")
     print(f"  未匹配跳过：{stats['skipped_no_match']}")
     print(f"  歧义跳过：{stats['skipped_ambiguous']}")
     print(f"  候选但不在 Excel（未动）：{stats['candidates_skipped_not_in_excel']}")
+    if stats["truncation_warnings"]:
+        print(f"  ⚠ 结果可能被截断的查询次数：{stats['truncation_warnings']}（已按显示行处理）")
     return stats
 
 
