@@ -2,15 +2,21 @@
 
 用法：
     cd ota_cms_automation
-    ./.venv/bin/python -m automation.dass_fill [--update OPTION] "/路径/更新后的文件.xlsx"
-    # 不传位置参数则取 ota_v4 输出目录里最新的 .xlsx（见 OTA_V4_OUTPUTS）
+    ./.venv/bin/python -m automation.dass_fill [OPTION] "/路径/更新后的文件.xlsx"
+    # OPTION 与 Excel 路径都是位置参数，顺序不限、均可省略。
+    # 不传 Excel 则取 ota_v4 输出目录里最新的 .xlsx（见 OTA_V4_OUTPUTS）。
 
---update OPTION 取值：
-    init    插入 N 行并逐格填入（默认，等同于不传 --update）。
+OPTION 取值（直接写关键字，不加 --update 前缀）：
+    init    插入 N 行并逐格填入（默认，等同于不传 OPTION）。
     ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
-            数据行已存在，不插入行：按 方案号/设备扩展信息/机型/目标版本/ruleid
-            五字段精确匹配定位已存在行，更新『当前阶段』『当前阶段时间』（以及
-            ota50 另写『是否展示』=1）。
+            数据行已存在，不插入行：用『粗筛批量匹配 + 精准回退』两阶段定位已存在行。
+            Stage1（粗筛）按 方案号 ∈ Excel集合、目标版本 ∈ Excel集合、
+            （递进选项再加）当前阶段 == 上一阶段(PREV_STAGE) 圈出候选行，再用 ruleid
+            确认是否属于本批 Excel（在集合内才更新，不在则不动）。Stage2（回退）对
+            Stage1 未命中的 ruleid，按 方案号+目标版本+设备扩展信息 三字段精确匹配
+            （恰好一行才更新；零行报警跳过；多行歧义跳过不猜）。ota50 无上一阶段，
+            Stage1 不过滤『当前阶段』。命中行更新『当前阶段』『当前阶段时间』（以及
+            ota50 另写『是否展示』=1；ota-all 等其它选项不触碰『是否展示』）。
 
 确认过的机制（见探测过程）：
 - 填报表在 URL 含 'entry_report' 的 iframe 内。
@@ -51,6 +57,15 @@ STAGE_LABELS = {
     "ota5k": "OTA5000",
     "ota20k": "OTA20000",
     "ota-all": "完全开放",
+}
+
+# 各递进选项在 DASS『当前阶段』里要找的上一阶段；ota50 无上一阶段，不参与此过滤。
+PREV_STAGE = {
+    "ota200": "OTA50",
+    "ota1k": "OTA200",
+    "ota5k": "OTA1000",
+    "ota20k": "OTA5000",
+    "ota-all": "OTA20000",
 }
 
 # 要填写的 DASS 列（其余列：OTA类型/所有人/是否展示/状态/各时间/灰度档位 一律留空）。
@@ -151,21 +166,27 @@ def blank_row_numbers(fr, count: int) -> list[int]:
     return [r["n"] for r in rows if r["text"] == "" and r["n"] is not None][:count]
 
 
-# update 路径用于匹配的五个字段（Excel 值 vs DASS 单元格显示文本，精确相等）。
+# existing_row_info 读取每个数据行的这几列文本；Stage2 精准回退键是其中的子集
+# （方案号+目标版本+设备扩展信息）。『当前阶段』另行附带（见 existing_row_info），不并入此表。
 MATCH_COLUMNS = ["方案号", "设备扩展信息", "机型", "目标版本", "ruleid"]
 
 
 def existing_row_info(fr, letters: dict) -> list[dict]:
-    """返回每个已存在数据行的 {n: 行号, 方案号/设备扩展信息/机型/目标版本/ruleid: 文本}。
+    """返回每个已存在数据行的 {n, 方案号/设备扩展信息/机型/目标版本/ruleid/当前阶段: 文本}。
 
     类比 blank_row_numbers：从『方案号』列 id 解析行号 N，按各匹配列的列字母读取
     该行对应单元格 .trim() 后的 innerText。仅返回『方案号』列非空的真实数据行
     （排除空白插入行与表头行）。letters 由 read_column_layout 提供列字母映射。
+
+    除 MATCH_COLUMNS 外，额外附带『当前阶段』文本（Stage1 递进选项需要用它过滤）；
+    若表头没有『当前阶段』列字母，则该字段置空串（不丢弃行，是否终止由 run_update 决定）。
     """
     plan_letter = letters.get("方案号")
     if not plan_letter:
         return []
+    # MATCH_COLUMNS 之外再读『当前阶段』；该列不并入 MATCH_COLUMNS（后者是 Stage2 精准键）。
     col_letters = {col: letters.get(col) for col in MATCH_COLUMNS}
+    col_letters["当前阶段"] = letters.get("当前阶段")
     rows = fr.evaluate(
         """({planLetter, colLetters}) => {
             const xts = Array.from(document.querySelectorAll('table.x-table'));
@@ -186,17 +207,16 @@ def existing_row_info(fr, letters: dict) -> list[dict]:
                 if(!m) continue;
                 const n=parseInt(m[1]);
                 const rec={n:n};
-                let ok=true;
                 for (const col in colLetters){
                     const letter=colLetters[col];
-                    if(!letter){ ok=false; break; }
+                    if(!letter){ rec[col]=''; continue; }  // 列字母缺失 -> 该字段置空，不丢弃行
                     let cell=null;
                     for(const c of dataTbl.rows[r].cells){
                         if((c.id||'').indexOf(letter+n+'-')===0){ cell=c; break; }
                     }
                     rec[col]=cell? (cell.innerText||'').trim() : '';
                 }
-                if(ok) res.push(rec);
+                res.push(rec);
             }}
             return res;
         }""",
@@ -392,15 +412,33 @@ def run_init(fr, page, records) -> bool:
 
 
 def run_update(fr, page, records, option: str) -> dict:
-    """update 路径：按五字段精确匹配已存在行并更新字段。返回统计字典。
+    """update 路径：两阶段『粗筛批量匹配 + 精准回退』更新已存在行。返回统计字典。
 
-    不插入行、不应答任何 prompt。逐条 Excel 记录：
-      - 五字段（方案号/设备扩展信息/机型/目标版本/ruleid）精确相等匹配已存在行；
-      - 恰好一个 -> 更新；零个 -> WARNING 跳过；多于一个 -> WARNING（歧义）跳过。
-    更新字段：当前阶段=STAGE_LABELS[option]，当前阶段时间=今日 YYYYMMDD，
-    ota50 额外写 是否展示=1（ota-all 及其它 otaXX 不触碰 是否展示）。
+    不插入行、不应答任何 prompt。本批次的权威标识是 Excel 所有记录的 ruleid 集合。
+
+    Stage1（粗筛批量匹配 + ruleid 确认）：扫描 DASS 已存在行，候选条件须全部满足——
+      · 方案号 非空且 ∈ Excel 方案号集合；
+      · 目标版本 ∈ Excel 目标版本集合；
+      · （递进选项 option != ota50）当前阶段 == PREV_STAGE[option]；ota50 跳过此条件。
+    对候选行按 ruleid 确认：ruleid ∈ Excel 集合 -> 更新（Stage1 命中）；
+    ∉ 集合 -> 不动（仅 debug 提示）。
+
+    Stage2（精准回退）：对 Stage1 未命中的每个 Excel ruleid，用其 Excel 记录的
+      方案号 + 目标版本 + 设备扩展信息 三字段精确相等匹配已存在行——
+      恰好一行 -> 更新（Stage2 命中）；零行 -> WARNING 跳过；多于一行 -> WARNING 歧义跳过不猜。
+
+    命中行写入：当前阶段=STAGE_LABELS[option]，当前阶段时间=今日 YYYYMMDD；
+    ota50 额外写 是否展示=1（ota-all 及其它选项不触碰 是否展示）。
+    每个 Excel ruleid 至多更新一次（Stage1 已满足者不进入 Stage2）。
+    所有比较均为对单元格显示文本的精确相等（仅沿用 existing_row_info 的 .trim()）。
     """
-    stats = {"updated": 0, "skipped_no_match": 0, "skipped_ambiguous": 0}
+    stats = {
+        "stage1_updated": 0,
+        "stage2_updated": 0,
+        "skipped_no_match": 0,
+        "skipped_ambiguous": 0,
+        "candidates_skipped_not_in_excel": 0,
+    }
 
     layout = read_column_layout(fr, debug=True)
     letters, session = layout["letters"], layout["session"]
@@ -410,13 +448,18 @@ def run_update(fr, page, records, option: str) -> dict:
         _shot(page, "update_no_anchor")
         return stats
 
-    # 必须能在表头定位所有五个匹配列（含 ruleid），否则报错终止，绝不退化为四字段匹配。
-    missing_match = [c for c in MATCH_COLUMNS if c not in letters]
+    # —— 匹配所需列的表头保证：缺任何一个都报错终止，绝不退化为更弱的匹配键 ——
+    # Stage1 用 方案号+目标版本[+当前阶段]，Stage2 用 方案号+目标版本+设备扩展信息，
+    # 两阶段都需要 ruleid 做确认/回退键；机型不参与新匹配，故不要求。
+    required_match = ["方案号", "目标版本", "设备扩展信息", "ruleid"]
+    if option != "ota50":
+        required_match.append("当前阶段")  # 递进选项 Stage1 需按上一阶段过滤
+    missing_match = [c for c in required_match if c not in letters]
     if missing_match:
-        print(f"✗ 表头缺少匹配列 {missing_match}（需要全部五字段含 ruleid），无法安全匹配，终止更新。")
+        print(f"✗ 表头缺少匹配所需列 {missing_match}，无法安全匹配，终止更新。")
         return stats
 
-    # 确定本次要写入的目标列。
+    # —— 待写列的表头保证：缺任何一个都报错终止，绝不静默跳过该字段 ——
     write_cols = ["当前阶段", "当前阶段时间"]
     if option == "ota50":
         write_cols.append("是否展示")
@@ -428,71 +471,141 @@ def run_update(fr, page, records, option: str) -> dict:
     stage_label = STAGE_LABELS[option]
     stage_time = datetime.now().strftime("%Y%m%d")
 
+    # —— 构建 Excel 侧集合与按 ruleid 的记录索引（整批构建一次，不逐行重算）——
+    excel_targets = {rec.get("目标版本", "") for rec in records if rec.get("目标版本", "")}
+    excel_scheme_nos = {rec.get("方案号", "") for rec in records if rec.get("方案号", "")}
+    excel_by_ruleid: dict[str, dict] = {}
+    for rec in records:
+        rid = rec.get("ruleid", "")
+        if not rid:
+            print(f"⚠ 跳过 ruleid 为空的 Excel 记录（无法作为可靠匹配键）：方案号={rec.get('方案号', '')!r}")
+            continue
+        if rid not in excel_by_ruleid:  # 去重：同一 ruleid 取首条记录
+            excel_by_ruleid[rid] = rec
+    excel_ruleids = set(excel_by_ruleid)
+
+    if not excel_ruleids:
+        print("✗ Excel 中没有可用的 ruleid（全为空或无数据），没有可靠匹配键，终止更新。")
+        return stats
+    if not excel_targets:
+        print("⚠ Excel 的『目标版本』集合为空，Stage1 粗筛无法按目标版本圈定，"
+              "所有 ruleid 将直接走 Stage2 精准回退。")
+
     existing = existing_row_info(fr, letters)
     print(f"已存在数据行数：{len(existing)}")
 
-    for rec in records:
-        key = {c: rec.get(c, "") for c in MATCH_COLUMNS}
-        matches = [
-            row for row in existing
-            if all(row.get(c, "") == key[c] for c in MATCH_COLUMNS)
-        ]
-        if len(matches) == 0:
-            print(f"⚠ 未匹配到任何已存在行，跳过。匹配键：{key}")
-            stats["skipped_no_match"] += 1
-            continue
-        if len(matches) > 1:
-            print(f"⚠ 匹配到多行（歧义 {len(matches)} 行），跳过。匹配键：{key}")
-            stats["skipped_ambiguous"] += 1
-            continue
+    satisfied_ruleids: set[str] = set()
 
-        row_n = matches[0]["n"]
-        print(f"\n更新行 {row_n}（匹配键：{key}）：")
-        ok_row = True
+    def _write_row(row_n: int, tag: str, ruleid: str) -> bool:
+        """对一行写入本次更新字段；全部 fill_cell 成功才算更新成功。"""
         updates = {"当前阶段": stage_label, "当前阶段时间": stage_time}
         if option == "ota50":
             updates["是否展示"] = "1"
+        print(f"\n更新行 {row_n}（{tag}，ruleid={ruleid!r}）：")
+        ok_row = True
         for col, val in updates.items():
-            letter = letters.get(col)
-            if not letter:
-                print(f"    ✗ 列『{col}』的列字母未解析到，未写入该字段。")
+            if not fill_cell(fr, page, row_n, letters[col], session, val):
                 ok_row = False
-                continue
-            if not fill_cell(fr, page, row_n, letter, session, val):
-                ok_row = False
-        if ok_row:
-            stats["updated"] += 1
+        return ok_row
+
+    # ———— Stage1：粗筛批量匹配 + ruleid 确认 ————
+    for row in existing:
+        scheme = row.get("方案号", "")
+        if not (scheme and scheme in excel_scheme_nos):
+            continue
+        if row.get("目标版本", "") not in excel_targets:
+            continue
+        if option != "ota50" and row.get("当前阶段", "") != PREV_STAGE[option]:
+            continue
+
+        rid = row.get("ruleid", "")
+        if rid in satisfied_ruleids:
+            # 同一 ruleid 已更新过（DASS 可能存在重复行），不重复写。
+            print(f"  · 候选行 {row['n']} 的 ruleid={rid!r} 已更新过，跳过。")
+            continue
+        if rid in excel_ruleids:
+            if _write_row(row["n"], "Stage1", rid):
+                stats["stage1_updated"] += 1
+                satisfied_ruleids.add(rid)
+        else:
+            stats["candidates_skipped_not_in_excel"] += 1
+            print(f"  · 候选行 {row['n']} 的 ruleid={rid!r} 不在 Excel 集合，跳过不动。")
+
+    # ———— Stage2：对 Stage1 未命中的 ruleid 精准回退 ————
+    for rid in excel_ruleids - satisfied_ruleids:
+        rec = excel_by_ruleid[rid]
+        k_scheme = rec.get("方案号", "")
+        k_target = rec.get("目标版本", "")
+        k_ext = rec.get("设备扩展信息", "")
+        matches = [
+            r for r in existing
+            if r.get("方案号", "") == k_scheme
+            and r.get("目标版本", "") == k_target
+            and r.get("设备扩展信息", "") == k_ext
+        ]
+        if len(matches) == 1:
+            if _write_row(matches[0]["n"], "Stage2", rid):
+                stats["stage2_updated"] += 1
+                satisfied_ruleids.add(rid)
+        elif len(matches) == 0:
+            print(f"⚠ Rule ID={rid!r} 精准匹配未找到任何行，跳过。"
+                  f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
+            stats["skipped_no_match"] += 1
+        else:
+            print(f"⚠ Rule ID={rid!r} 精准匹配到多行（歧义 {len(matches)} 行），跳过不猜。"
+                  f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
+            stats["skipped_ambiguous"] += 1
 
     print("\n======== 更新汇总 ========")
-    print(f"  已更新：{stats['updated']}")
+    print(f"  Stage-1 批量更新：{stats['stage1_updated']}")
+    print(f"  Stage-2 精准回退更新：{stats['stage2_updated']}")
     print(f"  未匹配跳过：{stats['skipped_no_match']}")
     print(f"  歧义跳过：{stats['skipped_ambiguous']}")
+    print(f"  候选但不在 Excel（未动）：{stats['candidates_skipped_not_in_excel']}")
     return stats
 
 
+def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
+    """解析位置参数：可给『选项关键字』和/或『Excel 路径』，顺序不限。
+
+    用法：
+        python -m automation.dass_fill [OPTION] [EXCEL]
+    OPTION 取值见 VALID_OPTIONS（init/ota50/ota200/ota1k/ota5k/ota20k/ota-all），
+    不给则默认 init。EXCEL 不给则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
+    不再使用 --update 前缀，直接写关键字即可，例如：
+        ./run_dass.sh ota50 "/路径/文件.xlsx"
+    返回 (option, excel_path_or_None)。非法/多余参数直接报错退出。
+    """
+    option = "init"
+    excel: str | None = None
+    for arg in argv:
+        if arg in ("-h", "--help"):
+            print(
+                "用法：python -m automation.dass_fill [OPTION] [EXCEL]\n"
+                f"  OPTION 取值：{' / '.join(VALID_OPTIONS)}（默认 init）\n"
+                "  EXCEL  可选 Excel 路径；不给则取 OTA_V4_OUTPUTS 下最新的 .xlsx。\n"
+                "示例：\n"
+                "  ./run_dass.sh \"/路径/文件.xlsx\"          # init，填空\n"
+                "  ./run_dass.sh ota50 \"/路径/文件.xlsx\"    # 更新已存在行\n"
+            )
+            raise SystemExit(0)
+        if arg in VALID_OPTIONS:
+            option = arg
+        elif arg.startswith("-"):
+            print(f"✗ 未知参数：{arg!r}。用法：[OPTION] [EXCEL]，OPTION 取值 {VALID_OPTIONS}。")
+            raise SystemExit(2)
+        elif excel is None:
+            excel = arg
+        else:
+            print(f"✗ 多余参数：{arg!r}。只接受一个 Excel 路径。")
+            raise SystemExit(2)
+    return option, excel
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        prog="automation.dass_fill",
-        description="DASS 填报：init 插入并填报 / otaXX 匹配已存在行并更新阶段字段。",
-    )
-    parser.add_argument(
-        "--update",
-        choices=VALID_OPTIONS,
-        default="init",
-        metavar="OPTION",
-        help="操作模式：%(choices)s（默认 init）。",
-    )
-    parser.add_argument(
-        "excel",
-        nargs="?",
-        default=None,
-        help="可选 Excel 路径；不传则取 OTA_V4_OUTPUTS 下最新的 .xlsx。",
-    )
-    args = parser.parse_args()
-    option = args.update
+    option, excel = _parse_cli(sys.argv[1:])
 
     # ——— 浏览器启动之前：先完成选项校验与 Excel 读取，保证静态快速失败 ———
-    excel = args.excel
     if not excel:
         from .dass_data import latest_updated_excel
         excel = latest_updated_excel(OTA_V4_OUTPUTS)
@@ -506,7 +619,7 @@ def main() -> int:
     if option == "init":
         print(f"读取到 {n} 条记录，将插入 {n} 行并填写。")
     else:
-        print(f"读取到 {n} 条记录，将按五字段精确匹配已存在行并更新（阶段：{STAGE_LABELS[option]}）。")
+        print(f"读取到 {n} 条记录，将按『粗筛批量匹配 + 精准回退』更新已存在行（阶段：{STAGE_LABELS[option]}）。")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not config.HEADED)

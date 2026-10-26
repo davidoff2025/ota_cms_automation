@@ -2,14 +2,17 @@
 # 把更新后的 Excel 填报到 DASS（安卓升级状态填报）。
 #
 # 用法：
-#   ./run_dass.sh                                # init 模式，取 ota_v4 输出目录里最新的 .xlsx
-#   ./run_dass.sh "/路径/更新后的文件.xlsx"             # init 模式，指定 Excel
-#   ./run_dass.sh --update ota50 "/路径/文件.xlsx"     # update 模式，匹配已存在行并更新字段
+#   ./run_dass.sh                              # init 模式，取 ota_v4 输出目录里最新的 .xlsx
+#   ./run_dass.sh "/路径/更新后的文件.xlsx"           # init 模式，指定 Excel
+#   ./run_dass.sh ota50 "/路径/文件.xlsx"           # update 模式，匹配已存在行并更新字段
 #
-# --update <option> 取值：init / ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
+# OPTION 取值（直接写关键字，不加 --update）：init / ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
 #   init（默认）：读 Excel -> 插入 N 行 -> 逐格填入。
-#   otaXX / ota-all：数据行已存在，不插入行；按 方案号/设备扩展信息/机型/目标版本/ruleid
-#     五字段精确匹配定位已存在行，更新『当前阶段』『当前阶段时间』（ota50 另写『是否展示』=1）。
+#   otaXX / ota-all：数据行已存在，不插入行；用『粗筛批量匹配 + 精准回退』两阶段定位已存在行：
+#     Stage1 按 方案号/目标版本（递进选项再加 当前阶段=上一阶段）圈出候选，再用 ruleid 确认是否属本批；
+#     Stage2 对未命中的 ruleid 按 方案号+目标版本+设备扩展信息 精准回退。
+#     命中行更新『当前阶段』『当前阶段时间』（ota50 另写『是否展示』=1）。
+# OPTION 与 Excel 路径顺序不限，均可省略。
 #
 # 机制：读 Excel -> 按模式填入/更新 -> 截图并暂停，
 #       在终端输入 approve 才会执行『验证 -> 提交』，否则不提交。
