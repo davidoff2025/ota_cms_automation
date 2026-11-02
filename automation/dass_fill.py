@@ -12,7 +12,7 @@ OPTION 取值（直接写关键字，不加 --update 前缀）：
             数据行已存在，不插入行：用【查询驱动】的『粗筛批量匹配 + 精选回退』两阶段定位。
             报表默认只显示有限的一页（显示行数 limit 10），所以不扫描默认显示的行，而是把
             条件填进顶部红色过滤框（方案号/目标版本/设备扩展信息/当前阶段）、点绿色『查询』，
-            以查询返回的行作为匹配来源。显示行数先设 'limit 50'，若结果数 >=50 升到 100。
+            以查询返回的行作为匹配来源。显示行数默认设 'limit 100'。
             Stage1（粗筛查询）按 方案号 + 目标版本 +（递进选项再加）当前阶段==上一阶段
             (PREV_STAGE) 查询，再用 ruleid 确认是否属于本批 Excel（在集合内才更新，不在则
             不动）；Stage1 不填设备扩展信息。Stage2（精选回退）对 Stage1 未命中的 ruleid，
@@ -37,6 +37,7 @@ OPTION 取值（直接写关键字，不加 --update 前缀）：
 """
 from __future__ import annotations
 
+import re
 import sys
 import time
 from datetime import datetime
@@ -47,6 +48,7 @@ from playwright.sync_api import sync_playwright
 from . import config
 from .dass_login import login, navigate_to_fillin, _shot
 from .dass_data import read_updated_excel
+# 注意：dass_perf 复用本模块的常量/查询件，于 main() 内延迟导入以避免模块级循环导入。
 
 # --update 合法取值；init 为默认（插入并填报），其余为更新已存在行。
 VALID_OPTIONS = ["init", "ota50", "ota200", "ota1k", "ota5k", "ota20k", "ota-all"]
@@ -85,14 +87,30 @@ HEADER_ALIASES = {
 OTA_V4_OUTPUTS = str(Path.home() / "my_python_project" / "ota_v4" / "data" / "outputs")
 
 
+def _strip_group_separators(s) -> str:
+    """去掉千分位分组逗号（半角 ',' 与全角 '，'）。
+
+    FineReport 的数字格式单元格会在【显示】文本里注入千分位逗号（如 '20,261,026'、
+    'OTA,200'），而底层存储/我们键入的原值是无逗号的（见 probe-findings.md 的
+    DISPLAY-ONLY 判定）。本函数只剥离分组逗号，不做其它改写（不转 int、不动空白），
+    供回读校验与 ruleid 归一化共用。
+    """
+    return str(s or "").replace(",", "").replace("，", "")
+
+
 def norm_ruleid(value) -> str:
     """归一化 ruleid 以便两边精确比较。
 
     DASS 页面把 ruleid 当数字展示，带千分位逗号（如 '65,197'），而 Excel 里是纯数字
-    '65197'。直接字符串比较永远不相等，导致匹配全部落空。这里去掉逗号与首尾空白，
-    使 '65,197' 与 '65197' 归一化为同一个键。不做其它改写（不转 int，避免前导零等语义丢失）。
+    '65197'。直接字符串比较永远不相等，导致匹配全部落空。
+
+    此外在【模糊查找】返回的结果里，ruleid 可能以逗号作为分隔符呈现（半角 '65,196'
+    或全角 '65，196'），甚至夹带空白 / 全角空格 / 千分位点等。为了让两侧稳定对齐，
+    这里把所有可能的分隔符（以及其它一切非数字字符）统统去掉，只保留数字后再比较，
+    使 '65,197' / '65，197' / '65 197' 等都归一化为同一个键 '65197'。
+    不转 int，避免前导零等语义丢失。
     """
-    return str(value or "").replace(",", "").replace("，", "").strip()
+    return re.sub(r"\D", "", str(value or ""))
 
 # —— 查询(筛选) UI 选择器（来自只读探测 .agents/tasks/probe-findings.md）——
 # 顶部红色标注的过滤框：把方案号/目标版本/设备扩展信息/当前阶段填进去，点绿色『查询』，
@@ -115,8 +133,8 @@ FILTER_INPUTS_OTHERS = {
 LIMIT_INPUT = "input[name='LIMIT']"
 # 绿色『查询』按钮（FineReport 自由按钮 div id）。
 QUERY_BUTTON = "#fr-btn-BTNSUBMIT"
-# 粗筛起始显示行数；查询结果数 >= 此值视为可能被截断，升到 LIMIT_MAX 重查。
-LIMIT_START = 50
+# 默认显示行数（粗筛起始）设为 100；查询结果数 >= 此值视为可能被截断，升到 LIMIT_MAX 重查。
+LIMIT_START = 100
 LIMIT_MAX = 100
 
 
@@ -204,7 +222,7 @@ def read_query_results(fr) -> tuple[list[dict], dict, str]:
 
 
 def _run_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
-    """设 limit=50 -> 填过滤框 -> 查询 -> 读结果；若结果数 >= 50 则升到 100 重查。
+    """设 limit=LIMIT_START（默认 100）-> 填过滤框 -> 查询 -> 读结果；若未到上限且疑似被截断再升档重查。
 
     返回 (rows, letters, session)。截断警告在调用方按业务语义处理，这里只负责升档重查。
     """
@@ -213,7 +231,8 @@ def _run_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
     click_query(fr, page)
     rows, letters, session = read_query_results(fr)
     print(f"  查询结果行数（limit {LIMIT_START}）：{len(rows)}")
-    if len(rows) >= LIMIT_START:
+    # 仅在起始 limit 小于上限时才升档重查；两者相等（默认 100）时已是上限，直接返回。
+    if LIMIT_START < LIMIT_MAX and len(rows) >= LIMIT_START:
         print(f"  结果数 >= {LIMIT_START}，疑似被截断，升到 'limit {LIMIT_MAX}' 重查 ...")
         set_display_limit(fr, page, LIMIT_MAX)
         set_filter(fr, page, filters)
@@ -822,8 +841,31 @@ def main() -> int:
                     dialog.accept()
             page.on("dialog", _on_dialog)
 
+        # 延迟导入：dass_perf 在模块级依赖本模块的常量/查询件，放这里避免循环导入。
+        from .dass_perf import GATE_OPTIONS, navigate_to_perf, check_success_rate
+
         try:
             login(page)
+
+            # ———— 升级成功率闸门（仅 ota200 起的递进档位）————
+            # 在『升级 DASS』(run_update) 之前，先去绩效页校验本批每个 Rule ID 的成功率：
+            # 全部 >= 50% 才放行；任一 < 50% 或两阶段都查不到 -> abort（不 run_update、
+            # 不进入人工提交环节）。ota50 / init 不校验。
+            if option in GATE_OPTIONS:
+                print("\n======== 升级成功率闸门（run_update 之前）========")
+                navigate_to_perf(page)
+                page.wait_for_timeout(2500)
+                fr_perf = _report_frame(page)
+                if fr_perf is None:
+                    print("✗ 未找到绩效页 frame，无法校验成功率；安全失败，abort 升级。")
+                    _shot(page, "perf_no_frame")
+                    return 2
+                if not check_success_rate(fr_perf, page, records, option):
+                    print("\n⛔ 成功率闸门未通过：中止本次升级事务，"
+                          "run_update 未执行，不进入人工提交环节。")
+                    return 2
+                print("\n✅ 成功率闸门通过，继续执行升级 DASS。")
+
             navigate_to_fillin(page)
             page.wait_for_timeout(2500)
             fr = _report_frame(page)
