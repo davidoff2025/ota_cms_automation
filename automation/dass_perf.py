@@ -23,15 +23,18 @@ ota50 / init 不校验（见 GATE_OPTIONS）。
 两阶段匹配（与 run_update 同构）：
   Stage1（模糊/粗筛）：按 方案号 + 目标版本 查询（limit 100），结果里按 norm_ruleid 对齐，
     命中则读其『升级成功率』。
-  Stage2（精准回退）：对 Stage1 未查到的 Rule ID，用 方案号 + 目标版本 + 当前阶段(上一阶段)
-    查询再定位（按 Rule ID 对齐）。
+  Stage2（精准回退）：对 Stage1 未查到的 Rule ID，用用户最初要求的四字段精准查询
+    方案号 + 目标版本 + 设备扩展信息 + 当前阶段(上一阶段) 查询再定位（按 Rule ID 对齐）。
 
-  ⚠ 与任务原澄清的差异（见 .agents/tasks/perf-probe-findings.md 实测）：
-    绩效页顶部过滤框【没有】『设备扩展信息』(DEVICEMSG) 框——它只作为结果【列】存在，
-    无法作为过滤条件输入。因此 Stage2 在绩效页改用 方案号+目标版本+当前阶段(上一阶段) 过滤，
-    再在结果中按 norm_ruleid 本地对齐定位该 Rule ID。这只是『如何在只读校验里定位到行』的
-    实现方式，闸门对外可见行为（全部 >=50% 放行、否则 abort）不变。『当前阶段』过滤值用该
-    档位的上一阶段 PREV_STAGE[option]，与 run_update Stage1 的递进逻辑一致。
+  设备扩展信息（见 .agents/tasks/perf-probe-findings.md 补探测实测）：
+    绩效页顶部确实存在『设备扩展信息』过滤框，FineReport 参数名 = DEVICEMSG（与填报页一致）。
+    但该框的 <input class="fr-trigger-texteditor"> 本身【没有】name 属性，参数名在其外层
+    wrapper 的 widgetname 上，所以 input[name='DEVICEMSG'] 选不中；稳定选择器用
+    div[widgetname='DEVICEMSG'] input.fr-trigger-texteditor（见 PERF_FILTER_INPUTS）。
+    设备扩展信息过滤值取自该 Rule ID 对应 Excel 记录的『设备扩展信息』字段，与 run_update
+    Stage2 的取值方式一致。『当前阶段』过滤值用该档位的上一阶段 PREV_STAGE[option]，与
+    run_update Stage1 的递进逻辑一致（绩效页该列表头可能叫『当前策略』，但过滤框即 DEVICEMSG
+    旁的 CURRENTSTAGE 框）。闸门对外可见行为（全部 >=50% 放行、否则 abort）不变。
 
 安全失败：成功率/ruleid 列字母解析不到、或成功率文本无法解析（空值/缺列）时，一律按
 『未找到/不通过』处理并 abort 升级，绝不默认放行。
@@ -57,11 +60,17 @@ GATE_OPTIONS = {"ota200", "ota1k", "ota5k", "ota20k", "ota-all"}
 # 通过阈值（含等于）。
 PASS_THRESHOLD = 50.0
 
-# —— 绩效页顶部过滤框 name（实测，见 perf-probe-findings.md）——
-# 注意：绩效页【没有】DEVICEMSG（设备扩展信息）过滤框；它只作为结果列存在。
+# —— 绩效页顶部过滤框选择器（实测，见 perf-probe-findings.md 补探测）——
+# 方案号/目标版本/当前阶段 的 <input> 带 name 属性，直接用 input[name=...]。
+# 『设备扩展信息』过滤框确实存在，FineReport 参数名 = DEVICEMSG（与填报页一致），但其
+# <input class="fr-trigger-texteditor"> 本身【没有】name 属性，参数名在外层
+# div[widgetname='DEVICEMSG'] 上，所以必须用 widgetname 锚定再取内层文本框；
+# 若此选择器因页面结构调整而选不中、导致设备扩展信息无法过滤，需核对该选择器
+# （仍以 perf-probe-findings.md 的实测 ancestors 为准）。
 PERF_FILTER_INPUTS = {
     "方案号": "input[name='PLANCODE']",
     "目标版本": "input[name='NEXTVERSION']",
+    "设备扩展信息": "div[widgetname='DEVICEMSG'] input.fr-trigger-texteditor",
     "当前阶段": "input[name='CURRENTSTAGE']",
 }
 # 清空用（避免上一次查询的残留条件干扰本次）。绩效页存在但本闸门不使用的过滤框。
@@ -239,8 +248,9 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
 def _perf_set_filter(fr, page, values: dict) -> None:
     """按 字段->值 填绩效页顶部过滤框，并清空其它过滤框（避免残留条件干扰）。
 
-    values 只含本次需要的字段（方案号/目标版本/当前阶段）；PERF_FILTER_INPUTS 里未给值的
-    字段与 PERF_FILTER_INPUTS_OTHERS 一律清空。注意绩效页无 DEVICEMSG 框。
+    values 含本次需要的字段（方案号/目标版本/设备扩展信息/当前阶段）；PERF_FILTER_INPUTS 里
+    未给值的字段与 PERF_FILTER_INPUTS_OTHERS 一律清空。设备扩展信息框的 <input> 无 name，
+    用 div[widgetname='DEVICEMSG'] input.fr-trigger-texteditor 锚定（见 PERF_FILTER_INPUTS）。
     """
     def _set_one(sel: str, val: str) -> None:
         loc = fr.locator(sel).first
@@ -292,8 +302,8 @@ def check_success_rate(fr, page, records, option: str) -> bool:
 
     - option 不在 GATE_OPTIONS（即 ota50/init）时不应校验；此处若被误调用，直接放行 True
       并打印提示（真正的跳过在 dass_fill.main() 里判断，不进入本函数）。
-    - 两阶段：Stage1 方案号+目标版本 模糊查询；Stage2 对未命中的 Rule ID 用
-      方案号+目标版本+当前阶段(上一阶段) 查询再本地按 norm_ruleid 定位。
+    - 两阶段：Stage1 方案号+目标版本 模糊查询；Stage2 对未命中的 Rule ID 用四字段精准查询
+      方案号+目标版本+设备扩展信息+当前阶段(上一阶段) 查询再本地按 norm_ruleid 定位。
     - 成功率/ruleid 列字母缺失、或成功率文本无法解析 -> 该 Rule ID 记为『未找到/不通过』并 abort。
     """
     if option not in GATE_OPTIONS:
@@ -346,11 +356,13 @@ def check_success_rate(fr, page, records, option: str) -> bool:
         rec = excel_by_ruleid[rid]
         k_scheme = rec.get("方案号", "")
         k_target = rec.get("目标版本", "")
-        filters = {"方案号": k_scheme, "目标版本": k_target}
+        k_ext = rec.get("设备扩展信息", "")  # 取自该 Rule ID 的 Excel 记录，与 run_update Stage2 一致
+        # 用户最初要求的四字段精准查询：方案号 + 目标版本 + 设备扩展信息 + 当前阶段(上一阶段)。
+        filters = {"方案号": k_scheme, "目标版本": k_target, "设备扩展信息": k_ext}
         if option != "ota50":  # GATE_OPTIONS 恒为递进档位，必有上一阶段
             filters["当前阶段"] = PREV_STAGE[option]
         print(f"\n====== 成功率 Stage2 精准查询：Rule ID={rid!r} 方案号={k_scheme!r} "
-              f"目标版本={k_target!r} 当前阶段={filters.get('当前阶段', '')!r} ======")
+              f"目标版本={k_target!r} 设备扩展信息={k_ext!r} 当前阶段={filters.get('当前阶段', '')!r} ======")
         rows, letters, session = _perf_query(fr, page, filters)
         if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
             print(f"  ✗ 绩效页未解析到 "
