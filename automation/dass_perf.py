@@ -296,6 +296,40 @@ def _perf_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
     return rows, letters, session
 
 
+def query_rates_stage1(fr, page, scheme: str, target: str) -> dict | None:
+    """Stage1 共享查询件：方案号 + 目标版本 模糊查询（limit 100），返回按 norm_ruleid
+    归一化的成功率字典，供成功率闸门与独立查询 CLI 复用（不复制粘贴解析逻辑）。
+
+    返回：
+      - dict：{norm_ruleid: {"rate": float|None, "rate_text": str, "raw_ruleid": str}}，
+        同一 norm_ruleid 多行时取首次出现。
+      - None：绩效页未解析到『升级策略ruleid』/『升级成功率』列字母（安全失败信号），
+        由调用方据此 abort / 报错。
+
+    说明：这段逻辑原本内联在 check_success_rate 的 Stage1 循环里（_perf_query 查询 ->
+    校验两列字母存在 -> 遍历结果行按 norm_ruleid 归一化 -> parse_percent 解析成功率），
+    这里整体抽出为纯查询件，check_success_rate 改为调用它，行为逐行等价。
+    """
+    rows, letters, session = _perf_query(fr, page, {"方案号": scheme, "目标版本": target})
+    if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
+        print(f"  ✗ 绩效页未解析到 "
+              f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
+              f"（letters={letters}）；安全失败。")
+        return None
+    result: dict[str, dict] = {}
+    for row in rows:
+        rid = norm_ruleid(row.get("ruleid", ""))
+        if not rid or rid in result:  # 同键取首次出现；空 ruleid 跳过
+            continue
+        rate_text = row.get("rate_text", "")
+        result[rid] = {
+            "rate": parse_percent(rate_text),
+            "rate_text": rate_text,
+            "raw_ruleid": row.get("ruleid", ""),
+        }
+    return result
+
+
 def check_success_rate(fr, page, records, option: str) -> bool:
     """成功率闸门：对本批每个 Rule ID 求成功率，全部 >= 50% 返回 True（放行升级），
     任一 < 50% 或两阶段都查不到 -> 打印逐条明细后返回 False（abort）。
@@ -334,21 +368,16 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     for scheme in sorted(excel_scheme_nos):
         for target in target_values:
             print(f"\n====== 成功率 Stage1 粗筛查询：方案号={scheme!r} 目标版本={target!r} ======")
-            rows, letters, session = _perf_query(fr, page, {"方案号": scheme, "目标版本": target})
-            if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
-                print(f"  ✗ 绩效页未解析到 "
-                      f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
-                      f"（letters={letters}）；安全失败，abort 升级。")
+            stage1 = query_rates_stage1(fr, page, scheme, target)
+            if stage1 is None:  # 列字母缺失 -> 安全失败 abort（行为同旧内联分支）
                 _shot(page, "perf_missing_columns")
                 return False
-            for row in rows:
-                rid = norm_ruleid(row.get("ruleid", ""))
+            for rid, info in stage1.items():
                 if rid in excel_ruleids and rid not in found_rate:
-                    rate = parse_percent(row.get("rate_text", ""))
                     found_rate[rid] = {
-                        "rate": rate,
+                        "rate": info["rate"],
                         "stage": "Stage1",
-                        "rate_text": row.get("rate_text", ""),
+                        "rate_text": info["rate_text"],
                     }
 
     # ———— Stage2：对 Stage1 未命中的 Rule ID 逐个精准查询 ————
