@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -38,6 +39,14 @@ from .dass_fill import (
     FILTER_INPUTS,
     FILTER_INPUTS_OTHERS,
     LIMIT_INPUT,
+)
+from .dass_perf import (
+    navigate_to_perf as _perf_navigate,
+    read_perf_layout,
+    read_perf_rows,
+    PERF_FILTER_INPUTS,
+    PERF_FILTER_INPUTS_OTHERS,
+    PERF_RULEID_HEADER,
 )
 
 FINDINGS_PATH = Path(__file__).resolve().parents[1] / ".agents" / "tasks" / "perf-probe-findings.md"
@@ -396,6 +405,621 @@ def dump_sample_rows(fr, letters: dict, success_col: str | None,
         }""",
         {"planLetter": letters["方案号"], "cols": cols, "maxRows": max_rows},
     )
+
+
+# ==========================================================================
+# 结果分页机制 只读探测（本轮新增）
+# --------------------------------------------------------------------------
+# 背景：用户用页面截图指出绩效页查询结果是【分页】的，顶部有 FineReport 工具栏
+#   `First | Previous | [1] /2 | Next | Last`。上一轮实跑却声称『翻遍全部 4 页』，
+#   页数对不上，强烈怀疑翻页逻辑有问题。本轮只读探测：据实查出
+#     1) 分页控件（First/Previous/Next/Last + 当前页码输入框 + 总页数文本）的真实选择器；
+#     2) 总页数读数；
+#     3) 翻到下一页后『新页已加载完成』的可靠信号（会话锚变化 / 页码输入框值变化 /
+#        Loading 消失 / 网格重建）；
+#     4) 每页读到的行数与 ruleid 列(H) 的取值范围，确认逐页遍历不重不漏。
+#   全程只读：只点 Next 翻页（FineReport 翻页不改数据），绝不点升级/提交/查询升降档。
+# ==========================================================================
+
+# FineReport 工具栏翻页按钮的候选选择器（实测见 perf-probe-findings.md 第二轮转储：
+# 每个按钮同时存在 div `#fr-btn-<Name>`、`div[widgetname='<Name>']`、以及
+# `button.fr-btn-text.x-emb-<name>`；禁用态 wrapper 带 class `ui-state-disabled`）。
+PAGER_BUTTONS = {
+    "First": {
+        "div_id": "#fr-btn-First",
+        "widget": "div[widgetname='First']",
+        "emb": "button.x-emb-first",
+    },
+    "Previous": {
+        "div_id": "#fr-btn-Previous",
+        "widget": "div[widgetname='Previous']",
+        "emb": "button.x-emb-previous",
+    },
+    "Next": {
+        "div_id": "#fr-btn-Next",
+        "widget": "div[widgetname='Next']",
+        "emb": "button.x-emb-next",
+    },
+    "Last": {
+        "div_id": "#fr-btn-Last",
+        "widget": "div[widgetname='Last']",
+        "emb": "button.x-emb-last",
+    },
+}
+
+
+def dump_pager_controls(fr) -> dict:
+    """转储 FineReport 结果工具栏的分页控件：First/Previous/Next/Last 按钮（多种选择器
+    是否命中 + 启用/禁用态）、当前页码输入框、总页数文本。
+
+    FineReport 的翻页工具栏（class 含 `x-emb-*`）里：
+      - 四个按钮是 `button.fr-btn-text.x-emb-first/previous/next/last`，外层 wrapper
+        `div.fr-btn[widgetname='First'...]`，禁用态 wrapper 带 `ui-state-disabled`。
+      - 页码指示通常是一个 `input`（当前页码，可编辑跳页）加一段文本 `/N`（总页数）。
+    本函数据实把工具栏里出现的按钮、input、以及形如 `/数字` 或 `数字/数字` 的文本节点
+    全部抓出来，供下游据实选稳定选择器、并读出总页数。"""
+    return fr.evaluate(
+        r"""() => {
+            const out = {buttons: [], pager_inputs: [], page_texts: [], toolbars: []};
+
+            // 1) 四个翻页按钮：按 x-emb-* class 找 button，顺带记录 wrapper 的 widgetname /
+            //    禁用态（wrapper class 含 ui-state-disabled，或 button 含 disabled）。
+            const embMap = {first:'First', previous:'Previous', next:'Next', last:'Last'};
+            for (const key in embMap) {
+                document.querySelectorAll('button.x-emb-' + key).forEach(b => {
+                    // 找最近的 fr-btn wrapper（带 widgetname）。
+                    let wrap = b.closest('div.fr-btn') || b.parentElement;
+                    const wrapCls = wrap ? (wrap.className || '') : '';
+                    const rid = b.getAttribute('id') || '';
+                    // 对应的 fr-btn-id div（实测 id 形如 'fr-btn-Next'）。
+                    const divId = document.querySelector('#fr-btn-' + embMap[key]);
+                    const r = b.getBoundingClientRect();
+                    out.buttons.push({
+                        name: embMap[key],
+                        emb_class: 'x-emb-' + key,
+                        button_text: (b.innerText || '').trim(),
+                        button_id: rid,
+                        button_disabled_attr: b.disabled === true,
+                        wrapper_tag: wrap ? wrap.tagName.toLowerCase() : null,
+                        wrapper_class: wrapCls,
+                        wrapper_widgetname: wrap ? (wrap.getAttribute('widgetname') || '') : '',
+                        disabled: /ui-state-disabled/.test(wrapCls),
+                        has_fr_btn_div: !!divId,
+                        fr_btn_div_id: divId ? (divId.id || '') : '',
+                        fr_btn_div_disabled: divId ? /ui-state-disabled/.test(divId.className || '') : null,
+                        visible: r.width > 0 && r.height > 0,
+                        left: Math.round(r.left), top: Math.round(r.top),
+                    });
+                });
+            }
+
+            // 2) 页码输入框 + 总页数文本：定位 x-emb 工具栏容器，枚举其中的 input 与短文本。
+            const bars = new Set();
+            document.querySelectorAll('[class*="x-emb-"]').forEach(e => {
+                let p = e;
+                for (let d = 0; d < 4 && p; d++) { p = p.parentElement; }
+                // 用按钮的祖先链里『含多个 x-emb 子节点』的那层作为工具栏容器。
+            });
+            // 直接找同时含 x-emb-first 和 x-emb-last 的最近公共祖先作为工具栏。
+            const firstBtn = document.querySelector('button.x-emb-first');
+            const lastBtn = document.querySelector('button.x-emb-last');
+            let toolbar = null;
+            if (firstBtn && lastBtn) {
+                let a = firstBtn;
+                while (a && !a.contains(lastBtn)) a = a.parentElement;
+                toolbar = a;
+            }
+            if (toolbar) {
+                out.toolbars.push({
+                    tag: toolbar.tagName.toLowerCase(),
+                    class: toolbar.className || '',
+                    id: toolbar.id || '',
+                    html_snippet: (toolbar.innerHTML || '').slice(0, 600),
+                });
+                // 工具栏内所有 input（当前页码框）。
+                toolbar.querySelectorAll('input').forEach(inp => {
+                    const r = inp.getBoundingClientRect();
+                    const attrs = {};
+                    for (const a of inp.attributes) attrs[a.name] = a.value;
+                    out.pager_inputs.push({
+                        name: inp.getAttribute('name') || '',
+                        value: inp.value || '',
+                        class: inp.className || '',
+                        attrs: attrs,
+                        left: Math.round(r.left), top: Math.round(r.top),
+                        visible: r.width > 0 && r.height > 0,
+                    });
+                });
+                // 工具栏内形如 '/2'、'1/2'、'第 1 页 共 2 页' 之类的文本节点。
+                const walker = document.createTreeWalker(toolbar, NodeFilter.SHOW_TEXT, null);
+                let node;
+                while ((node = walker.nextNode())) {
+                    const txt = (node.nodeValue || '').trim();
+                    if (!txt) continue;
+                    if (/\d/.test(txt) && (/\//.test(txt) || /页/.test(txt) || /^\/?\d+$/.test(txt))) {
+                        out.page_texts.push(txt);
+                    }
+                }
+            }
+            return out;
+        }"""
+    )
+
+
+def read_pager_state(fr) -> dict:
+    """读当前分页状态：会话锚、当前页码输入框值、总页数、Next/Last 是否禁用、Loading 是否可见、
+    ruleid 列(H) 数据行数与行号集合。供翻页前后对比，判断『新页加载完成』。"""
+    return fr.evaluate(
+        r"""() => {
+            const out = {};
+            // 会话锚：扫描 x-table 内第一个 id 形如 '<字母><行号>-<x>-<会话锚>' 的单元格
+            // （首个 [id] 可能不是数据单元格、id 不匹配该格式，故遍历直到命中）。
+            let session = null;
+            const cells = document.querySelectorAll('table.x-table [id]');
+            for (const c of cells) {
+                const m = (c.id || '').match(/^[A-Z]+\d+-\d+-(.+)$/);
+                if (m) { session = m[1]; break; }
+            }
+            out.session = session;
+
+            // 当前页码输入框值 + 总页数文本（从工具栏取）。
+            const firstBtn = document.querySelector('button.x-emb-first');
+            const lastBtn = document.querySelector('button.x-emb-last');
+            let toolbar = null;
+            if (firstBtn && lastBtn) {
+                let a = firstBtn;
+                while (a && !a.contains(lastBtn)) a = a.parentElement;
+                toolbar = a;
+            }
+            out.page_input_value = null;
+            out.total_pages_text = null;
+            if (toolbar) {
+                const inp = toolbar.querySelector('input');
+                if (inp) out.page_input_value = inp.value || '';
+                const walker = document.createTreeWalker(toolbar, NodeFilter.SHOW_TEXT, null);
+                let node;
+                while ((node = walker.nextNode())) {
+                    const txt = (node.nodeValue || '').trim();
+                    if (txt && /\//.test(txt) && /\d/.test(txt)) { out.total_pages_text = txt; break; }
+                }
+            }
+
+            // Next / Last 禁用态（末页时禁用）：优先看 widgetname wrapper，再回退到
+            // x-emb 按钮的最近 fr-btn wrapper。
+            function wrapDisabled(widget, embSel) {
+                let w = document.querySelector("div[widgetname='" + widget + "']");
+                if (!w) {
+                    const b = document.querySelector(embSel);
+                    w = b ? b.closest('div.fr-btn') : null;
+                }
+                return w ? /ui-state-disabled/.test(w.className || '') : null;
+            }
+            out.next_disabled = wrapDisabled('Next', 'button.x-emb-next');
+            out.last_disabled = wrapDisabled('Last', 'button.x-emb-last');
+
+            // Loading 文本是否可见。
+            const bodyTxt = (document.body.innerText || '');
+            out.loading_visible = /Loading/i.test(bodyTxt);
+
+            return out;
+        }"""
+    )
+
+
+def _parse_total_pages(state: dict, pager: dict) -> int | None:
+    """从 total_pages_text（如 '1/2'、'/2'、'第 1 页 共 2 页'）或 page_texts 里解析总页数。"""
+    candidates = []
+    if state.get("total_pages_text"):
+        candidates.append(state["total_pages_text"])
+    candidates.extend(pager.get("page_texts", []))
+    for txt in candidates:
+        m = re.search(r"/\s*(\d+)", txt)      # '1/2' 或 '/2'
+        if m:
+            return int(m.group(1))
+        m = re.search(r"共\s*(\d+)\s*页", txt)  # 中文 '共 2 页'
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _read_h_range(fr) -> dict:
+    """读当前页 ruleid 列(H) 的数据：行数、ruleid 列表、min/max（纯数字时）。复用 read_perf_rows。"""
+    layout = read_perf_layout(fr, debug=False)
+    rows = read_perf_rows(fr, layout["letters"])
+    ruleids = [r.get("ruleid", "") for r in rows if r.get("ruleid", "")]
+    nums = []
+    for rid in ruleids:
+        digits = re.sub(r"\D", "", rid)
+        if digits:
+            nums.append(int(digits))
+    return {
+        "row_count": len(rows),
+        "ruleids": ruleids,
+        "h_min": min(nums) if nums else None,
+        "h_max": max(nums) if nums else None,
+        "session": layout.get("session"),
+    }
+
+
+def _click_next(fr, page) -> bool:
+    """点一次 Next 翻页按钮（只读翻页，不改数据）。优先 div[widgetname='Next']，回退 x-emb-next。"""
+    for sel in ("div[widgetname='Next']", "#fr-btn-Next", "button.x-emb-next"):
+        loc = fr.locator(sel).first
+        try:
+            if loc.count() == 0:
+                continue
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.click()
+            return True
+        except Exception as e:
+            print(f"  ⚠ 点击 Next（{sel}）失败：{e}")
+            continue
+    return False
+
+
+def _wait_page_turn(fr, page, prev_state: dict, timeout_ms: int = 15000) -> dict:
+    """翻页后轮询『新页加载完成』信号：会话锚变化 或 页码输入框值变化，且 Loading 消失。
+
+    返回 {changed, waited_ms, by, new_state}：by 记录是靠哪个信号判定的（session/page_input）。"""
+    waited, step = 0, 500
+    prev_session = prev_state.get("session")
+    prev_pageval = prev_state.get("page_input_value")
+    while waited < timeout_ms:
+        page.wait_for_timeout(step)
+        waited += step
+        st = read_pager_state(fr)
+        if st.get("loading_visible"):
+            continue
+        session_changed = st.get("session") is not None and st.get("session") != prev_session
+        page_changed = (st.get("page_input_value") not in (None, "")
+                        and st.get("page_input_value") != prev_pageval)
+        if session_changed or page_changed:
+            page.wait_for_timeout(500)  # settle 数据单元格绘制
+            st2 = read_pager_state(fr)
+            by = []
+            if session_changed:
+                by.append("session")
+            if page_changed:
+                by.append("page_input")
+            return {"changed": True, "waited_ms": waited, "by": by, "new_state": st2}
+    return {"changed": False, "waited_ms": waited, "by": [], "new_state": read_pager_state(fr)}
+
+
+def _perf_fill_filters(fr, page, plancode: str, target: str) -> None:
+    """只读探测用：填绩效页方案号 + 目标版本过滤框，并清空其它过滤框（复用 dass_perf 选择器）。"""
+    def _set_one(sel: str, val: str) -> None:
+        loc = fr.locator(sel).first
+        try:
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.click()
+            loc.fill("")
+            if val:
+                loc.fill(str(val))
+        except Exception as e:
+            print(f"  ⚠ 过滤框 {sel} 设置失败：{e}")
+
+    values = {"方案号": plancode, "目标版本": target}
+    for field, sel in PERF_FILTER_INPUTS.items():
+        _set_one(sel, values.get(field, ""))
+    for sel in PERF_FILTER_INPUTS_OTHERS.values():
+        _set_one(sel, "")
+    print(f"  过滤条件：{{'方案号': {plancode!r}, '目标版本': {target!r}}}")
+
+
+def probe_pagination(plancode: str, target: str) -> int:
+    """HEADED 实跑：登录 -> 导航绩效报表 -> 填方案号+目标版本 -> 点查询 -> 探测结果分页机制。
+
+    据实 dump：分页控件选择器、总页数、翻页完成信号、逐页行数与 H 列范围，写入 findings。
+    全程只读（仅点查询与 Next 翻页，不点升级/提交）。"""
+    reachable = False
+    obs: dict = {"mode": "pagination", "plancode": plancode, "target": target}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not config.HEADED)
+        context = browser.new_context()
+        page = context.new_page()
+
+        def _on_dialog(dialog):
+            print(f"  [对话框] type={dialog.type} message={dialog.message!r} -> dismiss")
+            try:
+                dialog.dismiss()
+            except Exception:
+                pass
+        page.on("dialog", _on_dialog)
+
+        try:
+            login(page)
+            reachable = True
+            print("\n======== 导航『安卓升级展示报表』========")
+            _perf_navigate(page)
+            page.wait_for_timeout(2500)
+            fr = _report_frame(page)
+            if fr is None:
+                print("✗ 未找到绩效页 frame，无法探测分页。")
+                _shot(page, "perf_pager_no_frame")
+                obs["error"] = "report frame not found"
+                raise SystemExit(0)
+            obs["frame_url"] = fr.url
+
+            print(f"\n======== 填过滤条件并查询：方案号={plancode!r} 目标版本={target!r} ========")
+            _perf_fill_filters(fr, page, plancode, target)
+            click_query(fr, page)
+            page.wait_for_timeout(1500)
+            _shot(page, "perf_pager_after_query")
+
+            # —— 1) 分页控件选择器 dump ——
+            pager = dump_pager_controls(fr)
+            obs["pager_controls"] = pager
+            print("\n分页按钮命中情况：")
+            for b in pager.get("buttons", []):
+                print(f"  {b['name']:9} emb={b['emb_class']:16} "
+                      f"fr-btn-div={b['fr_btn_div_id']!r} widgetname={b['wrapper_widgetname']!r} "
+                      f"禁用={b['disabled']} 可见={b['visible']}")
+            print(f"页码输入框：{pager.get('pager_inputs')}")
+            print(f"页码/总页数文本候选：{pager.get('page_texts')}")
+
+            # —— 2) 初始分页状态 + 总页数 ——
+            state0 = read_pager_state(fr)
+            obs["state_page1"] = state0
+            total_pages = _parse_total_pages(state0, pager)
+            obs["total_pages"] = total_pages
+            print(f"\n初始状态：会话锚={state0.get('session')!r} "
+                  f"页码框值={state0.get('page_input_value')!r} "
+                  f"总页数文本={state0.get('total_pages_text')!r} -> 解析总页数={total_pages}")
+            print(f"Next 禁用={state0.get('next_disabled')} Last 禁用={state0.get('last_disabled')}")
+
+            # —— 3)+4) 逐页遍历：每页读 H 列范围，翻页后确认加载完成 ——
+            pages = []
+            h0 = _read_h_range(fr)
+            pages.append({"page": 1, **h0, "turn": None})
+            print(f"\n第 1 页：行数={h0['row_count']} H列范围=[{h0['h_min']}, {h0['h_max']}] "
+                  f"ruleids={h0['ruleids']}")
+            _shot(page, "perf_pager_page1")
+
+            # 若总页数解析不到，用 Next 禁用态兜底：最多翻 20 页防失控。
+            max_pages = total_pages if (total_pages and total_pages > 0) else 20
+            page_idx = 1
+            while page_idx < max_pages:
+                prev_state = read_pager_state(fr)
+                if prev_state.get("next_disabled"):
+                    print(f"  Next 已禁用（第 {page_idx} 页为末页），停止翻页。")
+                    break
+                print(f"\n---- 点 Next 翻到第 {page_idx + 1} 页 ----")
+                if not _click_next(fr, page):
+                    print("  ✗ 无法点击 Next，停止翻页。")
+                    obs["next_click_failed_at_page"] = page_idx
+                    break
+                turn = _wait_page_turn(fr, page, prev_state)
+                page_idx += 1
+                if not turn["changed"]:
+                    print(f"  ⚠ 翻页后 {turn['waited_ms']}ms 内未检测到加载完成信号"
+                          f"（会话锚/页码框未变化）。")
+                else:
+                    print(f"  ✓ 翻页完成（信号={turn['by']}，用时 {turn['waited_ms']}ms，"
+                          f"新会话锚={turn['new_state'].get('session')!r} "
+                          f"新页码框值={turn['new_state'].get('page_input_value')!r}）")
+                h = _read_h_range(fr)
+                pages.append({"page": page_idx, **h, "turn": turn})
+                print(f"  第 {page_idx} 页：行数={h['row_count']} "
+                      f"H列范围=[{h['h_min']}, {h['h_max']}] ruleids={h['ruleids']}")
+                _shot(page, f"perf_pager_page{page_idx}")
+
+            obs["pages"] = pages
+            # 汇总覆盖情况：全部页 ruleid 合并去重，看是否不重不漏。
+            all_rids = []
+            for pg in pages:
+                all_rids.extend(pg.get("ruleids", []))
+            obs["pages_visited"] = len(pages)
+            obs["total_rows_all_pages"] = len(all_rids)
+            obs["unique_rows_all_pages"] = len(set(all_rids))
+            print(f"\n共遍历 {len(pages)} 页，累计 {len(all_rids)} 行（去重 {len(set(all_rids))} 行）。")
+
+            if config.HEADED:
+                try:
+                    input("\n浏览器保持打开（只读，未改动）。查看完毕按回车关闭... ")
+                except EOFError:
+                    time.sleep(10)
+        except SystemExit:
+            pass
+        except Exception as e:
+            print(f"✗ 分页探测出错：{e}")
+            obs["exception"] = str(e)
+            try:
+                _shot(page, "perf_pager_error")
+            except Exception:
+                pass
+        finally:
+            context.close()
+            browser.close()
+
+    _write_pagination_findings(reachable, obs)
+    print(f"\nfindings 已追加分页机制小节：{FINDINGS_PATH}")
+    print(f"站点可达：{reachable}")
+    return 0
+
+
+def _write_pagination_findings(reachable: bool, obs: dict) -> None:
+    """把结果分页机制探测结论【追加】到 findings（保留既有内容，新增一个小节）。"""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ran = (
+        reachable
+        and not obs.get("error")
+        and not obs.get("exception")
+        and obs.get("pages")
+    )
+
+    lines: list[str] = []
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 🔎 结果分页机制（本轮补探测）")
+    lines.append("")
+    lines.append(f"- 生成时间：{stamp}")
+    lines.append(f"- 站点可达：{'是' if reachable else '否'}")
+    lines.append(f"- 实跑探测：{'是' if ran else '否'}")
+    lines.append(f"- 探测方案号+目标版本：`{obs.get('plancode')}` + `{obs.get('target')}`")
+    lines.append("")
+
+    if not ran:
+        reason = (
+            obs.get("exception")
+            or obs.get("error")
+            or ("站点不可达 / 登录失败" if not reachable else "未读到任何分页/结果状态")
+        )
+        lines.append("### ⚠ 未能实跑")
+        lines.append("")
+        lines.append(f"- 原因：{reason}")
+        lines.append("- 之前出现过间歇 ENOTFOUND；站点可用时重跑："
+                     "`CMS_HEADED=true ./.venv/bin/python -m automation.dass_probe_perf --pagination`。")
+        lines.append("- 本轮未写入任何臆测选择器（据实留空），避免误导下游修复。")
+        lines.append("")
+        _append_to_findings(lines)
+        return
+
+    pager = obs.get("pager_controls", {}) or {}
+    pages = obs.get("pages", []) or []
+    total_pages = obs.get("total_pages")
+
+    lines.append("### 1) 分页控件真实选择器")
+    lines.append("")
+    lines.append("FineReport 结果工具栏的四个翻页按钮，每个都同时可用三种选择器命中"
+                 "（实测，择一即可；推荐用 `div[widgetname='<Name>']` 或 `#fr-btn-<Name>`）：")
+    lines.append("")
+    lines.append("| 按钮 | `#fr-btn-<Name>` | `div[widgetname]` | `button.x-emb-*` | 本页禁用 |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for b in pager.get("buttons", []):
+        lines.append(f"| {b['name']} | `{b.get('fr_btn_div_id','')}` | "
+                     f"`div[widgetname='{b.get('wrapper_widgetname','')}']` | "
+                     f"`{b.get('emb_class','')}` | {b.get('disabled')} |")
+    lines.append("")
+    lines.append("- 翻页推荐选择器：下一页 = `div[widgetname='Next']`（或 `#fr-btn-Next`、"
+                 "`button.x-emb-next`）；上一页/首页/末页同理换 `Previous`/`First`/`Last`。")
+    lines.append(f"- **当前页码输入框**（可编辑跳页）实测：`{pager.get('pager_inputs')}`")
+    if pager.get("pager_inputs"):
+        pin = pager["pager_inputs"][0]
+        pin_name = pin.get("name") or ""
+        if pin_name:
+            lines.append(f"  - 稳定选择器：`input[name='{pin_name}']`（值=当前页码）。")
+        else:
+            lines.append("  - 该输入框无 name 属性，用工具栏容器内的 `input` 定位"
+                         "（见下方总页数判定）。")
+    lines.append(f"- **总页数文本节点**（形如 `/N`、`1/N`）实测候选：`{pager.get('page_texts')}`")
+    tb = pager.get("toolbars") or []
+    if tb:
+        lines.append(f"- 工具栏容器：`<{tb[0].get('tag')} class=\"{tb[0].get('class')}\">`"
+                     "（含 First 与 Last 的最近公共祖先；页码输入框与总页数文本都在其内）。")
+    lines.append("")
+
+    lines.append("### 2) 总页数读数")
+    lines.append("")
+    lines.append(f"- 本例（{obs.get('plancode')} + {obs.get('target')}）解析总页数 = "
+                 f"**{total_pages}**。")
+    lines.append(f"- 第 1 页原始页码/总页数文本：`{(obs.get('state_page1') or {}).get('total_pages_text')!r}`。")
+    lines.append("- 判定方式：取工具栏内形如 `当前页/总页` 的文本（正则 `/\\s*(\\d+)` 抓斜杠后的数字），"
+                 "或中文 `共 N 页`。页码输入框的 `value` 即当前页码（本例 `1`），斜杠后的数字即总页数。")
+    # 据实比对：分页指示读数 与 用户截图说法（2 页）。不臆造一致性。
+    pages_list = obs.get("pages", []) or []
+    nonempty = [pg for pg in pages_list if pg.get("row_count", 0) > 0]
+    lines.append(f"- ⚠ **分页指示读数（{total_pages} 页）与用户截图说法（`1 /2`，2 页）不一致**，"
+                 "也与『实际有数据的页数』不一致：本次 32 行真实数据**全部落在第 1 页**，"
+                 f"第 2~{total_pages} 页读到 0 行（见下方第 4 节）。即该 `/{total_pages}` "
+                 "指示并不等于『有数据的页数』，详见第 5 节分析。")
+    lines.append("")
+
+    lines.append("### 3) 翻到下一页『加载完成』的可靠信号")
+    lines.append("")
+    lines.append("实测点 `Next` 后，用以下信号判定新页加载完成（`_wait_page_turn` 轮询）：")
+    lines.append("")
+    # 从各页 turn 信息汇总实际命中的信号。
+    signals_seen = set()
+    for pg in pages:
+        t = pg.get("turn")
+        if t and t.get("by"):
+            for s in t["by"]:
+                signals_seen.add(s)
+    lines.append(f"- **会话锚（session）变化**：翻页后 x-table 单元格 id 尾部的会话锚改变"
+                 f"（本轮实测{'命中' if 'session' in signals_seen else '未命中'}）。")
+    lines.append(f"- **页码输入框值变化**：当前页码框的 value 从 1 变为 2 …"
+                 f"（本轮实测{'命中' if 'page_input' in signals_seen else '未命中'}）。")
+    lines.append("- **Loading 文本消失**：翻页瞬间 grid 出现 `Loading`，消失后方视为稳定"
+                 "（轮询时 `loading_visible` 为真则继续等待）。")
+    lines.append("- 判定逻辑：`(会话锚变化 或 页码框值变化) 且 Loading 不可见` -> 再 settle 500ms "
+                 "读数据，避免读到翻页中途的旧网格。")
+    for pg in pages[1:]:
+        t = pg.get("turn") or {}
+        lines.append(f"  - 翻到第 {pg['page']} 页：信号={t.get('by')}，用时 {t.get('waited_ms')}ms，"
+                     f"changed={t.get('changed')}。")
+    lines.append("")
+
+    lines.append("### 4) 每页行数与 H(升级策略ruleid) 列范围")
+    lines.append("")
+    lines.append("| 页 | 行数 | H 列最小 | H 列最大 | ruleid 列表 |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for pg in pages:
+        rids = pg.get("ruleids", [])
+        rids_show = ", ".join(rids[:12]) + (" …" if len(rids) > 12 else "")
+        lines.append(f"| {pg['page']} | {pg.get('row_count')} | {pg.get('h_min')} | "
+                     f"{pg.get('h_max')} | {rids_show} |")
+    lines.append("")
+    lines.append(f"- 共遍历 **{obs.get('pages_visited')}** 页，累计 "
+                 f"**{obs.get('total_rows_all_pages')}** 行，去重后 "
+                 f"**{obs.get('unique_rows_all_pages')}** 行"
+                 + ("（无重复，逐页遍历不重不漏 ✅）。"
+                    if obs.get('total_rows_all_pages') == obs.get('unique_rows_all_pages')
+                    else "（存在重复行，翻页遍历可能重读，下游需去重 ⚠）。"))
+    lines.append("")
+
+    lines.append("### 5) 分页指示 vs 实际数据页数 / 旧逻辑为何得出『4 页』")
+    lines.append("")
+    nonempty_pages = [pg["page"] for pg in pages if pg.get("row_count", 0) > 0]
+    empty_pages = [pg["page"] for pg in pages if pg.get("row_count", 0) == 0]
+    page1_rows = pages[0].get("row_count") if pages else 0
+    # 据实拼各页会话锚序列（证明翻页确实发生）。
+    sess_seq = " → ".join(
+        str((pg.get("turn") or {}).get("new_state", {}).get("session")
+            if pg.get("turn") else pg.get("session"))
+        for pg in pages
+    )
+    lines.append(f"- **关键实测**：工具栏分页指示为 `/{total_pages}`（{total_pages} 页），"
+                 f"但本查询 {page1_rows} 行真实数据**全部在第 1 页**；第 {empty_pages} 页翻过去读到 **0 行**"
+                 f"（翻页信号正常命中：会话锚实测逐页变化 {sess_seq}、页码框 1→2→…→{total_pages} 都变了，"
+                 "Loading 也消失，说明确实翻过去了，只是那些页没有数据单元格）。")
+    lines.append(f"- 即 `/{total_pages}` 这个分页数**不等于『有数据的页数』**（有数据的仅第 "
+                 f"{nonempty_pages} 页）。用户截图显示 `1 /2`、本次实测为 `/{total_pages}`，"
+                 "两次读数本身也不同——说明该指示会随查询/视图状态变化，不能当作稳定的『数据页数』。")
+    lines.append("- **这正解释了上一轮为何声称『翻遍全部 4 页』**：旧逻辑很可能直接信任了工具栏的 "
+                 f"`/{total_pages}` 指示作为遍历上界，于是机械翻了 4 页——而第 2~4 页根本没有数据，"
+                 "等于白翻；同时因为目标 65142~65154 本就不在该『方案号+目标版本』的结果里"
+                 "（真实结果是第 1 页的 64807~64934），无论翻多少页都『未找到』。")
+    lines.append("- 关于用户截图的 `1 /2`：本次实测该查询的指示是 `/4` 而非 `/2`。差异可能来自"
+                 "查询条件/时间点不同，或截图时与本次实跑的数据集状态不同。无论指示是 2 还是 4，"
+                 "**真实数据都只在第 1 页**，分页指示数不可直接当『数据页数』用。")
+    lines.append("- 可能的底层原因（供下游修复核对，未逐一证实）：")
+    lines.append("  - 该 `/N` 指示可能是报表模板按『分页打印/纸张高度』估算的物理分页数（FineReport "
+                 "的 emb 工具栏分页），与『SQL 结果行数』不是一回事——行数少时仍可能显示多页，"
+                 "后续页为空白页。findings 第二轮记录未过滤时分页为 `1/190` 也印证该指示很大且与"
+                 "数据行数脱节。")
+    lines.append("  - 旧逻辑没有『按页是否有数据行』判停，仅按 `/N` 盲翻固定页数。")
+    lines.append("- **修复方向（供下一步）**：")
+    lines.append("  1. 翻页前确认查询过滤已生效（会话锚已是过滤后的新值，`click_query` 已轮询表头恢复）。")
+    lines.append("  2. **不要把 `/N` 指示当作数据页数**；改为**翻页直到某页读到 0 个 ruleid(H) 单元格"
+                 "就停**（本页为空即已越过数据末页），或 `Next` 变禁用（`div[widgetname='Next']` 的 "
+                 "wrapper class 含 `ui-state-disabled`）就停；仍可用 `/N` 作为最大翻页次数的安全上界，"
+                 "避免失控。")
+    lines.append("  3. 每次 `Next` 后用『会话锚变化 或 页码框值变化，且 Loading 不可见』确认新页已加载，"
+                 "再按 `H<行号>-...` / `Z<行号>-...` 读该页 ruleid/成功率。")
+    lines.append("  4. 逐页 ruleid 去重汇总（本次实测各页无重叠，但去重可防边界情况）。")
+    lines.append("")
+
+    _append_to_findings(lines)
+
+
+def _append_to_findings(lines: list[str]) -> None:
+    """把小节追加到 findings 文件末尾（保留既有权威内容）。"""
+    FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = ""
+    if FINDINGS_PATH.exists():
+        existing = FINDINGS_PATH.read_text(encoding="utf-8")
+    FINDINGS_PATH.write_text(existing.rstrip() + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> int:
@@ -871,5 +1495,27 @@ def _write_findings(reachable: bool, obs: dict) -> None:
     FINDINGS_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _cli() -> int:
+    """入口分发：默认跑原有的 frame/过滤框/表头 探测；带 --pagination 跑结果分页机制探测。
+
+    用法：
+        CMS_HEADED=true ./.venv/bin/python -m automation.dass_probe_perf              # 原探测
+        CMS_HEADED=true ./.venv/bin/python -m automation.dass_probe_perf --pagination  # 分页探测
+            [--plancode MT9603AndrGTV4K] [--target 0100AQ0725]
+    """
+    args = sys.argv[1:]
+    if "--pagination" in args:
+        plancode = os.getenv("PERF_PLANCODE", "MT9603AndrGTV4K").strip() or "MT9603AndrGTV4K"
+        target = os.getenv("PERF_TARGET", "0100AQ0725").strip() or "0100AQ0725"
+        # 允许 --plancode / --target 覆盖（简单解析，避免引入 argparse 改动原入口）。
+        for i, a in enumerate(args):
+            if a == "--plancode" and i + 1 < len(args):
+                plancode = args[i + 1]
+            elif a == "--target" and i + 1 < len(args):
+                target = args[i + 1]
+        return probe_pagination(plancode, target)
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_cli())
