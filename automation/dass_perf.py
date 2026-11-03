@@ -47,10 +47,7 @@ from . import config
 from .dass_fill import (
     PREV_STAGE,
     norm_ruleid,
-    set_display_limit,
     click_query,
-    LIMIT_START,
-    LIMIT_MAX,
 )
 from .dass_login import _shot, _click_menu_in_any_frame, _dump_visible_menu
 
@@ -197,50 +194,47 @@ def read_perf_layout(fr, debug: bool = False) -> dict:
 
 
 def read_perf_rows(fr, letters: dict) -> list[dict]:
-    """返回绩效页每个数据行的 {n, ruleid, rate_text}（按方案号列非空筛真实数据行）。
+    """返回绩效页每个数据行的 {n, ruleid, rate_text}。
 
-    与 dass_fill.existing_row_info 同构：从『方案号』列 id 解析行号 N，再按各列字母读该行
-    对应单元格 .trim() 文本。ruleid 读『升级策略ruleid』列，rate_text 读『升级成功率』列。
-    若两列的列字母缺失，返回空列表（由调用方安全失败处理）。
+    ⚠ 以 **『升级策略ruleid』列（列字母 H）** 为行锚枚举数据行，而**不是**用『方案号』列。
+    原因（实测，见 perf-probe-findings.md 第二轮补探测）：绩效页『方案号』(列字母 B) 是
+    **跨行合并单元格**——同一方案号的多行结果里，方案号单元格只在首行渲染一个 `B<n>-...`，
+    其余行没有 B 单元格。旧实现以方案号列非空筛『真实数据行』，会把 32 行结果误判成只有 1 行
+    （甚至 0 行），这正是 HEADED 实跑读到 0 行的根因。而 ruleid 列每个结果行各有一个
+    `H<行号>-0-<会话锚>` 单元格，成功率列同理有 `Z<行号>-...`，故以 ruleid 列行号为锚最可靠。
+
+    做法：直接在整个 report frame 的 DOM 里按 id 前缀 `H<n>-` 收集所有 ruleid 数据单元格
+    （n>=2 为数据行，n=1 是表头），对每个行号 n 再按 `Z<n>-` 读成功率文本。不再依赖
+    『表头表 vs 数据表』的 table 结构假设（绩效页表头与数据同在一张 x-table）。
+    若 ruleid/成功率列字母缺失，返回空列表（由调用方安全失败处理）。
     """
-    plan_letter = letters.get(PERF_PLAN_HEADER)
     rid_letter = letters.get(PERF_RULEID_HEADER)
     rate_letter = letters.get(PERF_SUCCESS_RATE_HEADER)
-    if not plan_letter or not rid_letter or not rate_letter:
+    if not rid_letter or not rate_letter:
         return []
     rows = fr.evaluate(
-        """({planLetter, ridLetter, rateLetter}) => {
-            const xts = Array.from(document.querySelectorAll('table.x-table'));
-            let headerTbl=null, colIndex=-1;
-            for (const t of xts) {
-                if (!t.rows.length) continue;
-                const cells = Array.from(t.rows[0].cells);
-                const ci = cells.findIndex(c => (c.innerText||'').trim()==='方案号');
-                if (ci>=0){ headerTbl=t; colIndex=ci; break; }
-            }
-            let dataTbl=null, maxRows=-1;
-            for (const t of xts){ if(t===headerTbl) continue;
-                if(t.rows.length>maxRows){maxRows=t.rows.length; dataTbl=t;} }
-            const readCell=(row, letter, n)=>{
-                for(const c of row.cells){
-                    if((c.id||'').indexOf(letter+n+'-')===0){ return (c.innerText||'').trim(); }
-                }
-                return '';
-            };
-            const res=[];
-            if(dataTbl){ for(let r=0;r<dataTbl.rows.length;r++){
-                const pc=dataTbl.rows[r].cells[colIndex];
-                const m=pc? (pc.id||'').match(new RegExp('^'+planLetter+'(\\\\d+)-')):null;
-                if(!m) continue;
-                const n=parseInt(m[1]);
-                const plan=readCell(dataTbl.rows[r], planLetter, n);
-                if(plan==='') continue;  // 仅真实数据行
-                res.push({n:n, ruleid:readCell(dataTbl.rows[r], ridLetter, n),
-                          rate_text:readCell(dataTbl.rows[r], rateLetter, n)});
-            }}
+        """({ridLetter, rateLetter}) => {
+            // 以 ruleid 列为行锚：收集所有 id 形如 '<ridLetter><n>-<x>-<session>' 且 n>=2 的单元格。
+            const ridRe = new RegExp('^' + ridLetter + '(\\\\d+)-\\\\d+-');
+            const seen = {};
+            const res = [];
+            document.querySelectorAll('[id]').forEach(e => {
+                const m = (e.id || '').match(ridRe);
+                if (!m) return;
+                const n = parseInt(m[1]);
+                if (n < 2 || seen[n]) return;        // n=1 表头；去重
+                const ruleid = (e.innerText || '').trim();
+                if (!ruleid) return;                 // 空 ruleid 跳过
+                seen[n] = true;
+                // 同行成功率单元格：id 以 '<rateLetter><n>-' 开头。
+                const rc = document.querySelector('[id^="' + rateLetter + n + '-"]');
+                const rate_text = rc ? (rc.innerText || '').trim() : '';
+                res.push({ n: n, ruleid: ruleid, rate_text: rate_text });
+            });
+            res.sort((a, b) => a.n - b.n);
             return res;
         }""",
-        {"planLetter": plan_letter, "ridLetter": rid_letter, "rateLetter": rate_letter},
+        {"ridLetter": rid_letter, "rateLetter": rate_letter},
     )
     return rows
 
@@ -272,27 +266,28 @@ def _perf_set_filter(fr, page, values: dict) -> None:
 
 
 def _perf_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
-    """设 limit=LIMIT_START -> 填绩效页过滤框 -> 查询 -> 读结果行。
+    """填绩效页过滤框 -> 点『查询』-> 等重绘完成 -> 读结果行。
 
     返回 (rows, letters, session)。rows 来自 read_perf_rows（每行含 ruleid/rate_text）。
-    截断处理与 dass_fill._run_query 同构：起始 limit 小于上限且疑似截断时升档重查。
+
+    ⚠ 绩效页【没有『显示行数/LIMIT』过滤框】（实测，见 perf-probe-findings.md 第二轮补探测：
+    顶部控件里没有 name='LIMIT' 的输入框，也没有 limit 50/100 选项）。因此这里**不设 limit**、
+    也**不做**填报页那种『结果数 >= limit 疑似截断就升档重查』的逻辑——照搬填报页的
+    set_display_limit(input[name='LIMIT']) 在绩效页只会超时失败且无意义。查询流程就是：
+    填方案号+目标版本 -> 点查询 -> 等重绘 -> 读结果。
+
+    重绘完成信号（实测）：点『查询』后会话锚会变（如 1814->1815）、Loading 文本消失、
+    方案号列切换为过滤后的方案；click_query 已显式轮询表头+会话锚恢复，这里再 settle 一下。
+    成功率列(Z)/ruleid 列(H) 的单元格在查询后即渲染到 DOM（实测无需额外横向滚动即可读到
+    H/Z 单元格——它们是独立的单元格 id，不受视口影响；本函数按 id 前缀直接读取）。
     """
-    set_display_limit(fr, page, LIMIT_START)
     _perf_set_filter(fr, page, filters)
     click_query(fr, page)
+    page.wait_for_timeout(1200)  # 等结果网格 settle（会话锚变化后数据单元格绘制）
     layout = read_perf_layout(fr, debug=False)
     letters, session = layout["letters"], layout["session"]
     rows = read_perf_rows(fr, letters)
-    print(f"  绩效查询结果行数（limit {LIMIT_START}）：{len(rows)}")
-    if LIMIT_START < LIMIT_MAX and len(rows) >= LIMIT_START:
-        print(f"  结果数 >= {LIMIT_START}，疑似被截断，升到 'limit {LIMIT_MAX}' 重查 ...")
-        set_display_limit(fr, page, LIMIT_MAX)
-        _perf_set_filter(fr, page, filters)
-        click_query(fr, page)
-        layout = read_perf_layout(fr, debug=False)
-        letters, session = layout["letters"], layout["session"]
-        rows = read_perf_rows(fr, letters)
-        print(f"  绩效查询结果行数（limit {LIMIT_MAX}）：{len(rows)}")
+    print(f"  绩效查询结果行数：{len(rows)}")
     return rows, letters, session
 
 
