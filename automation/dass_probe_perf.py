@@ -102,10 +102,10 @@ def navigate_to_perf(page) -> str | None:
 
 
 def dump_filter_inputs(fr) -> list[dict]:
-    """列出绩效页顶部所有过滤框的 name/type/placeholder/value（供确认选择器）。
+    """列出绩效页顶部所有过滤框的 name/type/placeholder/value + 边界框坐标（供确认选择器）。
 
     重点确认：当前阶段过滤框 name 是否仍是 CURRENTSTAGE，以及 PLANCODE / NEXTVERSION /
-    DEVICEMSG 是否与填报页一致。"""
+    DEVICEMSG 是否与填报页一致。额外返回每个 input 的 top/left/right 坐标，供标签就近匹配。"""
     return fr.evaluate(
         """() => {
             const out = [];
@@ -119,11 +119,195 @@ def dump_filter_inputs(fr) -> list[dict]:
                     placeholder: e.getAttribute('placeholder') || '',
                     value: (e.value || '').slice(0, 20),
                     visible: r.width > 0 && r.height > 0,
+                    top: Math.round(r.top),
+                    left: Math.round(r.left),
+                    right: Math.round(r.right),
+                    bottom: Math.round(r.bottom),
+                    width: Math.round(r.width),
+                    height: Math.round(r.height),
                 });
             }
             return out;
         }"""
     )
+
+
+def dump_filter_label_map(fr) -> dict:
+    """把顶部每个可见过滤 input 与其对应的『标签文字』就近配对。
+
+    FineReport 的过滤栏通常是：一段标签文本（如『设备扩展信息』），其右侧紧跟一个 input。
+    本函数几何配对：对每个 input，在同一水平带（纵向重叠）里找它【左侧最近】的文本节点作为
+    标签；若左侧没有，再找【正上方最近】的文本节点兜底。这样即便 input 的 name 不直观
+    （如 DEVICEMSG / 某个随机 name），也能据实知道它屏幕上对应哪个中文标签。
+
+    返回：
+      {
+        "pairs": [ {name, type, value, left, right, top, label, label_left, label_top,
+                    match: 'left'|'above'|'none', dist}... ],   # 每个可见 input 一条
+        "device_msg": {label, name, ...} | None,   # 标签含『设备扩展信息』的那个 input
+        "all_label_texts": [ ... ],                 # 过滤栏里出现过的候选标签文本（去重）
+      }
+    """
+    return fr.evaluate(
+        r"""() => {
+            // 1) 收集所有可见、可输入的过滤 input（排除隐藏/0 尺寸）。
+            const inputs = [];
+            for (const e of document.querySelectorAll("input, textarea, select")) {
+                const r = e.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                inputs.push({
+                    el: e,
+                    name: e.getAttribute('name') || '',
+                    type: e.getAttribute('type') || '',
+                    value: (e.value || '').slice(0, 20),
+                    left: Math.round(r.left), right: Math.round(r.right),
+                    top: Math.round(r.top), bottom: Math.round(r.bottom),
+                    cx: (r.left + r.right) / 2, cy: (r.top + r.bottom) / 2,
+                });
+            }
+
+            // 2) 收集所有“叶子文本节点”的屏幕位置（含中文标签）。只取可见、非纯空白、
+            //    长度 <= 20 的短文本（标签都很短），排除 input 自身。
+            const labels = [];
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+            let node;
+            while ((node = walker.nextNode())) {
+                const txt = (node.nodeValue || '').trim();
+                if (!txt || txt.length > 20) continue;
+                // 必须含中文或可见字符，排除纯符号。
+                if (!/[\u4e00-\u9fa5A-Za-z]/.test(txt)) continue;
+                const range = document.createRange();
+                range.selectNodeContents(node);
+                const r = range.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                labels.push({
+                    text: txt,
+                    left: Math.round(r.left), right: Math.round(r.right),
+                    top: Math.round(r.top), bottom: Math.round(r.bottom),
+                    cx: (r.left + r.right) / 2, cy: (r.top + r.bottom) / 2,
+                });
+            }
+
+            const vOverlap = (a, b) => Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+
+            const pairs = [];
+            for (const inp of inputs) {
+                // (a) 左侧同一行最近的标签：纵向有重叠且在 input 左边。
+                let bestLeft = null, bestLeftDist = Infinity;
+                for (const lb of labels) {
+                    if (vOverlap(inp, lb) <= 0) continue;      // 不在同一水平带
+                    if (lb.right > inp.left + 4) continue;     // 必须在 input 左侧
+                    const d = inp.left - lb.right;
+                    if (d >= 0 && d < bestLeftDist) { bestLeftDist = d; bestLeft = lb; }
+                }
+                // (b) 正上方最近的标签（兜底）：横向有重叠且在 input 上方。
+                let bestAbove = null, bestAboveDist = Infinity;
+                for (const lb of labels) {
+                    const hOverlap = Math.min(inp.right, lb.right) - Math.max(inp.left, lb.left);
+                    if (hOverlap <= 0) continue;
+                    if (lb.bottom > inp.top + 4) continue;     // 必须在上方
+                    const d = inp.top - lb.bottom;
+                    if (d >= 0 && d < bestAboveDist) { bestAboveDist = d; bestAbove = lb; }
+                }
+                let label = '', match = 'none', dist = null, lleft = null, ltop = null;
+                if (bestLeft && bestLeftDist <= 200) {
+                    label = bestLeft.text; match = 'left'; dist = bestLeftDist;
+                    lleft = bestLeft.left; ltop = bestLeft.top;
+                } else if (bestAbove && bestAboveDist <= 60) {
+                    label = bestAbove.text; match = 'above'; dist = bestAboveDist;
+                    lleft = bestAbove.left; ltop = bestAbove.top;
+                }
+                pairs.push({
+                    name: inp.name, type: inp.type, value: inp.value,
+                    left: inp.left, right: inp.right, top: inp.top,
+                    label: label, label_left: lleft, label_top: ltop,
+                    match: match, dist: dist,
+                });
+            }
+
+            // 3) 直接按文本『设备扩展信息』定位它对应的 input（右侧或下方最近）。
+            let deviceMsg = null;
+            const targets = labels.filter(l => l.text.indexOf('设备扩展信息') >= 0);
+            for (const lb of targets) {
+                let best = null, bestDist = Infinity;
+                for (const inp of inputs) {
+                    // 右侧同一行优先
+                    if (vOverlap(inp, lb) > 0 && inp.left >= lb.right - 4) {
+                        const d = inp.left - lb.right;
+                        if (d >= 0 && d < bestDist) { bestDist = d; best = inp; }
+                    }
+                }
+                if (!best) {
+                    // 兜底：下方横向重叠最近
+                    for (const inp of inputs) {
+                        const hOverlap = Math.min(inp.right, lb.right) - Math.max(inp.left, lb.left);
+                        if (hOverlap > 0 && inp.top >= lb.bottom - 4) {
+                            const d = inp.top - lb.bottom;
+                            if (d >= 0 && d < bestDist) { bestDist = d; best = inp; }
+                        }
+                    }
+                }
+                if (best) {
+                    // FineReport 过滤控件的 input 常常没有 name 属性，真实参数名可能在
+                    // input 自身的其它属性（widgetname/id/data-*）或祖先 div 上。把这些都抓出来
+                    // 供据实判断真实 name / 稳定选择器。
+                    const el = best.el;
+                    const attrs = {};
+                    for (const a of el.attributes) attrs[a.name] = a.value;
+                    const ancestors = [];
+                    let p = el.parentElement;
+                    for (let d = 0; d < 6 && p; d++) {
+                        const pa = {};
+                        for (const a of p.attributes) pa[a.name] = a.value;
+                        ancestors.push({ tag: p.tagName.toLowerCase(), attrs: pa });
+                        p = p.parentElement;
+                    }
+                    deviceMsg = {
+                        label: lb.text, name: best.name, type: best.type,
+                        value: best.value, dist: bestDist,
+                        label_left: lb.left, label_top: lb.top,
+                        input_left: best.left, input_top: best.top,
+                        input_attrs: attrs, ancestors: ancestors,
+                    };
+                    break;
+                }
+            }
+
+            // 4) 过滤栏候选标签文本（去重，仅短中文），便于人工核对布局顺序。
+            const labelTexts = [];
+            const seen = {};
+            labels.slice().sort((a,b)=> (a.top-b.top) || (a.left-b.left)).forEach(l => {
+                if (!seen[l.text]) { seen[l.text] = true; labelTexts.push(l.text); }
+            });
+
+            return { pairs, device_msg: deviceMsg, all_label_texts: labelTexts };
+        }"""
+    )
+
+
+def dump_filter_inputs_all_frames(page) -> list[dict]:
+    """遍历【所有】frame，转储每个 frame 里的过滤 input（name/label 配对）。
+
+    上一轮只在 _report_frame(page) 返回的那个 iframe 里 dump，若『设备扩展信息』框实际
+    渲染在另一个 frame（或 _report_frame 命中的 frame 不含过滤栏），就会漏掉。这里对每个
+    frame 都跑 dump_filter_label_map，据实记录它各自命中的 input/标签，彻底排除漏看。"""
+    results = []
+    for i, fr in enumerate(page.frames):
+        try:
+            data = dump_filter_label_map(fr)
+        except Exception as e:
+            results.append({"frame": i, "name": fr.name, "url": (fr.url or "")[:100],
+                            "error": str(e)})
+            continue
+        results.append({
+            "frame": i,
+            "name": fr.name,
+            "url": (fr.url or "")[:100],
+            "pairs": data.get("pairs", []),
+            "device_msg": data.get("device_msg"),
+            "all_label_texts": data.get("all_label_texts", []),
+        })
+    return results
 
 
 def dump_header_cells(fr) -> list[dict]:
@@ -265,7 +449,75 @@ def main() -> int:
             for f in filt:
                 if f["visible"] and (f["name"] or f["placeholder"]):
                     print(f"  name={f['name']!r:16} type={f['type']!r:10} "
-                          f"placeholder={f['placeholder']!r}")
+                          f"placeholder={f['placeholder']!r}  "
+                          f"left={f.get('left')} top={f.get('top')}")
+
+            # —— 过滤框 ↔ 标签就近配对（本轮补探测的核心：据实查出『设备扩展信息』的 name）——
+            label_map = dump_filter_label_map(fr)
+            obs["filter_label_map"] = label_map
+            print("\n过滤框 ↔ 标签 就近配对（report frame）：")
+            for p in label_map.get("pairs", []):
+                if p.get("label") or p.get("name"):
+                    print(f"  标签={p.get('label')!r:14} -> name={p.get('name')!r:16} "
+                          f"type={p.get('type')!r:8} (match={p.get('match')}, dist={p.get('dist')})")
+            dm = label_map.get("device_msg")
+            print(f"\n★ 『设备扩展信息』框就近配对结果：{dm}")
+            if dm:
+                print(f"  input 全属性：{dm.get('input_attrs')}")
+                print(f"  祖先链属性：{dm.get('ancestors')}")
+            print(f"过滤栏候选标签文本（按位置排序）：{label_map.get('all_label_texts')}")
+
+            # —— 保险起见，遍历所有 frame 再查一遍（防止框在别的 frame）——
+            all_frames = dump_filter_inputs_all_frames(page)
+            obs["filter_inputs_all_frames"] = all_frames
+            print("\n所有 frame 的『设备扩展信息』命中情况：")
+            device_msg_hits = []
+            for fobj in all_frames:
+                dmf = fobj.get("device_msg")
+                if dmf:
+                    device_msg_hits.append({"frame": fobj["frame"], **dmf})
+                    print(f"  frame[{fobj['frame']}] name={fobj.get('name')!r}: {dmf}")
+            obs["device_msg_hits"] = device_msg_hits
+            # 汇总最终结论：『设备扩展信息』框的真实 name 与稳定选择器。
+            # FineReport 过滤 input 常无 name 属性；真实参数名优先取 name，其次 widgetname，
+            # 再看 id（形如 'DEVICEMSG' 或 'xxx-DEVICEMSG' 等）。据实记录，缺失则置 None。
+            device_msg_name = None
+            device_msg_selector = None
+            attrs = (dm or {}).get("input_attrs", {}) or {}
+            ancestors = (dm or {}).get("ancestors", []) or []
+            # FineReport 参数名所在：优先 input 自身的 name；其次 input 自身 widgetname/id；
+            # 实测该框参数名其实在祖先 div 的 widgetname 上（class 含 fr-trigger-editor 的那个
+            # 控件 wrapper，widgetname='DEVICEMSG'）。跳过纯结构容器（PARA / __layout*__）。
+            STRUCT_WIDGETS = {"PARA", "__layout4align__"}
+            if dm and dm.get("name"):
+                device_msg_name = dm["name"]
+                device_msg_selector = f"input[name='{device_msg_name}']"
+            elif attrs.get("widgetname"):
+                device_msg_name = attrs["widgetname"]
+                device_msg_selector = f"input[widgetname='{device_msg_name}']"
+            elif attrs.get("id"):
+                device_msg_name = attrs["id"]
+                device_msg_selector = f"input[id='{device_msg_name}']"
+            else:
+                # 在祖先链里找最近的有意义 widgetname（跳过结构容器）。
+                for anc in ancestors:
+                    wn = (anc.get("attrs") or {}).get("widgetname", "").strip()
+                    if wn and wn not in STRUCT_WIDGETS:
+                        device_msg_name = wn
+                        # 该 widgetname 在 wrapper div 上，稳定选择器用 div[widgetname=...]
+                        # 内的文本 input 定位。
+                        device_msg_selector = (
+                            f"div[widgetname='{wn}'] input.fr-trigger-texteditor"
+                        )
+                        break
+                if device_msg_name is None and device_msg_hits and device_msg_hits[0].get("name"):
+                    device_msg_name = device_msg_hits[0]["name"]
+                    device_msg_selector = f"input[name='{device_msg_name}']"
+            obs["device_msg_name"] = device_msg_name
+            obs["device_msg_selector"] = device_msg_selector
+            obs["device_msg_input_attrs"] = attrs
+            print(f"\n★★ 实测『设备扩展信息』过滤框 name = {device_msg_name!r}  "
+                  f"选择器 = {device_msg_selector!r}")
 
             # —— 点一次查询（不填条件）让结果行显示出来 ——
             try:
@@ -395,7 +647,7 @@ def _write_findings(reachable: bool, obs: dict) -> None:
     lines.append("")
 
     if not ran:
-        lines.append("## ⚠ 未能实跑探测")
+        lines.append("## ⚠ 未能实跑补探测（设备扩展信息过滤框 name）")
         lines.append("")
         reason = (
             obs.get("exception")
@@ -406,19 +658,29 @@ def _write_findings(reachable: bool, obs: dict) -> None:
         lines.append(f"- 尝试过的叶子菜单候选：{obs.get('menu_candidates')}")
         lines.append(f"- 真正打开报表的叶子：{obs.get('opened_leaf')!r}")
         lines.append("")
-        lines.append("> 下面是**默认假设**，仅供后续实现起步，**不是实测值**。"
+        lines.append("> 本轮补探测目标：据实查出绩效页顶部『设备扩展信息』过滤框的真实 "
+                     "input name。但本次环境未能实跑，下面是**默认假设**，不是实测值。"
                      "站点可用后请重跑 `./.venv/bin/python -m automation.dass_probe_perf` 校准。")
         lines.append("")
-        lines.append("### 默认假设（未经实测，后续务必核对）")
+        lines.append("### ✅ 本轮采用的默认假设（供下游 Stage2 修改据此实现并加注释）")
+        lines.append("")
+        lines.append("- **设备扩展信息过滤框 name = `DEVICEMSG`**（填报页 "
+                     "`dass_fill.FILTER_INPUTS` 已知 name；绩效页与填报页同为 FineReport 报表，"
+                     "最可能一致）。")
+        lines.append("- 下游 Stage2 修改应采用的稳定选择器：**`input[name='DEVICEMSG']`**。")
+        lines.append("- ⚠ 这是**假设而非实测**；下游实现处必须加注释标明"
+                     "『绩效页 DEVICEMSG 框 name 未经实测，沿用填报页已知 name，"
+                     "站点可用时以 dass_probe_perf 实测为准』。")
+        lines.append("")
+        lines.append("### 其余默认假设（未经实测，后续务必核对）")
         lines.append("")
         lines.append("- 绩效页 frame：与填报页一致，取 URL 含 `entry_report` 的 iframe"
                      "（`_report_frame(page)` 已按此逻辑兜底到 `<td>` 最多的 frame）。")
-        lines.append("- 过滤框 name 假设与填报页相同：")
-        lines.append("  - 方案号 `PLANCODE`、目标版本 `NEXTVERSION`、设备扩展信息 `DEVICEMSG`、"
-                     "当前阶段 `CURRENTSTAGE`。")
-        lines.append("- 成功率列表头文本假设为 `升级成功率（11）`（全角括号）。")
-        lines.append("- Rule ID 列表头文本假设为 `ruleid`（与填报页同名）。")
-        lines.append("- 单元格 id 格式假设与填报页相同：`{列字母}{行号}-0-{会话锚}`，"
+        lines.append("- 其余过滤框 name 假设与填报页相同：")
+        lines.append("  - 方案号 `PLANCODE`、目标版本 `NEXTVERSION`、当前阶段 `CURRENTSTAGE`。")
+        lines.append("- 成功率列表头文本（上一轮已实测为 `升级成功率`，列字母 Z）。")
+        lines.append("- Rule ID 列表头文本（上一轮已实测为 `升级策略ruleid`，列字母 H）。")
+        lines.append("- 单元格 id 格式：`{列字母}{行号}-0-{会话锚}`，"
                      "成功率显示形如 `28.26%` / `65.07%` / `50.00%`。")
         lines.append("")
         lines.append("### 后续实现的硬性要求（安全失败，勿误放行）")
@@ -472,8 +734,71 @@ def _write_findings(reachable: bool, obs: dict) -> None:
     lines.append("")
     lines.append(f"- 方案号 `PLANCODE`：{_chk('PLANCODE')}")
     lines.append(f"- 目标版本 `NEXTVERSION`：{_chk('NEXTVERSION')}")
-    lines.append(f"- 设备扩展信息 `DEVICEMSG`：{_chk('DEVICEMSG')}")
+    lines.append(f"- 设备扩展信息 `DEVICEMSG`：{_chk('DEVICEMSG')}"
+                 " —— ⚠ **这里的 ✗ 仅指 `<input>` 的 `name` 属性**；该框真实存在，"
+                 "参数名在外层 `div[widgetname='DEVICEMSG']` 上，详见下一节『🔎 本轮补探测』。")
     lines.append(f"- 当前阶段 `CURRENTSTAGE`：{_chk('CURRENTSTAGE')}")
+    lines.append("")
+    lines.append("> 注：上表只列出带 `name` 属性的 `<input>`。绩效页『设备扩展信息』过滤框的 "
+                 "`<input>` 没有 `name` 属性（参数名在祖先 wrapper 的 `widgetname` 上），"
+                 "因此不出现在上表里——这不代表它不存在。")
+    lines.append("")
+
+    # —— 本轮补探测核心：『设备扩展信息』过滤框 ↔ 标签 就近配对实测结论 ——
+    label_map = obs.get("filter_label_map", {}) or {}
+    dm = label_map.get("device_msg")
+    dm_name = obs.get("device_msg_name")
+    dm_selector = obs.get("device_msg_selector")
+    dm_attrs = obs.get("device_msg_input_attrs", {}) or {}
+    lines.append("## 🔎 本轮补探测：『设备扩展信息』过滤框真实 name（推翻上一轮结论）")
+    lines.append("")
+    lines.append("> 上一轮错误结论：『绩效页没有设备扩展信息(DEVICEMSG)过滤框，"
+                 "设备扩展信息只作为结果列存在』。用户已用页面截图确认：绩效页顶部"
+                 "确实存在一个『设备扩展信息』文本输入框（位于『国家』右侧、『当前策略』左侧）。"
+                 "本轮用【标签文字 ↔ input 就近几何配对】据实重新探测，**结论：该框确实存在**。")
+    lines.append("")
+    lines.append(f"- **『设备扩展信息:』标签右侧确实存在一个文本输入框**（实测标签在 "
+                 f"left={ (dm or {}).get('label_left') }, top={ (dm or {}).get('label_top') }，"
+                 f"input 紧邻其右侧 left={ (dm or {}).get('input_left') }, "
+                 f"top={ (dm or {}).get('input_top') }，几何距离 { (dm or {}).get('dist') }px）。"
+                 "推翻上一轮『无此框』的结论。")
+    lines.append(f"- 该 `<input>` 本身的 `name` 属性实测为：`{(dm or {}).get('name')!r}`"
+                 "（空）。FineReport 过滤控件的 `<input class=\"fr-trigger-texteditor\">` "
+                 "**没有 name 属性**——这正是上一轮只查 `input[name=...]` 而误判『无此框』的原因。")
+    lines.append(f"- 该 input 的全部属性（实测）：`{dm_attrs}`")
+    lines.append("- **真实参数名在祖先控件 wrapper 的 `widgetname` 上**：该 input 外层紧邻一个 "
+                 "`<div class=\"fr-trigger-editor ...\" widgetname=\"DEVICEMSG\">`（实测，见下方 "
+                 "ancestors）。即该『设备扩展信息』过滤框的 FineReport 参数名就是 "
+                 "**`DEVICEMSG`**，与填报页 `dass_fill.FILTER_INPUTS['设备扩展信息']` 的 "
+                 "`DEVICEMSG` **一致**。")
+    if dm_name:
+        lines.append(f"- **结论：『设备扩展信息』过滤框参数名 = `{dm_name}`**。")
+        lines.append(f"- 下游 Stage2 修改应采用的稳定选择器：**`{dm_selector}`**")
+        lines.append("  （用 wrapper 的 `widgetname='DEVICEMSG'` 锚定再取其内的文本 input，"
+                     "比只写 `input[name='DEVICEMSG']` 更稳——因为该 input 没有 name 属性，"
+                     "绩效页上 `input[name='DEVICEMSG']` **选不中**）。")
+    else:
+        lines.append("- ⚠ 未能据实读出参数名（既无 input name，祖先也无 widgetname）；"
+                     "下游请用几何定位（『设备扩展信息:』标签右侧最近的 "
+                     "`input.fr-trigger-texteditor`），兜底沿用 `DEVICEMSG` 并加注释。")
+    lines.append("")
+    lines.append("就近配对原始命中（含 input 全属性与祖先链，供下游选稳定选择器）：")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(dm, ensure_ascii=False, indent=2))
+    lines.append("```")
+    lines.append(f"- 所有 frame device_msg 命中：`{obs.get('device_msg_hits')}`")
+    lines.append("")
+    lines.append("report frame 内 input ↔ 标签 配对表：")
+    lines.append("")
+    lines.append("| 标签 | input name | type | 配对方式 | 距离(px) |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for p in label_map.get("pairs", []):
+        if p.get("label") or p.get("name"):
+            lines.append(f"| {p.get('label','')} | `{p.get('name','')}` | "
+                         f"{p.get('type','')} | {p.get('match','')} | {p.get('dist')} |")
+    lines.append("")
+    lines.append(f"- 过滤栏候选标签文本（按屏幕位置排序）：`{label_map.get('all_label_texts')}`")
     lines.append("")
 
     lines.append("## 表头 列名 -> 列字母 映射")
@@ -518,17 +843,18 @@ def _write_findings(reachable: bool, obs: dict) -> None:
                  "是设备数不是比率，切勿当成功率用。")
     lines.append(f"2. ruleid 列表头是 **`升级策略ruleid`（列字母 {letters.get('升级策略ruleid')}）**，"
                  "不是裸 `ruleid`。")
-    has_devicemsg = "DEVICEMSG" in names
-    lines.append(f"3. 过滤框 **没有 `DEVICEMSG`（设备扩展信息）**"
-                 f"{'（本次实测不存在）' if not has_devicemsg else ''}。"
-                 "绩效页顶部过滤框只有 `PLANCODE / NEXTVERSION / CURRENTSTAGE / "
-                 "CURRENTVERSION / REGION / DEVICECODE`（另有 `sortable0/sortable1` 为检索/排序框）。"
-                 "注意：`设备扩展信息` 作为【列】存在（列字母 "
-                 f"{letters.get('设备扩展信息')}），但不能作为过滤条件输入。")
+    _fallback_sel = "div[widgetname='DEVICEMSG'] input.fr-trigger-texteditor"
+    lines.append("3. **（更正上一轮错误结论）** 绩效页顶部**确实存在『设备扩展信息』过滤框**，"
+                 f"FineReport 参数名 = `{dm_name or 'DEVICEMSG'}`（与填报页一致）。"
+                 "该框的 `<input>` 本身没有 name 属性，参数名在其外层 "
+                 "`div[widgetname='DEVICEMSG']` 上，所以 `input[name='DEVICEMSG']` **选不中**；"
+                 f"下游稳定选择器用 `{dm_selector or _fallback_sel}`。")
+    lines.append("   - ⚠ 上一轮『绩效页没有 DEVICEMSG 过滤框、设备扩展信息仅作为结果列存在』的"
+                 "结论**错误，已推翻**（上一轮只查 `input[name=...]`，漏看了 wrapper 的 "
+                 "widgetname）。设备扩展信息既是结果【列】（列字母 "
+                 f"{letters.get('设备扩展信息')}），也是顶部可用的【过滤框】。")
     lines.append("   - 影响：任务澄清的『查不到 ruleid 就按 方案号+目标版本+设备扩展码+当前阶段 "
-                 "精准查询』在绩效页**无法用设备扩展信息过滤框实现**。下一步需确认改用："
-                 "① 仅用 方案号+目标版本+当前阶段 过滤，再在结果里按 ruleid（及设备扩展信息列文本）"
-                 "本地筛选；或 ② 是否存在其它入口。**此处属产品决策，实现前请与用户确认。**")
+                 "精准查询』在绩效页**可以用该设备扩展信息过滤框实现**，Stage2 不必再退化成三字段。")
     lines.append(f"4. 升级成功率示例值形如 `28.26%`（带 `%`，需去 `%` 转 float 再比 >= 50）。")
     lines.append("")
 
