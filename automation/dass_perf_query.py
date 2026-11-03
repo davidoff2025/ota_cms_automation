@@ -117,8 +117,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target", required=True, help="目标版本（填 NEXTVERSION 过滤框）。")
     p.add_argument(
         "ruleids",
-        nargs="+",
-        help="一组 Rule ID，支持区间与逗号混合，如 65142-65154 或 65142,65150。",
+        nargs="*",
+        help="一组 Rule ID，支持区间与逗号混合，如 65142-65154 或 65142,65150；"
+             "与 --all 互斥，给了 --all 时留空。",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        dest="list_all",
+        help="不限定目标 Rule ID，列出该 方案号+目标版本 下 Stage1 查到的全部行"
+             "（与位置参数 ruleids 互斥）。",
     )
     p.add_argument(
         "--dry-run",
@@ -126,6 +134,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只解析 Rule ID 列表并打印，不启动浏览器（供校验用）。",
     )
     return p
+
+
+def _validate_mode(list_all: bool, ruleids: list[str]) -> str:
+    """校验 --all 与位置参数 ruleids 的互斥/必填关系，返回运行模式。
+
+    - list_all 且 ruleids 非空 -> 抛 ValueError（互斥，二选一）。
+    - 两者皆空 -> 抛 ValueError（必填其一）。
+    - 仅 list_all -> 返回 "all"。
+    - 仅 ruleids -> 返回 "targets"。
+    """
+    has_ruleids = bool(ruleids)
+    if list_all and has_ruleids:
+        raise ValueError("--all 与位置参数 ruleids 互斥，二选一。")
+    if not list_all and not has_ruleids:
+        raise ValueError("请给出一组 Rule ID，或用 --all 列出全部。")
+    return "all" if list_all else "targets"
 
 
 def _collect_targets(ruleid_args: list[str]) -> list[str]:
@@ -186,8 +210,63 @@ def _print_summary(targets: list[str], failed: list[str], not_found: list[str], 
         print(f"    未找到（Stage1，已遍历全部 {pages} 页）：{not_found}")
 
 
+def _ruleid_sort_key(rid: str):
+    """norm_ruleid 排序键：纯数字按数值升序，非纯数字退化为字符串比较（排在数字之后）。"""
+    return (0, int(rid)) if rid.isdigit() else (1, rid)
+
+
+def _print_all(rates: dict, pages: int = 1) -> None:
+    """--all 模式：把 Stage1 查到的【每一行】都打印出来（不做任何过滤、不触发 abort）。
+
+    rates 为 query_rates_stage1 的返回 dict（键为 norm_ruleid）。按 norm_ruleid 升序
+    （数字优先）逐行打印 raw_ruleid / norm_ruleid / 成功率文本 / 解析 float / 是否 >=50%，
+    末尾打印汇总：总行数、Rule ID 范围（最小 ~ 最大）。
+    """
+    print(f"\n======== 全部 Rule ID 及成功率（Stage1 模糊查询，已遍历全部 {pages} 页）========")
+    keys = sorted(rates, key=_ruleid_sort_key)
+    if not keys:
+        print(f"  该 方案号+目标版本 下 Stage1 未查到任何行（0 行）。")
+        print("\n======== 汇总 ========")
+        print("  总行数：0")
+        print("  Rule ID 范围：（无）")
+        return
+    for rid in keys:
+        info = rates[rid]
+        rate = info.get("rate")
+        raw = info.get("raw_ruleid", "")
+        rate_text = info.get("rate_text", "")
+        if rate is None:
+            parsed = "解析失败"
+            ge = "否"
+        else:
+            parsed = f"{rate:.2f}"
+            ge = "是" if rate >= PASS_THRESHOLD else "否"
+        print(
+            f"  Rule ID 原始显示值={raw!r} 归一值={rid}  "
+            f"成功率={rate_text!r}（解析={parsed}）  >=50%? {ge}"
+        )
+    print("\n======== 汇总 ========")
+    print(f"  总行数：{len(keys)}")
+    print(f"  Rule ID 范围：{keys[0]} ~ {keys[-1]}")
+
+
 def main() -> int:
     args = _build_parser().parse_args()
+
+    try:
+        mode = _validate_mode(args.list_all, args.ruleids)
+    except ValueError as e:
+        print(f"✗ 参数错误：{e}")
+        return 2
+
+    if mode == "all":
+        print(f"方案号：{args.plancode}")
+        print(f"目标版本：{args.target}")
+        print("模式：--all（列出该 方案号+目标版本 下 Stage1 查到的全部行）")
+        if args.dry_run:
+            print("（--dry-run：仅解析参数，不启动浏览器。）")
+            return 0
+        return _run_all(args)
 
     try:
         targets = _collect_targets(args.ruleids)
@@ -203,6 +282,10 @@ def main() -> int:
         print("（--dry-run：仅解析参数，不启动浏览器。）")
         return 0
 
+    return _run_targets(args, targets)
+
+
+def _run_targets(args, targets: list[str]) -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not config.HEADED)
         context = browser.new_context()
@@ -235,6 +318,46 @@ def main() -> int:
             failed, not_found = _print_report(targets, rates, pages)
             _print_summary(targets, failed, not_found, pages)
             return 0 if (not failed and not not_found) else 1
+        except Exception as e:
+            print(f"✗ 出错：{e}")
+            _shot(page, "perf_query_error")
+            return 1
+        finally:
+            context.close()
+            browser.close()
+
+
+def _run_all(args) -> int:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not config.HEADED)
+        context = browser.new_context()
+        page = context.new_page()
+        # 只读查询：不注册任何 dialog 应答，不点升级/提交/插入行。
+        try:
+            login(page)
+            print("\n======== 导航『安卓升级展示报表』========")
+            navigate_to_perf(page)
+            page.wait_for_timeout(2500)
+            fr = _report_frame(page)
+            if fr is None:
+                print("✗ 未找到绩效页 frame，无法查询。")
+                _shot(page, "perf_query_no_frame")
+                return 2
+
+            # --all：不限定目标 Rule ID（target_ruleids=None），跨页遍历查询全集。
+            # stats_out 收集实际遍历页数，供汇总展示。
+            stats: dict = {}
+            rates = query_rates_stage1(
+                fr, page, args.plancode, args.target, None, stats
+            )
+            _shot(page, "perf_query_done")
+            if rates is None:
+                print("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。")
+                _shot(page, "perf_query_missing_columns")
+                return 2
+
+            _print_all(rates, stats.get("pages", 1))
+            return 0
         except Exception as e:
             print(f"✗ 出错：{e}")
             _shot(page, "perf_query_error")
@@ -304,6 +427,54 @@ def _selftest() -> int:
         "_collect_targets 合并去重保序",
         _collect_targets(["65142-65144", "65143,65150"]) == ["65142", "65143", "65144", "65150"],
     )
+
+    # —— --all 与位置参数互斥/必填的模式校验 ——
+    check("--all 且无 ruleids -> 'all'", _validate_mode(True, []) == "all")
+    check("无 --all 且有 ruleids -> 'targets'", _validate_mode(False, ["65142"]) == "targets")
+    try:
+        _validate_mode(True, ["65142"])
+        check("--all 与 ruleids 并存应抛错（互斥）", False)
+    except ValueError:
+        check("--all 与 ruleids 并存抛 ValueError（互斥）", True)
+    try:
+        _validate_mode(False, [])
+        check("两者皆空应抛错（必填）", False)
+    except ValueError:
+        check("两者皆空抛 ValueError（必填）", True)
+
+    # —— _build_parser：ruleids 变为可选、--all 可解析 ——
+    parser = _build_parser()
+    ns_all = parser.parse_args(["--plancode", "P", "--target", "T", "--all"])
+    check("解析 --all 时 list_all=True 且 ruleids 为空", ns_all.list_all and ns_all.ruleids == [])
+    ns_tgt = parser.parse_args(["--plancode", "P", "--target", "T", "65142"])
+    check("解析位置参数时 list_all=False 且 ruleids=['65142']",
+          (not ns_tgt.list_all) and ns_tgt.ruleids == ["65142"])
+
+    # —— _print_all 冒烟 + 汇总范围（捕获 stdout 校验总行数/范围）——
+    import io
+    from contextlib import redirect_stdout
+
+    sample = {
+        "64807": {"rate": 100.0, "rate_text": "100.00%", "raw_ruleid": "64,807"},
+        "64813": {"rate": 0.0, "rate_text": "0.00%", "raw_ruleid": "64813"},
+        "64923": {"rate": None, "rate_text": "--", "raw_ruleid": "64923"},
+    }
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _print_all(sample, 3)
+    out = buf.getvalue()
+    check("_print_all 汇总总行数=3", "总行数：3" in out)
+    check("_print_all 汇总范围=64807 ~ 64923", "Rule ID 范围：64807 ~ 64923" in out)
+    check("_print_all 对解析失败行标注『解析失败』", "解析=解析失败" in out)
+    check("_print_all 对 >=50% 行标『是』", ">=50%? 是" in out)
+    check("_print_all 对 <50% 行标『否』", ">=50%? 否" in out)
+
+    # 空 dict 不崩，且汇总显示 0 行。
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        _print_all({}, 1)
+    out2 = buf2.getvalue()
+    check("_print_all 空结果不崩且总行数=0", "总行数：0" in out2)
 
     print("\n自测结果：", "全部通过 ✅" if ok else "存在失败 ❌")
     return 0 if ok else 1
