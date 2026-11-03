@@ -517,6 +517,17 @@ def _perf_query(
     return rows, letters, session
 
 
+def build_gate_stage1_filters(scheme: str, target: str, option: str) -> dict:
+    """构造闸门 Stage1 查询用的三字段过滤条件：方案号 + 目标版本 + 当前阶段(=上一阶段)。
+
+    闸门只在 GATE_OPTIONS（ota200/ota1k/ota5k/ota20k/ota-all）内运行，均为递进档位，
+    故 PREV_STAGE[option] 必存在（如 ota200 -> OTA50，ota-all -> OTA20000）。此函数为
+    不依赖浏览器的纯逻辑，既供 check_success_rate 实际构造 Stage1 的『当前阶段』过滤值，
+    也供 _selftest 离线断言『实际传给查询的三字段』，避免测试与实现漂移。
+    """
+    return {"方案号": scheme, "目标版本": target, "当前阶段": PREV_STAGE[option]}
+
+
 def query_rates_stage1(
     fr,
     page,
@@ -524,9 +535,16 @@ def query_rates_stage1(
     target: str,
     target_ruleids: set | None = None,
     stats_out: dict | None = None,
+    current_stage: str = "",
 ) -> dict | None:
-    """Stage1 共享查询件：方案号 + 目标版本 模糊查询（跨所有页遍历），返回按 norm_ruleid
-    归一化的成功率字典，供成功率闸门与独立查询 CLI 复用（不复制粘贴解析逻辑）。
+    """Stage1 共享查询件：方案号 + 目标版本（+可选 当前阶段）查询（跨所有页遍历），返回按
+    norm_ruleid 归一化的成功率字典，供成功率闸门与独立查询 CLI 复用（不复制粘贴解析逻辑）。
+
+    参数 current_stage：
+      - 默认空串 ""：不按『当前阶段』过滤（仅方案号+目标版本两字段）。独立 CLI
+        dass_perf_query 的两处调用不传该参数即保持原两字段行为，零破坏。
+      - 非空：把该值并入过滤条件（filters['当前阶段']），构成『方案号+目标版本+当前阶段』
+        三字段查询。闸门 Stage1 传 PREV_STAGE[option]（上一阶段）以缩小匹配范围。
 
     返回：
       - dict：{norm_ruleid: {"rate": float|None, "rate_text": str, "raw_ruleid": str}}，
@@ -542,8 +560,11 @@ def query_rates_stage1(
     target_ruleids 给定时作提前停止用（目标 Rule ID 全部命中即不再翻页）。
     stats_out 给定时写入 {'pages': 实际遍历页数}，供调用方展示『已遍历全部 N 页』。
     """
+    filters = {"方案号": scheme, "目标版本": target}
+    if current_stage:  # 仅非空才并入，空＝不按阶段过滤（CLI 不传即行为不变）
+        filters["当前阶段"] = current_stage
     rows, letters, session = _perf_query(
-        fr, page, {"方案号": scheme, "目标版本": target}, target_ruleids, stats_out
+        fr, page, filters, target_ruleids, stats_out
     )
     if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
         print(f"  ✗ 绩效页未解析到 "
@@ -601,9 +622,15 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     target_values = sorted(excel_targets) if excel_targets else [""]
     for scheme in sorted(excel_scheme_nos):
         for target in target_values:
-            print(f"\n====== 成功率 Stage1 粗筛查询：方案号={scheme!r} 目标版本={target!r} ======")
+            # A：闸门 Stage1 用三字段查询——方案号 + 目标版本 + 当前阶段(=上一阶段 PREV_STAGE)。
+            gate_filters = build_gate_stage1_filters(scheme, target, option)
+            prev_stage = gate_filters["当前阶段"]
+            print(f"\n====== 成功率 Stage1 粗筛查询：方案号={scheme!r} 目标版本={target!r} "
+                  f"当前阶段={prev_stage!r}（上一阶段）======")
             # 提前停止：本批目标 Rule ID 全部命中即可停翻页（跨页遍历在 _perf_query 内完成）。
-            stage1 = query_rates_stage1(fr, page, scheme, target, excel_ruleids)
+            stage1 = query_rates_stage1(
+                fr, page, scheme, target, excel_ruleids, current_stage=prev_stage
+            )
             if stage1 is None:  # 列字母缺失 -> 安全失败 abort（行为同旧内联分支）
                 _shot(page, "perf_missing_columns")
                 return False
@@ -648,33 +675,75 @@ def check_success_rate(fr, page, records, option: str) -> bool:
 
     _shot(page, "perf_queried")
 
-    # ———— 判定：全部 >= 50% 才放行 ————
-    failures: list[tuple[str, dict]] = []
-    for rid in sorted(excel_ruleids):
+    # ———— 判定 + 逐条/汇总打印（B）————
+    report, passed = format_gate_report(excel_ruleids, found_rate)
+    print(report)
+    if not passed:
+        _shot(page, "perf_gate_abort")
+    return passed
+
+
+def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
+    """把闸门判定结果格式化成『逐条 + 汇总 + 结论』文本，并返回 (文本, 是否放行)。
+
+    为不依赖浏览器的纯逻辑（供 check_success_rate 打印，也供 _selftest 离线断言）。
+
+    - 逐条：对 sorted(excel_ruleids) 每个 Rule ID 打印一行，无论通过与否都打印，含
+      Rule ID、升级成功率（命中可解析 -> '49.09%'；未找到 -> '未找到'；命中但解析失败 ->
+      '成功率解析失败（原文 ...）'）、是否 >=50%（'通过 ✅' / '不通过 ❌'）、来源阶段
+      （Stage1 / Stage2 / 未找到）。
+    - 汇总：总数 / 通过数 / 不通过数 / 未找到数。
+    - 结论：无 failures -> 『放行 ✅』；有 failures -> 『abort ❌』。
+
+    判定（与原行为一致）：rate 为 None（未找到/解析失败）或 rate < PASS_THRESHOLD 记为失败。
+    """
+    rids = sorted(excel_ruleids)
+    lines: list[str] = []
+    lines.append("\n======== 成功率闸门：逐条明细 ========")
+
+    pass_n = 0
+    fail_n = 0
+    not_found_n = 0
+    failures: list[str] = []
+
+    for rid in rids:
         info = found_rate.get(rid, {"rate": None, "stage": "未找到", "rate_text": ""})
-        rate = info["rate"]
-        if rate is None or rate < PASS_THRESHOLD:
-            failures.append((rid, info))
+        rate = info.get("rate")
+        stage = info.get("stage", "未找到")
+        if rate is None:
+            if stage == "未找到":
+                rate_desc = "未找到"
+                not_found_n += 1
+            else:
+                rate_desc = f"成功率解析失败（原文 {info.get('rate_text', '')!r}）"
+                fail_n += 1
+            verdict = "不通过 ❌"
+            failures.append(rid)
+        else:
+            rate_desc = f"升级成功率={rate:.2f}%"
+            if rate >= PASS_THRESHOLD:
+                verdict = "通过 ✅"
+                pass_n += 1
+            else:
+                verdict = "不通过 ❌"
+                failures.append(rid)
+                fail_n += 1
+        lines.append(f"  Rule ID={rid!r}  {rate_desc}  {verdict}  来源阶段={stage}")
+
+    # 不通过数 = 命中但未达标/解析失败；未找到数单列。总失败 = 不通过 + 未找到。
+    lines.append("\n======== 成功率闸门：汇总 ========")
+    lines.append(f"  总数：{len(rids)}  通过：{pass_n}  不通过：{fail_n}  未找到：{not_found_n}")
 
     if not failures:
-        print("\n======== 成功率闸门：通过 ✅ ========")
-        print(f"  本批 {len(excel_ruleids)} 个 Rule ID 成功率均 >= {PASS_THRESHOLD:.0f}%，放行升级。")
-        for rid in sorted(excel_ruleids):
-            info = found_rate[rid]
-            print(f"    Rule ID={rid!r}  成功率={info['rate']:.2f}%  （{info['stage']}）")
-        return True
+        lines.append(f"\n======== 最终结论：放行 ✅ ========")
+        lines.append(f"  本批 {len(rids)} 个 Rule ID 成功率均 >= {PASS_THRESHOLD:.0f}%，放行升级。")
+        return "\n".join(lines), True
 
-    print("\n======== 成功率闸门：不通过 ❌ abort 升级 ========")
-    print(f"  以下 {len(failures)} 个 Rule ID 未达标（< {PASS_THRESHOLD:.0f}% 或两阶段都查不到），"
-          "run_update 不执行，也不进入人工提交环节：")
-    for rid, info in failures:
-        if info["rate"] is None:
-            detail = "未找到" if info["stage"] == "未找到" else f"成功率解析失败（原文 {info['rate_text']!r}）"
-            print(f"    Rule ID={rid!r}  {detail}  （{info['stage']}）")
-        else:
-            print(f"    Rule ID={rid!r}  成功率={info['rate']:.2f}% < {PASS_THRESHOLD:.0f}%  （{info['stage']}）")
-    _shot(page, "perf_gate_abort")
-    return False
+    lines.append(f"\n======== 最终结论：abort ❌ 中止升级 ========")
+    lines.append(f"  以下 {len(failures)} 个 Rule ID 未达标"
+                 f"（< {PASS_THRESHOLD:.0f}% 或两阶段都查不到）：{failures}")
+    lines.append("  run_update 不执行，也不进入人工提交环节。")
+    return "\n".join(lines), False
 
 
 # —— 不依赖浏览器的纯函数自测（python -m automation.dass_perf --selftest）——
@@ -716,6 +785,54 @@ def _selftest() -> int:
     # 查不到的 Rule ID 触发 abort 的判定逻辑（rate=None => 失败）
     none_rate = None
     check("成功率 None 判为不通过", not (none_rate is not None and none_rate >= PASS_THRESHOLD))
+
+    # —— A：闸门 Stage1 三字段 filters 构造 ——
+    f200 = build_gate_stage1_filters("P", "T", "ota200")
+    check("Stage1 filters 含方案号/目标版本/当前阶段三键",
+          set(f200) == {"方案号", "目标版本", "当前阶段"})
+    check("Stage1 filters 方案号/目标版本原样", f200["方案号"] == "P" and f200["目标版本"] == "T")
+    check("ota200 当前阶段=上一阶段 OTA50", f200["当前阶段"] == PREV_STAGE["ota200"] == "OTA50")
+    check("ota-all 当前阶段=上一阶段 OTA20000",
+          build_gate_stage1_filters("P", "T", "ota-all")["当前阶段"] == "OTA20000")
+
+    # —— A：query_rates_stage1 的 current_stage 默认空＝不改变 CLI 两字段行为 ——
+    import inspect
+    sig = inspect.signature(query_rates_stage1)
+    check("query_rates_stage1 新增 current_stage 且默认空串",
+          "current_stage" in sig.parameters and sig.parameters["current_stage"].default == "")
+
+    # —— B：闸门逐条/汇总/结论日志格式（含通过/不通过/未找到/解析失败四类样本）——
+    excel_ids = {"101", "102", "103", "104"}
+    found = {
+        "101": {"rate": 72.5, "stage": "Stage1", "rate_text": "72.50%"},   # 通过
+        "102": {"rate": 49.09, "stage": "Stage2", "rate_text": "49.09%"},  # 不通过
+        "103": {"rate": None, "stage": "未找到", "rate_text": ""},          # 未找到
+        "104": {"rate": None, "stage": "Stage1", "rate_text": "--"},        # 解析失败
+    }
+    report, passed = format_gate_report(excel_ids, found)
+    check("有 failures 时不放行", passed is False)
+    check("逐条含每个 Rule ID", all(f"Rule ID={rid!r}" in report for rid in excel_ids))
+    check("逐条含『通过 ✅』", "通过 ✅" in report)
+    check("逐条含『不通过 ❌』", "不通过 ❌" in report)
+    check("逐条含『未找到』", "未找到" in report)
+    check("逐条含『成功率解析失败』", "成功率解析失败" in report)
+    check("逐条含来源阶段 Stage1/Stage2", "来源阶段=Stage1" in report and "来源阶段=Stage2" in report)
+    check("成功率按 49.09% 原样格式化", "49.09%" in report)
+    # 样本：101 通过 / 102 <50%(不通过) / 104 解析失败(不通过) / 103 未找到
+    check("汇总含总数/通过/不通过/未找到四个计数",
+          "总数：4" in report and "通过：1" in report and "不通过：2" in report and "未找到：1" in report)
+    check("结论行含 abort", "abort" in report)
+
+    # 全部通过 -> 放行
+    found_pass = {
+        "201": {"rate": 50.0, "stage": "Stage1", "rate_text": "50.00%"},  # 等于阈值放行
+        "202": {"rate": 88.0, "stage": "Stage2", "rate_text": "88.00%"},
+    }
+    report2, passed2 = format_gate_report({"201", "202"}, found_pass)
+    check("全部 >=50% 放行", passed2 is True)
+    check("放行结论含『放行』", "放行" in report2)
+    check("放行汇总 通过：2 不通过：0 未找到：0",
+          "通过：2" in report2 and "不通过：0" in report2 and "未找到：0" in report2)
 
     print("\n自测结果：", "全部通过 ✅" if ok else "存在失败 ❌")
     return 0 if ok else 1

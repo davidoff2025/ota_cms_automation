@@ -520,6 +520,28 @@ def fill_cell(fr, page, row_n: int, letter: str, session: str, value: str) -> bo
     return ok
 
 
+def format_init_detail(row_n: int, rec: dict, written: dict) -> str:
+    """把一条 init 记录格式化成可检索的写入明细行（纯逻辑，供 run_init 打印与 selftest 断言）。
+
+    含：行号、Rule ID、方案号、以及本行实际填入的各字段 `列名=值`（written 为实际被填的
+    非空字段映射，含『当前阶段时间』等 init 写入字段）。
+    """
+    pairs = "  ".join(f"{col}={val!r}" for col, val in written.items())
+    return (f"  [填报明细] 行号={row_n}  Rule ID={rec.get('ruleid', '')!r}  "
+            f"方案号={rec.get('方案号', '')!r}  写入字段：{pairs}")
+
+
+def format_update_detail(row_n: int, ruleid: str, scheme: str, tag: str, updates: dict) -> str:
+    """把一行 update 写入格式化成可检索明细行（纯逻辑，供 _write_row 打印与 selftest 断言）。
+
+    含：行号、Rule ID、方案号、来源阶段(Stage1/Stage2)、以及本次写入的 updates 各字段
+    `列名=值`（『当前阶段』『当前阶段时间』，ota50 另含『是否展示=1』）。
+    """
+    pairs = "  ".join(f"{col}={val!r}" for col, val in updates.items())
+    return (f"  [更新明细] 行号={row_n}  Rule ID={ruleid!r}  方案号={scheme!r}  "
+            f"来源阶段={tag}  写入字段：{pairs}")
+
+
 def run_init(fr, page, records) -> bool:
     """init 路径：点『插入行』-> 定位 N 个空行 -> 逐格填入。返回是否全部成功。
 
@@ -558,6 +580,7 @@ def run_init(fr, page, records) -> bool:
     ok_all = True
     for rec, row_n in zip(records, rows_n):
         print(f"\n填写行 {row_n}：")
+        written: dict = {}  # 本行实际填入的非空字段（列名->值），供逐条明细打印
         for col in FILL_COLUMNS:
             letter, header_name = resolve_letter(col)
             if not letter:
@@ -565,8 +588,11 @@ def run_init(fr, page, records) -> bool:
             val = rec.get(col, "")
             if val == "":
                 continue
+            written[col] = val
             if not fill_cell(fr, page, row_n, letter, session, val):
                 ok_all = False
+        # C：逐条打印可检索的写入明细（行号 + Rule ID + 方案号 + 实际写入各字段值）。
+        print(format_init_detail(row_n, rec, written))
     return ok_all
 
 
@@ -682,6 +708,9 @@ def run_update(fr, page, records, option: str) -> dict:
         for col, val in updates.items():
             if not fill_cell(fr, page, row_n, letters[col], session, val):
                 ok_row = False
+        # C：逐条打印可检索的更新明细（行号 + Rule ID + 方案号 + 来源阶段 + 写入字段值）。
+        scheme = excel_by_ruleid.get(ruleid, {}).get("方案号", "")
+        print(format_update_detail(row_n, ruleid, scheme, tag, updates))
         return ok_row
 
     # ———— Stage1：按 方案号×目标版本（+上一阶段）粗筛查询 ————
@@ -920,5 +949,47 @@ def main() -> int:
             browser.close()
 
 
+# —— 不依赖浏览器的纯函数自测（python -m automation.dass_fill --selftest）——
+def _selftest() -> int:
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+        if not cond:
+            ok = False
+
+    # —— C：init 明细行格式 ——
+    rec = {"ruleid": "65204", "方案号": "MT9655AndrGTVLas", "目标版本": "0100UQ1015"}
+    written = {"方案号": "MT9655AndrGTVLas", "ruleid": "65204", "目标版本": "0100UQ1015",
+               "当前阶段时间": "20260101"}
+    init_line = format_init_detail(3, rec, written)
+    check("init 明细含行号", "行号=3" in init_line)
+    check("init 明细含 Rule ID", "Rule ID='65204'" in init_line)
+    check("init 明细含方案号", "方案号='MT9655AndrGTVLas'" in init_line)
+    check("init 明细含写入字段『当前阶段时间』", "当前阶段时间='20260101'" in init_line)
+
+    # —— C：update 明细行格式（ota200，Stage1）——
+    upd = {"当前阶段": "OTA200", "当前阶段时间": "20260101"}
+    up_line = format_update_detail(5, "65204", "MT9655AndrGTVLas", "Stage1", upd)
+    check("update 明细含行号", "行号=5" in up_line)
+    check("update 明细含 Rule ID", "Rule ID='65204'" in up_line)
+    check("update 明细含方案号", "方案号='MT9655AndrGTVLas'" in up_line)
+    check("update 明细含来源阶段 Stage1", "来源阶段=Stage1" in up_line)
+    check("update 明细含『当前阶段=OTA200』", "当前阶段='OTA200'" in up_line)
+    check("update 明细含『当前阶段时间』", "当前阶段时间='20260101'" in up_line)
+
+    # —— C：update 明细（ota50 变体，含是否展示=1；来源阶段 Stage2）——
+    upd50 = {"当前阶段": "OTA50", "当前阶段时间": "20260101", "是否展示": "1"}
+    up50_line = format_update_detail(7, "65210", "MT9655AndrGTVLas", "Stage2", upd50)
+    check("ota50 update 明细含『是否展示=1』", "是否展示='1'" in up50_line)
+    check("ota50 update 明细含来源阶段 Stage2", "来源阶段=Stage2" in up50_line)
+
+    print("\n自测结果：", "全部通过 ✅" if ok else "存在失败 ❌")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(_selftest())
     sys.exit(main())
