@@ -140,10 +140,11 @@ def _collect_targets(ruleid_args: list[str]) -> list[str]:
     return targets
 
 
-def _print_report(targets: list[str], rates: dict) -> tuple[list[str], list[str]]:
+def _print_report(targets: list[str], rates: dict, pages: int = 1) -> tuple[list[str], list[str]]:
     """按目标顺序逐条打印，返回 (不通过列表, 未找到列表)。
 
-    rates 为 query_rates_stage1 的返回 dict（键为 norm_ruleid）。
+    rates 为 query_rates_stage1 的返回 dict（键为 norm_ruleid）。pages 为跨页遍历
+    实际翻过的页数，用于『未找到（Stage1，已遍历全部 N 页）』提示。
     判定：命中且 rate >= PASS_THRESHOLD -> 通过；命中但 rate < 阈值 -> 不通过；
     命中但 rate 为 None（解析失败）-> 不通过（标成功率解析失败）；未命中 -> 未找到。
     """
@@ -153,7 +154,7 @@ def _print_report(targets: list[str], rates: dict) -> tuple[list[str], list[str]
     for rid in targets:
         info = rates.get(rid)
         if info is None:
-            print(f"  Rule ID={rid}  成功率=未找到（Stage1）  未找到  （Stage1）")
+            print(f"  Rule ID={rid}  成功率=未找到（Stage1，已遍历全部 {pages} 页）  未找到")
             not_found.append(rid)
             continue
         rate = info.get("rate")
@@ -169,7 +170,7 @@ def _print_report(targets: list[str], rates: dict) -> tuple[list[str], list[str]
     return failed, not_found
 
 
-def _print_summary(targets: list[str], failed: list[str], not_found: list[str]) -> None:
+def _print_summary(targets: list[str], failed: list[str], not_found: list[str], pages: int = 1) -> None:
     print("\n======== 汇总 ========")
     total = len(targets)
     passed_n = total - len(failed) - len(not_found)
@@ -182,7 +183,7 @@ def _print_summary(targets: list[str], failed: list[str], not_found: list[str]) 
     if failed:
         print(f"    不通过（< {PASS_THRESHOLD:.0f}% 或解析失败）：{failed}")
     if not_found:
-        print(f"    未找到（Stage1）：{not_found}")
+        print(f"    未找到（Stage1，已遍历全部 {pages} 页）：{not_found}")
 
 
 def main() -> int:
@@ -218,15 +219,21 @@ def main() -> int:
                 _shot(page, "perf_query_no_frame")
                 return 2
 
-            rates = query_rates_stage1(fr, page, args.plancode, args.target)
+            # 传入目标 Rule ID 集合作提前停止：跨页遍历（_perf_query 内），目标全部命中即停。
+            # stats_out 收集实际遍历页数，用于『未找到（Stage1，已遍历全部 N 页）』提示。
+            stats: dict = {}
+            rates = query_rates_stage1(
+                fr, page, args.plancode, args.target, set(targets), stats
+            )
             _shot(page, "perf_query_done")
             if rates is None:
                 print("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。")
                 _shot(page, "perf_query_missing_columns")
                 return 2
 
-            failed, not_found = _print_report(targets, rates)
-            _print_summary(targets, failed, not_found)
+            pages = stats.get("pages", 1)
+            failed, not_found = _print_report(targets, rates, pages)
+            _print_summary(targets, failed, not_found, pages)
             return 0 if (not failed and not not_found) else 1
         except Exception as e:
             print(f"✗ 出错：{e}")

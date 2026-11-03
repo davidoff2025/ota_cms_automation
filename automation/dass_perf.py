@@ -77,6 +77,15 @@ PERF_FILTER_INPUTS_OTHERS = {
     "机型": "input[name='DEVICECODE']",
 }
 
+# —— 结果分页控件（实测，见 perf-probe-findings.md『结果分页机制』补探测）——
+# 下一页按钮：div[widgetname='Next']（等价 #fr-btn-Next / button.x-emb-next）。
+# 禁用判定：Next 的 wrapper div 带 class 'ui-state-disabled'（已翻到末页/本页即末页）。
+PERF_NEXT_BUTTON = "#fr-btn-Next"
+PERF_NEXT_WIDGET = "div[widgetname='Next']"
+# 翻页安全上界：工具栏 '/N' 指示不等于『有数据的页数』（实测 /4 但数据只在第 1 页），
+# 只拿它当『最多翻几次』的兜底上界，避免失控；真正判停靠『本页读到 0 行 / Next 禁用』。
+PERF_PAGE_HARD_CAP = 200
+
 # 绩效页表头【自己的】列名列表（不要改动 dass_fill.read_column_layout 的 known）。
 # 实测该页成功率列表头文本是『升级成功率』(列字母 Z)、ruleid 列是『升级策略ruleid』(列字母 H)。
 PERF_KNOWN_COLUMNS = [
@@ -265,34 +274,258 @@ def _perf_set_filter(fr, page, values: dict) -> None:
     print(f"  过滤条件：{shown}")
 
 
-def _perf_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
-    """填绩效页过滤框 -> 点『查询』-> 等重绘完成 -> 读结果行。
+def _perf_scroll_grid_horizontal(fr) -> None:
+    """把结果网格的横向滚动容器来回滚一遍，促使 H(ruleid)/Z(成功率) 列单元格进入 DOM 后再读。
 
-    返回 (rows, letters, session)。rows 来自 read_perf_rows（每行含 ruleid/rate_text）。
+    实测（perf-probe-findings.md 第二轮）：本页 x-table 不做虚拟/懒渲染，H/Z 单元格按 id
+    稳定存在、横向滚动前后计数相同。但用户明确要求『逐页横向滚动渲染 H/Z 列再读』，故这里
+    做一次 best-effort 的横向滚动（滚到最右再滚回）——有懒渲染时能确保单元格入 DOM，无懒
+    渲染时也无副作用（不改变单元格 id、不影响按 id 前缀读取）。任何异常都吞掉，不影响读取。
+    """
+    try:
+        fr.evaluate(
+            """() => {
+                const sc = document.querySelector('div.content-container')
+                    || document.querySelector('.x-table') && document.querySelector('.x-table').parentElement;
+                if (!sc) return;
+                const max = sc.scrollWidth - sc.clientWidth;
+                if (max > 0) { sc.scrollLeft = max; sc.scrollLeft = 0; sc.scrollLeft = max; }
+            }"""
+        )
+    except Exception:
+        pass
+
+
+def _perf_next_disabled(fr) -> bool:
+    """『下一页』是否已禁用（已到末页）。实测禁用时 wrapper div 的 class 含 'ui-state-disabled'。"""
+    try:
+        cls = fr.evaluate(
+            """(sel) => {
+                const e = document.querySelector(sel);
+                return e ? (e.className || '') : null;
+            }""",
+            PERF_NEXT_WIDGET,
+        )
+    except Exception:
+        return False
+    if cls is None:
+        return True  # 找不到 Next 控件，当作不可继续翻页（保守停止）
+    return "ui-state-disabled" in cls
+
+
+def _perf_page_input_value(fr):
+    """读当前页码输入框的值（实测该框无 name，用工具栏内 input.fr-texteditor 宽度小的那个）。
+
+    返回字符串值或 None。仅用于『翻页是否完成』的变化信号，读不到不影响主流程。
+    """
+    try:
+        return fr.evaluate(
+            """() => {
+                const ins = Array.from(document.querySelectorAll('input.fr-texteditor'));
+                // 页码框实测 width:42px、text-align:center；取首个窄居中的文本框。
+                for (const i of ins) {
+                    const st = i.getAttribute('style') || '';
+                    if (st.indexOf('text-align: center') >= 0) return i.value;
+                }
+                return ins.length ? ins[0].value : null;
+            }"""
+        )
+    except Exception:
+        return None
+
+
+def _perf_loading_visible(fr) -> bool:
+    """grid 是否正显示 Loading（翻页/重查中途）。读不到就当作不在 loading。"""
+    try:
+        return bool(
+            fr.evaluate(
+                """() => {
+                    const els = Array.from(document.querySelectorAll('div, span, td'));
+                    for (const e of els) {
+                        const t = (e.innerText || '').trim();
+                        if (t === 'Loading' || t === '正在加载' || t === 'Loading...') {
+                            const r = e.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _perf_wait_page_turn(fr, page, prev_session, prev_page_val, timeout_ms: int = 15000) -> bool:
+    """点『下一页』后等新页加载完成。
+
+    判定信号（实测，见 perf-probe-findings.md『结果分页机制』第 3 节）：
+      （会话锚变化 或 页码框值变化）且 Loading 不可见 -> 再 settle 500ms 视为稳定。
+    返回 True 表示检测到翻页完成；超时返回 False（调用方据此停止，避免误读旧网格）。
+    """
+    waited, step = 0, 300
+    while waited < timeout_ms:
+        page.wait_for_timeout(step)
+        waited += step
+        if _perf_loading_visible(fr):
+            continue
+        cur_session = read_perf_layout(fr, debug=False)["session"]
+        cur_page_val = _perf_page_input_value(fr)
+        changed = (cur_session is not None and cur_session != prev_session) or (
+            cur_page_val is not None and cur_page_val != prev_page_val
+        )
+        if changed:
+            page.wait_for_timeout(500)  # settle，避免读到翻页中途的旧网格
+            return True
+    return False
+
+
+def _perf_read_all_pages(
+    fr,
+    page,
+    target_ruleids: set | None = None,
+) -> tuple[list[dict], dict, str, int]:
+    """从第 1 页起遍历所有结果页，逐页横向滚动 + 读取 + 按 norm_ruleid 去重累积。
+
+    返回 (rows, letters, session, pages_traversed)：
+      - rows：去重后的累积结果行（每行 {n, ruleid, rate_text}；n 为所在页内的行号，仅调试用）。
+      - letters/session：**第 1 页** 的表头列字母映射与会话锚（供调用方校验列字母存在；后续
+        页各自的 letters 内部读取时即时解析，不外泄——各页 H/Z 列字母一致）。
+      - pages_traversed：实际翻过的页数（含第 1 页）。
+
+    判停（见 findings『结果分页机制』第 5 节，不信任 '/N' 指示作数据页数）：
+      1) 本页读到 0 个 ruleid(H) 单元格 -> 已越过数据末页，停；
+      2) 『下一页』禁用（wrapper class 含 ui-state-disabled）-> 停；
+      3) 翻页未检测到完成信号（超时）-> 停（保守，避免误读旧网格）；
+      4) 命中 PERF_PAGE_HARD_CAP 安全上界 -> 停（防失控）。
+    提前停止：若给了 target_ruleids 且已全部命中，则不再翻页（目标集齐即可返回）。
+    去重：按 norm_ruleid 归一化后的 Rule ID 去重（防翻页重叠或合并单元格导致重复）。
+    """
+    # —— 第 1 页 ——
+    first_layout = read_perf_layout(fr, debug=False)
+    first_letters, first_session = first_layout["letters"], first_layout["session"]
+    if not first_letters.get(PERF_RULEID_HEADER) or not first_letters.get(PERF_SUCCESS_RATE_HEADER):
+        # 列字母缺失：直接返回空，交由调用方安全失败（与旧行为一致）。
+        return [], first_letters, first_session, 1
+
+    seen: set[str] = set()
+    acc: list[dict] = []
+    remaining = set(target_ruleids) if target_ruleids is not None else None
+
+    def _accumulate(page_rows: list[dict]) -> int:
+        added = 0
+        for row in page_rows:
+            rid = norm_ruleid(row.get("ruleid", ""))
+            if not rid or rid in seen:  # 去重：空 ruleid 跳过，重复 ruleid 跳过
+                continue
+            seen.add(rid)
+            acc.append(row)
+            added += 1
+            if remaining is not None:
+                remaining.discard(rid)
+        return added
+
+    _perf_scroll_grid_horizontal(fr)
+    page1_rows = read_perf_rows(fr, first_letters)
+    _accumulate(page1_rows)
+    print(f"  绩效第 1 页行数：{len(page1_rows)}（累计去重 {len(acc)}）")
+
+    pages = 1
+    # 提前停止：目标 Rule ID 已全部命中就不必再翻页。
+    if remaining is not None and not remaining:
+        print("  目标 Rule ID 已全部命中，提前停止翻页。")
+        return acc, first_letters, first_session, pages
+
+    prev_session = first_session
+    prev_page_val = _perf_page_input_value(fr)
+
+    while pages < PERF_PAGE_HARD_CAP:
+        if _perf_next_disabled(fr):
+            print(f"  『下一页』已禁用，停止翻页（共遍历 {pages} 页）。")
+            break
+        # 点『下一页』。
+        try:
+            loc = fr.locator(PERF_NEXT_BUTTON).first
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.click()
+        except Exception as e:
+            print(f"  ⚠ 点击『下一页』失败（{PERF_NEXT_BUTTON}）：{e}；停止翻页（共 {pages} 页）。")
+            break
+        if not _perf_wait_page_turn(fr, page, prev_session, prev_page_val):
+            print(f"  ⚠ 未检测到翻页完成信号（超时），停止翻页（共遍历 {pages} 页）。")
+            break
+        pages += 1
+
+        cur_layout = read_perf_layout(fr, debug=False)
+        cur_letters, cur_session = cur_layout["letters"], cur_layout["session"]
+        _perf_scroll_grid_horizontal(fr)
+        page_rows = read_perf_rows(fr, cur_letters) if cur_letters.get(PERF_RULEID_HEADER) else []
+        added = _accumulate(page_rows)
+        print(f"  绩效第 {pages} 页行数：{len(page_rows)}（本页新增去重 {added}，累计 {len(acc)}）")
+
+        prev_session = cur_session
+        prev_page_val = _perf_page_input_value(fr)
+
+        # 判停①：本页读到 0 个 ruleid 单元格 -> 已越过数据末页。
+        if len(page_rows) == 0:
+            print(f"  本页无数据行，判定已越过数据末页，停止翻页（共遍历 {pages} 页）。")
+            break
+        # 提前停止：目标 Rule ID 已全部命中。
+        if remaining is not None and not remaining:
+            print(f"  目标 Rule ID 已全部命中，提前停止翻页（共遍历 {pages} 页）。")
+            break
+    else:
+        print(f"  ⚠ 已达翻页安全上界 {PERF_PAGE_HARD_CAP} 页，停止翻页。")
+
+    return acc, first_letters, first_session, pages
+
+
+def _perf_query(
+    fr,
+    page,
+    filters: dict,
+    target_ruleids: set | None = None,
+    stats_out: dict | None = None,
+) -> tuple[list[dict], dict, str]:
+    """填绩效页过滤框 -> 点『查询』-> 等重绘完成 -> 【跨所有页】遍历读取结果行。
+
+    返回 (rows, letters, session)。rows 为**所有页**去重累积的结果（每行含 ruleid/rate_text），
+    letters/session 为第 1 页的表头列字母映射与会话锚（供调用方校验列字母存在）。
 
     ⚠ 绩效页【没有『显示行数/LIMIT』过滤框】（实测，见 perf-probe-findings.md 第二轮补探测：
     顶部控件里没有 name='LIMIT' 的输入框，也没有 limit 50/100 选项）。因此这里**不设 limit**、
     也**不做**填报页那种『结果数 >= limit 疑似截断就升档重查』的逻辑——照搬填报页的
-    set_display_limit(input[name='LIMIT']) 在绩效页只会超时失败且无意义。查询流程就是：
-    填方案号+目标版本 -> 点查询 -> 等重绘 -> 读结果。
+    set_display_limit(input[name='LIMIT']) 在绩效页只会超时失败且无意义。
 
     重绘完成信号（实测）：点『查询』后会话锚会变（如 1814->1815）、Loading 文本消失、
     方案号列切换为过滤后的方案；click_query 已显式轮询表头+会话锚恢复，这里再 settle 一下。
-    成功率列(Z)/ruleid 列(H) 的单元格在查询后即渲染到 DOM（实测无需额外横向滚动即可读到
-    H/Z 单元格——它们是独立的单元格 id，不受视口影响；本函数按 id 前缀直接读取）。
+
+    翻页遍历（实测，见 perf-probe-findings.md『结果分页机制』）：查询生效后从第 1 页起，
+    逐页横向滚动确保 H(ruleid)/Z(成功率) 列单元格入 DOM 再读，点『下一页』并用『会话锚/页码框
+    变化且 Loading 消失』确认新页加载，逐页按 norm_ruleid 去重累积；直到本页 0 行 / Next 禁用 /
+    目标 Rule ID 已集齐。**不信任工具栏 '/N' 指示作数据页数**（实测 /4 但数据仅在第 1 页）。
+    target_ruleids 给定时用于提前停止（目标全部命中即不再翻页）。
+    stats_out 给定时写入 {'pages': 实际遍历页数}，供调用方（如 CLI）在『未找到』提示里展示。
     """
     _perf_set_filter(fr, page, filters)
     click_query(fr, page)
     page.wait_for_timeout(1200)  # 等结果网格 settle（会话锚变化后数据单元格绘制）
-    layout = read_perf_layout(fr, debug=False)
-    letters, session = layout["letters"], layout["session"]
-    rows = read_perf_rows(fr, letters)
-    print(f"  绩效查询结果行数：{len(rows)}")
+    rows, letters, session, pages = _perf_read_all_pages(fr, page, target_ruleids)
+    print(f"  绩效查询结果行数（已遍历 {pages} 页，去重后）：{len(rows)}")
+    if stats_out is not None:
+        stats_out["pages"] = pages
     return rows, letters, session
 
 
-def query_rates_stage1(fr, page, scheme: str, target: str) -> dict | None:
-    """Stage1 共享查询件：方案号 + 目标版本 模糊查询（limit 100），返回按 norm_ruleid
+def query_rates_stage1(
+    fr,
+    page,
+    scheme: str,
+    target: str,
+    target_ruleids: set | None = None,
+    stats_out: dict | None = None,
+) -> dict | None:
+    """Stage1 共享查询件：方案号 + 目标版本 模糊查询（跨所有页遍历），返回按 norm_ruleid
     归一化的成功率字典，供成功率闸门与独立查询 CLI 复用（不复制粘贴解析逻辑）。
 
     返回：
@@ -304,8 +537,14 @@ def query_rates_stage1(fr, page, scheme: str, target: str) -> dict | None:
     说明：这段逻辑原本内联在 check_success_rate 的 Stage1 循环里（_perf_query 查询 ->
     校验两列字母存在 -> 遍历结果行按 norm_ruleid 归一化 -> parse_percent 解析成功率），
     这里整体抽出为纯查询件，check_success_rate 改为调用它，行为逐行等价。
+
+    翻页：_perf_query 现已跨所有结果页遍历并按 norm_ruleid 去重累积（见其 docstring）。
+    target_ruleids 给定时作提前停止用（目标 Rule ID 全部命中即不再翻页）。
+    stats_out 给定时写入 {'pages': 实际遍历页数}，供调用方展示『已遍历全部 N 页』。
     """
-    rows, letters, session = _perf_query(fr, page, {"方案号": scheme, "目标版本": target})
+    rows, letters, session = _perf_query(
+        fr, page, {"方案号": scheme, "目标版本": target}, target_ruleids, stats_out
+    )
     if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
         print(f"  ✗ 绩效页未解析到 "
               f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
@@ -363,7 +602,8 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     for scheme in sorted(excel_scheme_nos):
         for target in target_values:
             print(f"\n====== 成功率 Stage1 粗筛查询：方案号={scheme!r} 目标版本={target!r} ======")
-            stage1 = query_rates_stage1(fr, page, scheme, target)
+            # 提前停止：本批目标 Rule ID 全部命中即可停翻页（跨页遍历在 _perf_query 内完成）。
+            stage1 = query_rates_stage1(fr, page, scheme, target, excel_ruleids)
             if stage1 is None:  # 列字母缺失 -> 安全失败 abort（行为同旧内联分支）
                 _shot(page, "perf_missing_columns")
                 return False
@@ -387,7 +627,8 @@ def check_success_rate(fr, page, records, option: str) -> bool:
             filters["当前阶段"] = PREV_STAGE[option]
         print(f"\n====== 成功率 Stage2 精准查询：Rule ID={rid!r} 方案号={k_scheme!r} "
               f"目标版本={k_target!r} 设备扩展信息={k_ext!r} 当前阶段={filters.get('当前阶段', '')!r} ======")
-        rows, letters, session = _perf_query(fr, page, filters)
+        # 跨页遍历（_perf_query 内）；只找这一个 rid，命中即提前停止翻页。
+        rows, letters, session = _perf_query(fr, page, filters, {rid})
         if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
             print(f"  ✗ 绩效页未解析到 "
                   f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
