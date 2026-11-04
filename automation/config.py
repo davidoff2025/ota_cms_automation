@@ -26,6 +26,9 @@ def get(name: str, default: str = "") -> str:
 # URLs (have sane defaults so only credentials are mandatory).
 CMS_LOGIN_URL = get("CMS_LOGIN_URL", "http://cms.intsmarthub.com:31597/microop/user/login/")
 CMS_OTA_URL = get("CMS_OTA_URL", "http://cms.intsmarthub.com:31597/basicservice/otamanage/upgrade-ota")
+# 「规则上下线编排」双区弹窗的真实入口：升级事件(upevent) 列表行内『规则上下线』按钮
+# （findings §8.0 实跑校正）。注意：旧 /otamanage/uprule 单表页不是该编排视图。
+CMS_UPEVENT_URL = get("CMS_UPEVENT_URL", "http://cms.intsmarthub.com:31597/basicservice/otamanage/upevent")
 
 HEADED = get("CMS_HEADED", "true").lower() in ("1", "true", "yes", "on")
 ARTIFACTS_DIR = _PROJECT_ROOT / get("CMS_ARTIFACTS_DIR", "./artifacts").lstrip("./")

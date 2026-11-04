@@ -10,7 +10,8 @@
 三阶段（已确认决策 D1~D12，硬性）：
   阶段1 导入建规则（D5）：走「OTA升级模板导入」入口，把规则名称(D1)/备注(D2)填入导入弹窗
        输入框后导入，导入后回读本批连续 Rule ID range。
-  阶段2 逐条上线 + 冲突处理（D6/D7/D8）：在「待选规则」按规则ID搜出→点「上线」→确认框点
+  阶段2 逐条上线 + 冲突处理（D6/D7/D8）：从「升级事件(upevent)」列表行内点『规则上下线』打开
+       标题为「规则上下线编排」的双区弹窗，在「待选规则」区按规则ID搜出→点「上线」→确认框点
        「确定」。若弹「规则替换」冲突窗：解析被冲突号 XXXXX→先不点弹窗按钮→去「已选规则」
        按 XXXXX 搜、读 mac组 列→mac组非空→回弹窗点「确定」替换；mac组为空→点「取消」中止该条。
   阶段3 状态汇总（D9/D10）：对每个 Rule ID 回读最终状态（online / 冲突中止 / 失败）并打印。
@@ -26,10 +27,16 @@
 - Rule ID 比较统一复用 dass_fill.norm_ruleid（去所有非数字分隔符）。
 - 不改动 dass_* / login 既有代码；Excel 读取复用 openpyxl（沿用 dass_data 表头→列索引范式）。
 
-⚠ 编排视图（「已选规则/待选规则」双区、上线/下线/编辑按钮、确认框、规则替换弹窗、mac组列）
-  的真实选择器在探测阶段**未实跑复现**（见 .agents/tasks/active-ota-probe-findings.md 第 2.2/3/5 节），
-  本模块对应选择器为**预期值**，首次实跑前应先 `--probe-online` 校正；所有写操作均经二次确认 gate
-  （D-f），条件不满足只打印不点，确保不误点危险按钮。
+编排视图真实选择器（见 .agents/tasks/active-ota-probe-findings.md §8，实跑校正）：
+  · 入口：升级事件页 CMS_UPEVENT_URL 列表行内『规则上下线』按钮 → 标题「规则上下线编排」的 antd 弹窗。
+  · 双区根容器：弹窗内有且仅 2 张带表头 .vxe-table，**待选表独有 class `vxe-editable`**
+    （已选表无此 class）；已选=第 1 张 .vxe-table。区 class 为空、vxe `tid_*` 动态，勿硬编码。
+  · 两区搜索框 #ruleId（精准）/#deviceExt（模糊）各出现 2 次（两区各一、id 重复），必须先锚区再取。
+  · 列序：规则ID=索引0、mac组=索引5（两区一致）；按列头文本定位列索引更稳。
+⚠ 仍**未实跑复现**（环境两区 No Data 所致，见 findings §8.4/8.5/8.8）：行级『上线/下线/编辑』按钮
+  文本（是否全角空格）、「确认上线该规则?」小确认框、「规则替换」冲突窗、真实 mac组 单元格占位文案。
+  这些按**用户截图/DOM 推断**填入并在注释标注「未实跑复现」，所有写操作均经二次确认 gate（D-f），
+  条件不满足只打印不点，确保不误点危险按钮。首次实跑前可 `--probe-online` 再校正这几项。
 """
 from __future__ import annotations
 
@@ -286,6 +293,125 @@ def _click_button_in(scope, page, keyword: str, label: str) -> bool:
     return False
 
 
+# —— 「规则上下线编排」双区弹窗：导航 + 区作用域（findings §8，实跑校正）——
+
+def open_orchestration_modal(page):
+    """导航升级事件页并点行内『规则上下线』，打开标题为「规则上下线编排」的双区弹窗。
+
+    返回弹窗 locator（.ant-modal，含文本「规则上下线编排」）。失败抛 RuntimeError。
+    入口与判定信号均为 findings §8.0 实跑校正：
+      - URL = config.CMS_UPEVENT_URL（/basicservice/otamanage/upevent）。
+      - 行内按钮文本 `规则上下线`（无全角空格），`get_by_role("button", name="规则上下线")`。
+      - 弹窗判定：`.ant-modal-title has_text="规则上下线编排"` 可见。
+    注意：旧 /otamanage/uprule 单表页不是该视图（findings §8.0 已作废原 §2.1 结论）。
+    """
+    print(f"  打开升级事件页：{config.CMS_UPEVENT_URL}")
+    page.goto(config.CMS_UPEVENT_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+    try:
+        page.get_by_role("button", name="规则上下线").first.click()
+    except Exception as e:
+        raise RuntimeError(f"未能点开升级事件行内『规则上下线』按钮：{e}")
+    try:
+        page.locator(".ant-modal-title", has_text="规则上下线编排").first.wait_for(
+            state="visible", timeout=10000
+        )
+    except Exception as e:
+        raise RuntimeError(f"点『规则上下线』后未出现「规则上下线编排」弹窗：{e}")
+    page.wait_for_timeout(1200)
+    modal = page.locator(".ant-modal", has_text="规则上下线编排").last
+    print("  ✓ 已打开「规则上下线编排」双区弹窗。")
+    return modal
+
+
+def _orchestration_modal(page):
+    """返回当前可见的「规则上下线编排」弹窗 locator；不在场返回 None。"""
+    modal = page.locator(".ant-modal", has_text="规则上下线编排").last
+    try:
+        return modal if modal.count() and modal.is_visible() else None
+    except Exception:
+        return None
+
+
+def _pending_table(modal):
+    """待选规则表 = 弹窗内独有 class `vxe-editable` 的 .vxe-table（findings §8.1）。"""
+    return modal.locator(".vxe-table.vxe-editable").first
+
+
+def _selected_table(modal):
+    """已选规则表 = 弹窗内第 1 张带表头的 .vxe-table（findings §8.1）。"""
+    return modal.locator(".vxe-table").first
+
+
+def _pending_form(modal):
+    """待选规则搜索表单 = 弹窗内 form.ant-form-inline（findings §8.1 block 2）。"""
+    return modal.locator("form.ant-form-inline").first
+
+
+def _search_pending_zone(modal, page, rule_id: str) -> bool:
+    """在「待选规则」区按规则ID精确搜索（findings §8.2）。
+
+    待选搜索表单 = form.ant-form-inline（block 2），区内 #ruleId placeholder=精准匹配；
+    搜索按钮文本无全角空格。先锚待选表单再取 #ruleId，避免与已选区同名控件混淆。
+    """
+    form = _pending_form(modal)
+    form.locator("input#ruleId").first.fill(norm_ruleid(rule_id))
+    return _click_button_in(form, page, "搜索", "待选规则-搜索")
+
+
+def _search_selected_zone(modal, page, rule_id: str) -> bool:
+    """在「已选规则」区按规则ID精确搜索（findings §8.2）。
+
+    findings §8.1：已选区搜索表单与已选表同在弹窗第 0 块，是弹窗内**第 1 个**搜索表单
+    （待选表单 form.ant-form-inline 在其后）。#ruleId 两区重复，用「第 1 个 #ruleId」锚已选区，
+    并点其所在表单的『搜索』。
+    """
+    # 已选区 #ruleId = 弹窗内第 1 个（DOM 顺序先于待选 form.ant-form-inline）。
+    box = modal.locator("input#ruleId").first
+    box.fill(norm_ruleid(rule_id))
+    # 已选区搜索按钮 = 弹窗内第 1 个『搜索』（去空白匹配，无全角空格）。
+    btns = modal.locator("button")
+    for i in range(btns.count()):
+        el = btns.nth(i)
+        try:
+            if not el.is_visible():
+                continue
+            if "搜索" in _normspace(el.inner_text()):
+                el.scroll_into_view_if_needed(timeout=2000)
+                el.click()
+                print("  ✓ 已点击『已选规则-搜索』按钮（弹窗内第 1 个搜索）")
+                page.wait_for_timeout(600)
+                return True
+        except Exception:
+            continue
+    print("  ✗ 未找到可见的『已选规则-搜索』按钮。")
+    return False
+
+
+def _read_mac_group_from_table(table) -> str | None:
+    """按列头文本『mac组』定位列索引，读该表 tbody 首行该列 innerText（findings §8.3）。
+
+    读不到（无表/无表头/无行/无 mac组 列）返回 None。规则ID 列=索引0、mac组 列=索引5，
+    但按列头文本匹配而非硬编码数字，防列序调整。
+    """
+    try:
+        return table.evaluate(
+            """(t) => {
+                const heads = [...t.querySelectorAll('thead th, thead td')]
+                    .map(h => (h.innerText || '').trim());
+                const i = heads.findIndex(x =>
+                    x.replace(/\\s/g, '').toLowerCase().includes('mac组'.toLowerCase())
+                    || x.replace(/\\s/g, '').toLowerCase().includes('mac'));
+                const row = t.querySelector('tbody tr');
+                if (!row || i < 0) return null;
+                const c = row.querySelectorAll('td, th')[i];
+                return c ? (c.innerText || '').trim() : null;
+            }"""
+        )
+    except Exception:
+        return None
+
+
 # —— 阶段1：导入建规则 ——
 
 def _click_import_confirm(page, modal) -> bool:
@@ -459,16 +585,14 @@ def _goto_next_page(page) -> bool:
 
 
 # —— 阶段2：逐条上线 + 冲突处理 ——
-# ⚠ 以下编排视图选择器为预期值（findings §2.2/3/5 未实跑复现），首次实跑前请先 --probe-online 校正。
+# 编排双区容器/搜索框/列序已按 findings §8（实跑校正）回填。仍未实跑复现的几项（行级
+# 上线/下线按钮文本是否全角、上线确认框、规则替换冲突窗、真实 mac组 占位文案 —— findings
+# §8.4/8.5/8.8）按用户截图/DOM 推断填入，并在各函数注释标注；写操作均经 D-f gate。
 
-def _search_pending_rule(page, rule_id: str) -> bool:
-    """在『待选规则』区按规则ID搜出唯一一条。搜不到返回 False（预期选择器，待校正）。"""
+def _search_pending_rule(page, modal, rule_id: str) -> bool:
+    """在「待选规则」区按规则ID搜出唯一一条。搜不到/异常返回 False（findings §8.1/8.2）。"""
     try:
-        card = page.locator(".ant-card", has_text="待选规则").first
-        scope = card if card.count() else page
-        box = scope.locator("input#ruleId, input[placeholder*='规则']").first
-        box.fill(norm_ruleid(rule_id))
-        _click_button_in(scope, page, "搜索", "待选规则-搜索")
+        _search_pending_zone(modal, page, rule_id)
         page.wait_for_timeout(1200)
         return True
     except Exception as e:
@@ -476,12 +600,16 @@ def _search_pending_rule(page, rule_id: str) -> bool:
         return False
 
 
-def _click_online(page, rule_id: str) -> bool:
-    """D-f gate：在搜出的待选行点『上线』。点前断言该行唯一在场；失败只打印不点。"""
+def _click_online(page, modal, rule_id: str) -> bool:
+    """D-f gate：在搜出的待选行点『上线』。点前断言该行唯一在场；失败只打印不点。
+
+    待选表 = 弹窗内独有 vxe-editable 的 .vxe-table（findings §8.1）。
+    ⚠ 行级『上线』按钮文本（是否全角空格）在探测环境两区 No Data 未实跑复现（findings §8.4），
+      下方按用户截图/DOM 推断用 `_click_button_in` 去空白子串匹配 `上线`（兼容潜在全角 `上 线`）。
+    """
     try:
-        card = page.locator(".ant-card", has_text="待选规则").first
-        scope = card if card.count() else page
-        rows = scope.locator("tbody tr")
+        table = _pending_table(modal)
+        rows = table.locator("tbody tr")
         # 仅当搜出恰好一行时才点，避免误点他行（保守 gate）。
         visible_rows = [rows.nth(i) for i in range(rows.count()) if rows.nth(i).is_visible()]
         if len(visible_rows) != 1:
@@ -494,13 +622,28 @@ def _click_online(page, rule_id: str) -> bool:
 
 
 def _confirm_online(page) -> bool:
-    """D6/D-f gate：『确认上线该规则?』确认框点『确定』。点前断言确认框在场。"""
+    """D6/D-f gate：『确认上线该规则?』小确认框点『确定』。点前断言确认框在场。
+
+    ⚠ findings §8.5：该小确认框**未实跑复现**（探测未点上线），按 antd 二次确认两种常见形态
+      （.ant-modal-confirm 弹窗式 / .ant-popconfirm 气泡式）推断定位，文案判定沿用。
+    ⚠ 务必在**该确认框作用域**内取『确定』，绝不误点编排弹窗底部的 `确 定`（那是提交整个编排的写操作，
+      findings §8.7）。先用文案可见做 gate，再优先取 confirm/popconfirm 容器作用域内的确定。
+    """
     try:
         if page.get_by_text("确认上线该规则", exact=False).count() == 0:
             print("  ✗ [gate] 未见『确认上线该规则?』确认框，拒绝点『确定』。")
             return False
-        modal = _active_modal(page) or page
-        return _click_button_in(modal, page, "确定", "确认上线-确定")
+        # 优先在二次确认容器作用域内取『确定』（避免误点编排弹窗底部提交按钮）。
+        for sel in (".ant-modal-confirm", ".ant-popover", ".ant-popconfirm"):
+            scope = page.locator(sel).last
+            try:
+                if scope.count() and scope.is_visible():
+                    return _click_button_in(scope, page, "确定", "确认上线-确定")
+            except Exception:
+                continue
+        print("  ✗ [gate] 未定位到上线确认框的独立作用域（confirm/popconfirm），"
+              "为避免误点编排提交按钮，拒绝点『确定』。")
+        return False
     except Exception as e:
         print(f"  ✗ 确认上线失败：{e}")
         return False
@@ -514,30 +657,18 @@ def _conflict_modal_present(page) -> bool:
         return False
 
 
-def _read_mac_group(page, conflict_ruleid: str) -> str | None:
-    """去『已选规则』区按被冲突号搜出并读 mac组 列文本。读不到返回 None（D-e 保守中止）。"""
+def _read_mac_group(page, modal, conflict_ruleid: str) -> str | None:
+    """去「已选规则」区按被冲突号搜出并读 mac组 列文本。读不到返回 None（D-e 保守中止）。
+
+    findings §8.1/8.2/8.3：已选表=弹窗内第 1 张 .vxe-table；已选区搜索用弹窗内第 1 个 #ruleId；
+    mac组 列按列头文本定位（索引 5，不硬编码）。
+    ⚠ 真实 mac组 单元格占位文案（空/非空样例）在探测环境无数据未实跑复现（findings §8.3/8.6），
+      空判定沿用 mac_group_is_bound/MAC_GROUP_EMPTY_TOKENS；读不到一律 None → 上层保守中止。
+    """
     try:
-        card = page.locator(".ant-card", has_text="已选规则").first
-        scope = card if card.count() else page
-        box = scope.locator("input#ruleId, input[placeholder*='规则']").first
-        box.fill(norm_ruleid(conflict_ruleid))
-        _click_button_in(scope, page, "搜索", "已选规则-搜索")
+        _search_selected_zone(modal, page, conflict_ruleid)
         page.wait_for_timeout(1200)
-        mac = scope.evaluate(
-            """(el) => {
-                const t = el.querySelector('.vxe-table, table');
-                if (!t) return null;
-                const heads = t.querySelectorAll('thead th, thead td');
-                const names = Array.from(heads).map(h => (h.innerText||'').trim());
-                const idx = names.findIndex(x => x.indexOf('mac组') >= 0 || x.indexOf('MAC组') >= 0 || x.toLowerCase().indexOf('mac') >= 0);
-                if (idx < 0) return null;
-                const row = t.querySelector('tbody tr');
-                if (!row) return null;
-                const cells = row.querySelectorAll('td, th');
-                return cells[idx] ? (cells[idx].innerText||'').trim() : null;
-            }""",
-        )
-        return mac
+        return _read_mac_group_from_table(_selected_table(modal))
     except Exception as e:
         print(f"  ✗ 读取被冲突号 {conflict_ruleid!r} 的 mac组 失败：{e}")
         return None
@@ -574,16 +705,19 @@ def run_online(page, rule_ids: list[str]) -> list[dict]:
     for rid in rule_ids:
         print(f"  · {rid}")
 
+    # 打开「规则上下线编排」双区弹窗（findings §8.0 真实入口）。
+    modal = open_orchestration_modal(page)
+
     results: list[dict] = []
     for rid in rule_ids:
         print(f"\n---- 上线 Rule ID={rid!r} ----")
         res = {"ruleid": rid, "status": STATUS_FAILED}
 
-        if not _search_pending_rule(page, rid):
+        if not _search_pending_rule(page, modal, rid):
             res["note"] = "待选规则搜索失败"
             results.append(res)
             continue
-        if not _click_online(page, rid):
+        if not _click_online(page, modal, rid):
             res["note"] = "上线按钮 gate 未满足"
             results.append(res)
             continue
@@ -611,7 +745,7 @@ def run_online(page, rule_ids: list[str]) -> list[dict]:
                 results.append(res)
                 continue
 
-            mac_text = _read_mac_group(page, conflict_rid)
+            mac_text = _read_mac_group(page, modal, conflict_rid)
             if mac_text is None:
                 print(f"  ⚠ mac组 读取不确定，保守中止该条（点取消）。被冲突号={conflict_rid!r}")
                 _click_replace_cancel(page)
@@ -653,6 +787,16 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> l
 
     与阶段2 的冲突中止结果合并（冲突中止/失败保留阶段2 判定，不覆盖）。
     """
+    # D9 回读在「规则上下线编排」弹窗的「已选规则」区进行（findings §8）。阶段2 结束后弹窗
+    # 可能仍开着；不在场则重新打开（只读搜索，不点写按钮）。
+    modal = _orchestration_modal(page)
+    if modal is None:
+        try:
+            modal = open_orchestration_modal(page)
+        except Exception as e:
+            print(f"  ⚠ 回读阶段无法打开编排弹窗：{e}")
+            modal = None
+
     prior = {r["ruleid"]: r for r in prior_results}
     merged: list[dict] = []
     for rid in rule_ids:
@@ -661,7 +805,7 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> l
         if p.get("status") == STATUS_CONFLICT_ABORT:
             merged.append(p)
             continue
-        online = _is_online(page, rid)
+        online = _is_online(page, modal, rid) if modal is not None else False
         if online:
             merged.append({**p, "ruleid": rid, "status": STATUS_ONLINE})
         else:
@@ -671,26 +815,29 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> l
     return merged
 
 
-def _is_online(page, rule_id: str) -> bool:
-    """D9：在『已选规则』按规则ID搜到且该行操作列含『下线』= online。保守：搜不到返回 False。"""
+def _is_online(page, modal, rule_id: str) -> bool:
+    """D9：在「已选规则」区按规则ID能搜到该行即 online（findings §8/§8.10 第 9 点）。
+
+    已选区=弹窗内第 1 张 .vxe-table（findings §8.1）；按规则ID精确搜出后，若该表 tbody 有行则
+    判定 online。保守：搜不到/异常返回 False。
+    （上下线状态在编排双区语义为「能否在已选区搜到」，与行内『下线』按钮文本是否全角空格无关，
+      故不依赖 §8.4 未复现的行级按钮文本。）
+    """
     try:
-        card = page.locator(".ant-card", has_text="已选规则").first
-        scope = card if card.count() else page
-        box = scope.locator("input#ruleId, input[placeholder*='规则']").first
-        box.fill(norm_ruleid(rule_id))
-        _click_button_in(scope, page, "搜索", "已选规则-搜索")
+        _search_selected_zone(modal, page, rule_id)
         page.wait_for_timeout(1200)
-        has_offline = scope.evaluate(
-            """(el) => {
-                const t = el.querySelector('.vxe-table, table');
-                if (!t) return false;
+        has_row = _selected_table(modal).evaluate(
+            """(t) => {
                 const row = t.querySelector('tbody tr');
                 if (!row) return false;
+                // vxe 空表可能渲染占位行；排除无单元格/标注 No Data 的情形。
                 const txt = (row.innerText || '').replace(/\\s|\\u3000/g, '');
-                return txt.indexOf('下线') >= 0;
-            }""",
+                if (!txt) return false;
+                if (txt.toLowerCase().indexOf('nodata') >= 0 || txt.indexOf('暂无数据') >= 0) return false;
+                return row.querySelectorAll('td, th').length > 0;
+            }"""
         )
-        return bool(has_offline)
+        return bool(has_row)
     except Exception as e:
         print(f"  ✗ online 回读失败 {rule_id!r}：{e}")
         return False
@@ -701,39 +848,50 @@ def _is_online(page, rule_id: str) -> bool:
 # ======================================================================
 
 def probe_online(page) -> None:
-    """只读 dump 在线规则/编排视图结构，用于校正 findings。全程只读，绝不点写操作按钮。"""
-    url = config.get("CMS_UPRULE_URL",
-                      "http://cms.intsmarthub.com:31597/basicservice/otamanage/uprule")
-    print(f"只读探测编排视图：{url}")
-    page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    dump = page.evaluate(
-        """() => {
-            const out = {cards: [], switches: 0, buttons: [], tableHeaders: []};
-            document.querySelectorAll('.ant-card').forEach(c => {
-                const title = (c.querySelector('.ant-card-head-title, .ant-card-head') || {}).innerText || '';
-                out.cards.push((title||'').trim().slice(0, 40));
+    """只读 dump「规则上下线编排」双区弹窗结构，用于校正 findings §8。
+
+    入口为升级事件页行内『规则上下线』→「规则上下线编排」弹窗（findings §8.0 真实入口，
+    不再用旧 /otamanage/uprule 单表页）。全程只读：仅打开弹窗 dump 结构，绝不点
+    上线/下线/编辑/确定/替换/删除 任何写按钮。
+    """
+    print(f"只读探测「规则上下线编排」编排视图入口：{config.CMS_UPEVENT_URL}")
+    modal = open_orchestration_modal(page)  # 仅打开弹窗（只读），不点任何写按钮
+    dump = modal.evaluate(
+        """(m) => {
+            const out = {title: '', tables: [], buttons: [], hasPendingEditable: false,
+                         ruleIdCount: 0, deviceExtCount: 0, selectCount: 0, formCount: 0};
+            const title = m.querySelector('.ant-modal-title');
+            out.title = title ? (title.innerText||'').trim() : '';
+            out.ruleIdCount = m.querySelectorAll('input#ruleId').length;
+            out.deviceExtCount = m.querySelectorAll('input#deviceExt').length;
+            out.selectCount = m.querySelectorAll('.ant-select').length;
+            out.formCount = m.querySelectorAll('form.ant-form-inline').length;
+            out.hasPendingEditable = !!m.querySelector('.vxe-table.vxe-editable');
+            m.querySelectorAll('.vxe-table').forEach(t => {
+                const names = Array.from(t.querySelectorAll('thead th, thead td'))
+                    .map(x => (x.innerText||'').trim()).filter(Boolean);
+                const editable = t.classList.contains('vxe-editable');
+                const rowCount = t.querySelectorAll('tbody tr').length;
+                out.tables.push({editable, rowCount, headers: names});
             });
-            out.switches = document.querySelectorAll('.ant-switch').length;
             const seen = new Set();
-            document.querySelectorAll('button').forEach(b => {
+            m.querySelectorAll('button').forEach(b => {
                 const t = (b.innerText||'').trim();
                 if (t && !seen.has(t)) { seen.add(t); out.buttons.push(t); }
-            });
-            document.querySelectorAll('.vxe-table thead, table thead').forEach(h => {
-                const names = Array.from(h.querySelectorAll('th, td')).map(x => (x.innerText||'').trim()).filter(Boolean);
-                if (names.length) out.tableHeaders.push(names);
             });
             return out;
         }"""
     )
-    print("  卡片标题：", dump["cards"])
-    print("  开关数量：", dump["switches"])
+    print("  弹窗标题：", dump["title"])
+    print("  #ruleId 数量：", dump["ruleIdCount"], " #deviceExt 数量：", dump["deviceExtCount"],
+          " .ant-select 数量：", dump["selectCount"], " form.ant-form-inline 数量：", dump["formCount"])
+    print("  待选表(vxe-editable)在场：", dump["hasPendingEditable"])
+    for i, t in enumerate(dump["tables"]):
+        print(f"  表[{i}] editable={t['editable']} rows={t['rowCount']} 表头={t['headers']}")
     print("  可见按钮：", dump["buttons"])
-    print("  表头：", dump["tableHeaders"])
-    _shot(page, "active_probe_online")
+    _shot(page, "active_probe_orchestration")
     print("  ⚠ 只读探测完成，未点任何上线/下线/确定/替换/删除按钮。"
-          "请用以上实测结果校正 findings §2.2/3/5 并回填 active_ota 阶段2/3 选择器。")
+          "请用以上实测结果校正 findings §8 并回填 active_ota 阶段2/3 选择器。")
 
 
 # ======================================================================
