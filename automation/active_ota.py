@@ -348,13 +348,39 @@ def _pending_form(modal):
     return modal.locator("form.ant-form-inline").first
 
 
-def _search_pending_zone(modal, page, rule_id: str) -> bool:
-    """在「待选规则」区按规则ID精确搜索（findings §8.2）。
+def _search_pending_zone(modal, page, rule_id: str, device_code: str = "") -> bool:
+    """在「待选规则」区按【设备类型代码 + 规则ID】精确搜索（findings §8.2）。
 
     待选搜索表单 = form.ant-form-inline（block 2），区内 #ruleId placeholder=精准匹配；
     搜索按钮文本无全角空格。先锚待选表单再取 #ruleId，避免与已选区同名控件混淆。
+
+    device_code 非空时，另在同一待选表单里填『设备类型代码』搜索框（两条件一起搜）。
+    该设备类型框选择器未经编排视图实跑复现，用多候选兜底；找不到则仅按 Rule ID 搜并告警，
+    不硬失败（保证功能可用，精度下降）。
     """
     form = _pending_form(modal)
+    # 设备类型代码（第二条件）。多候选：#internalDeviceType（findings §1 uprule 页同名）、
+    # 按 placeholder/关联标签含『设备类型』的输入框。
+    if device_code:
+        filled_dc = False
+        for sel in (
+            "input#internalDeviceType",
+            "input#deviceType",
+            "input[placeholder*='设备类型']",
+        ):
+            try:
+                box = form.locator(sel).first
+                if box.count() and box.is_visible():
+                    box.fill("")
+                    box.fill(str(device_code).strip())
+                    print(f"  待选区设备类型代码已填：{device_code!r}（选择器 {sel!r}）")
+                    filled_dc = True
+                    break
+            except Exception:
+                continue
+        if not filled_dc:
+            print(f"  ⚠ 待选区未找到『设备类型代码』搜索框（候选均未命中），本次仅按 Rule ID 搜索。"
+                  f"设备类型代码={device_code!r}（选择器需按实跑校正）。")
     form.locator("input#ruleId").first.fill(norm_ruleid(rule_id))
     return _click_button_in(form, page, "搜索", "待选规则-搜索")
 
@@ -794,14 +820,19 @@ def _goto_next_page(page) -> bool:
 # 上线/下线按钮文本是否全角、上线确认框、规则替换冲突窗、真实 mac组 占位文案 —— findings
 # §8.4/8.5/8.8）按用户截图/DOM 推断填入，并在各函数注释标注；写操作均经 D-f gate。
 
-def _search_pending_rule(page, modal, rule_id: str) -> bool:
-    """在「待选规则」区按规则ID搜出唯一一条。搜不到/异常返回 False（findings §8.1/8.2）。"""
+def _search_pending_rule(page, modal, rule_id: str, device_code: str = "") -> bool:
+    """在「待选规则」区按【设备类型代码 + 规则ID】两条件搜出唯一一条。
+
+    用户要求：上线搜索需同时带设备类型代码（从 Excel『设备类型代码』列读）与 Rule ID，
+    以避免跨设备类型的 Rule ID 碰撞。device_code 为空时退化为仅按 Rule ID 搜。
+    搜不到/异常返回 False（findings §8.1/8.2）。
+    """
     try:
-        _search_pending_zone(modal, page, rule_id)
+        _search_pending_zone(modal, page, rule_id, device_code)
         page.wait_for_timeout(1200)
         return True
     except Exception as e:
-        print(f"  ✗ 待选规则搜索 {rule_id!r} 失败：{e}")
+        print(f"  ✗ 待选规则搜索 {rule_id!r}（设备类型代码={device_code!r}）失败：{e}")
         return False
 
 
@@ -896,7 +927,7 @@ def _click_replace_cancel(page) -> bool:
     return _click_button_in(modal, page, "取消", "规则替换-取消")
 
 
-def run_online(page, rule_ids: list[str]) -> list[dict]:
+def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
     """阶段2：逐条上线 + 冲突处理（D6/D7/D8）。返回每个 Rule ID 的处理 result 列表。
 
     D8：先打印待上线 Rule ID 清单。对每个 rule_id：待选区搜出→点上线→确认框点确定→轮询冲突弹窗：
@@ -918,7 +949,7 @@ def run_online(page, rule_ids: list[str]) -> list[dict]:
         print(f"\n---- 上线 Rule ID={rid!r} ----")
         res = {"ruleid": rid, "status": STATUS_FAILED}
 
-        if not _search_pending_rule(page, modal, rid):
+        if not _search_pending_rule(page, modal, rid, device_code):
             res["note"] = "待选规则搜索失败"
             results.append(res)
             continue
@@ -1234,8 +1265,22 @@ def main() -> int:
                     return 2
                 print(f"[online] 从 Excel 读到 {len(rule_ids)} 个 Rule ID（升序）：{rule_ids}")
 
-                # 阶段2：逐条上线 + 冲突处理。
-                results = run_online(page, rule_ids)
+                # 设备类型代码：上线搜索的第二个条件（设备类型代码 + Rule ID）。从 Excel『设备类型代码』列读。
+                device_codes = {d for d in info.get("device_codes", set()) if str(d or "").strip()}
+                if len(device_codes) == 1:
+                    device_code = next(iter(device_codes))
+                elif len(device_codes) == 0:
+                    device_code = ""
+                    print("⚠ [online] Excel『设备类型代码』列为空，上线搜索将只用 Rule ID（精度下降）。")
+                else:
+                    device_code = ""
+                    print(f"⚠ [online] Excel 含多个设备类型代码 {sorted(device_codes)!r}，"
+                          "无法确定唯一值，上线搜索将只用 Rule ID（精度下降）。")
+                if device_code:
+                    print(f"[online] 设备类型代码（搜索第二条件）：{device_code!r}")
+
+                # 阶段2：逐条上线 + 冲突处理（按 设备类型代码 + Rule ID 搜索）。
+                results = run_online(page, rule_ids, device_code)
                 # 阶段3：状态汇总。
                 final = read_final_status(page, rule_ids, results)
                 print("\n" + summarize(final))
