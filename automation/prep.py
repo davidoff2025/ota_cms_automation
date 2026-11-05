@@ -519,7 +519,7 @@ def _s3_precheck_skip(bucket: str, prefix: str, urls: list, size_md5_by_zip: dic
         extra = ""
         if exp_md5 and meta_md5 == exp_md5:
             extra = "，MD5 亦一致"
-        print("  " + color(f"✓ 已存在且大小一致{extra}，跳过：{name}", "green"))
+        print("  " + _ok(f"已存在且大小一致{extra}，跳过：{name}"))
         skip.add(name)
     return skip
 
