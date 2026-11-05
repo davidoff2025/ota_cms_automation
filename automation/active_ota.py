@@ -348,39 +348,35 @@ def _pending_form(modal):
     return modal.locator("form.ant-form-inline").first
 
 
-def _search_pending_zone(modal, page, rule_id: str, device_code: str = "") -> bool:
-    """在「待选规则」区按【设备类型代码 + 规则ID】精确搜索（findings §8.2）。
+def _search_pending_zone(modal, page, rule_id: str) -> bool:
+    """在「待选规则」区按规则ID精确搜索（findings §8.2）。
 
     待选搜索表单 = form.ant-form-inline（block 2），区内 #ruleId placeholder=精准匹配；
     搜索按钮文本无全角空格。先锚待选表单再取 #ruleId，避免与已选区同名控件混淆。
-
-    device_code 非空时，另在同一待选表单的『设备类型』下拉里选中该设备类型代码（两条件一起搜）。
-    实测（用户截图）：『设备类型』是 ant-select 下拉（显示“请选择”），选项文字与 Excel 的
-    『设备类型代码』完全相同，故按精确文本选中。选不中则仅按 Rule ID 搜并告警，不硬失败。
+    （设备类型不在此设置——它已在进页面时于已选区设过一次。）
     """
     form = _pending_form(modal)
-    # 设备类型（第二条件）= ant-select 下拉，label『设备类型』，选项文字=设备类型代码。
-    if device_code:
-        if not _select_device_type(form, page, device_code):
-            print(f"  ⚠ 待选区『设备类型』下拉未能选中 {device_code!r}，本次仅按 Rule ID 搜索"
-                  "（选择器/选项需按实跑校正）。")
     form.locator("input#ruleId").first.fill(norm_ruleid(rule_id))
     return _click_button_in(form, page, "搜索", "待选规则-搜索")
 
 
-def _select_device_type(form, page, device_code: str) -> bool:
-    """在给定搜索表单作用域内，点开『设备类型』ant-select 下拉并按精确文本选中 device_code。
+def _set_device_type_once(page, modal, device_code: str) -> bool:
+    """进页面后【只调用一次】：在「已选规则」区的『设备类型』框设置设备类型代码。
 
-    交互：定位『设备类型』label 所在的 .ant-select → 点开 → 在浮层 .ant-select-dropdown 里
-    点文本精确等于 device_code 的 .ant-select-item-option。用户确认下拉选项文字 == 设备类型代码。
-    选项可能带搜索框：支持的话先输入过滤再点。成功返回 True。
+    用户确认的交互：在『设备类型』框【输入】设备类型代码 → 页面自动弹出匹配下拉 → 选中该项
+    （不是从静态列表里挑；是输入触发自动匹配）。选项文字 == 设备类型代码（精确）。
+    设备类型只设这一次，后续逐条只用 Rule ID 搜。成功返回 True；失败返回 False（上层据此终止）。
+
+    作用域为「已选规则」区：findings §8.1 已选区搜索表单是弹窗内【第 1 个】搜索表单
+    （待选表单 form.ant-form-inline 在其后）。故这里锚弹窗内第 1 个『设备类型』ant-select。
+    选择器/交互在编排视图未实跑复现，用标准 ant-select 可搜索输入交互，失败即返回 False。
     """
     want = str(device_code).strip()
-    # a) 定位『设备类型』这一项的 ant-select 触发器。优先按 label 文本关联，兜底取表单内第 1 个 select。
+
+    # a) 定位「已选规则」区的『设备类型』ant-select 触发器（弹窗内第 1 个）。
     trigger = None
     try:
-        # ant-form 里一项通常是 .ant-form-item，含 label『设备类型』与其下的 .ant-select。
-        item = form.locator(".ant-form-item", has_text="设备类型").first
+        item = modal.locator(".ant-form-item", has_text="设备类型").first
         if item.count():
             cand = item.locator(".ant-select").first
             if cand.count():
@@ -388,55 +384,56 @@ def _select_device_type(form, page, device_code: str) -> bool:
     except Exception:
         trigger = None
     if trigger is None:
-        # 兜底：表单内第 1 个 .ant-select（截图中『设备类型』是该区第 1 个下拉）。
         try:
-            cand = form.locator(".ant-select").first
+            cand = modal.locator(".ant-select").first  # 弹窗内第 1 个 select = 已选区设备类型
             if cand.count():
                 trigger = cand
         except Exception:
             trigger = None
     if trigger is None:
+        print("  ✗ 未定位到「已选规则」区『设备类型』控件。")
         return False
 
     try:
         trigger.scroll_into_view_if_needed(timeout=2000)
         trigger.click()
         page.wait_for_timeout(400)
-        # b) 若下拉自带搜索输入，输入过滤文本缩小选项。
-        try:
-            search_input = trigger.locator("input.ant-select-selection-search-input").first
-            if search_input.count() and search_input.is_visible():
-                search_input.fill(want)
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
-        # c) 在打开的浮层里按精确文本选中选项（浮层挂在 body，用 page 作用域）。
-        option = page.locator(".ant-select-dropdown:visible .ant-select-item-option").filter(
-            has_text=want
-        )
-        # 精确匹配：filter(has_text) 为子串，这里再按 inner_text 精确校验。
+        # b) 输入设备类型代码，触发自动匹配下拉。
+        search_input = trigger.locator("input.ant-select-selection-search-input").first
+        if search_input.count() and search_input.is_visible():
+            search_input.fill(want)
+        else:
+            # 退化：若无独立搜索 input，直接键入（聚焦后输入）。
+            page.keyboard.type(want)
+        page.wait_for_timeout(700)  # 等自动匹配下拉返回
+
+        # c) 在浮层里选中文本精确等于 device_code 的匹配项。
+        option = page.locator(".ant-select-dropdown:visible .ant-select-item-option")
         n = option.count()
         for i in range(n):
             el = option.nth(i)
             try:
                 if el.is_visible() and (el.inner_text() or "").strip() == want:
                     el.click()
-                    print(f"  待选区『设备类型』已选中：{want!r}")
-                    page.wait_for_timeout(300)
+                    print(f"  ✓ 已选规则区『设备类型』已设置：{want!r}")
+                    page.wait_for_timeout(400)
                     return True
             except Exception:
                 continue
-        # 没有精确相等项时，若过滤后仅剩一项则选它（容错）。
+        # 自动匹配后若恰好只剩 1 项，选它（容错；但要求其文本包含 want，避免误选）。
         if n == 1:
             try:
-                option.first.click()
-                print(f"  待选区『设备类型』按唯一候选选中（过滤后仅 1 项）：目标 {want!r}")
-                page.wait_for_timeout(300)
-                return True
+                only = option.first
+                if want in (only.inner_text() or ""):
+                    only.click()
+                    print(f"  ✓ 已选规则区『设备类型』按唯一匹配项设置：目标 {want!r}")
+                    page.wait_for_timeout(400)
+                    return True
             except Exception:
                 pass
+        print(f"  ✗ 『设备类型』输入 {want!r} 后未在自动匹配下拉中找到精确匹配项（共 {n} 项）。")
     except Exception as e:
-        print(f"  ⚠ 『设备类型』下拉交互异常：{e}")
+        print(f"  ✗ 『设备类型』设置交互异常：{e}")
     return False
 
 
@@ -875,19 +872,17 @@ def _goto_next_page(page) -> bool:
 # 上线/下线按钮文本是否全角、上线确认框、规则替换冲突窗、真实 mac组 占位文案 —— findings
 # §8.4/8.5/8.8）按用户截图/DOM 推断填入，并在各函数注释标注；写操作均经 D-f gate。
 
-def _search_pending_rule(page, modal, rule_id: str, device_code: str = "") -> bool:
-    """在「待选规则」区按【设备类型代码 + 规则ID】两条件搜出唯一一条。
+def _search_pending_rule(page, modal, rule_id: str) -> bool:
+    """在「待选规则」区按规则ID搜出唯一一条（设备类型已在进页面时于已选区设过一次，此处只用 Rule ID）。
 
-    用户要求：上线搜索需同时带设备类型代码（从 Excel『设备类型代码』列读）与 Rule ID，
-    以避免跨设备类型的 Rule ID 碰撞。device_code 为空时退化为仅按 Rule ID 搜。
     搜不到/异常返回 False（findings §8.1/8.2）。
     """
     try:
-        _search_pending_zone(modal, page, rule_id, device_code)
+        _search_pending_zone(modal, page, rule_id)
         page.wait_for_timeout(1200)
         return True
     except Exception as e:
-        print(f"  ✗ 待选规则搜索 {rule_id!r}（设备类型代码={device_code!r}）失败：{e}")
+        print(f"  ✗ 待选规则搜索 {rule_id!r} 失败：{e}")
         return False
 
 
@@ -999,12 +994,21 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
     # 打开「规则上下线编排」双区弹窗（findings §8.0 真实入口）。
     modal = open_orchestration_modal(page)
 
+    # —— 进页面后【只设一次】设备类型：设在「已选规则」区（用户确认）。——
+    # 交互：在已选区『设备类型』框输入设备类型代码 → 自动匹配下拉 → 选中。设失败即终止整个 online。
+    # 之后逐条只用 Rule ID 搜（待选区上线搜 / 已选区查状态），不再重设设备类型。
+    if device_code:
+        if not _set_device_type_once(page, modal, device_code):
+            print(f"✗ 已选规则区设置『设备类型』={device_code!r} 失败，按约定终止 online（不逐条上线）。")
+            return [{"ruleid": rid, "status": STATUS_FAILED,
+                     "note": f"设备类型设置失败，终止：{device_code!r}"} for rid in rule_ids]
+
     results: list[dict] = []
     for rid in rule_ids:
         print(f"\n---- 上线 Rule ID={rid!r} ----")
         res = {"ruleid": rid, "status": STATUS_FAILED}
 
-        if not _search_pending_rule(page, modal, rid, device_code):
+        if not _search_pending_rule(page, modal, rid):
             res["note"] = "待选规则搜索失败"
             results.append(res)
             continue
