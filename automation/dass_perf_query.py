@@ -38,7 +38,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 from . import config
-from ._log import ok, warn, err, color
+from ._log import color
 from .dass_login import login, _shot
 from .dass_fill import norm_ruleid, _report_frame
 from .dass_perf import (

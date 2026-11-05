@@ -44,7 +44,7 @@ from __future__ import annotations
 import re
 
 from . import config
-from ._log import ok, warn, err, color
+from ._log import color
 from .dass_fill import (
     PREV_STAGE,
     norm_ruleid,
