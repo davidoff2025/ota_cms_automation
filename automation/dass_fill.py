@@ -46,6 +46,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from . import config
+from ._log import ok, warn, err, color
 from .dass_login import login, navigate_to_fillin, _shot
 from .dass_data import read_updated_excel
 # 注意：dass_perf 复用本模块的常量/查询件，于 main() 内延迟导入以避免模块级循环导入。
@@ -150,7 +151,7 @@ def set_display_limit(fr, page, n: int) -> bool:
         print(f"  显示行数 已设为 'limit {int(n)}'")
         return True
     except Exception as e:
-        print(f"  ✗ 设置显示行数失败（{LIMIT_INPUT}）：{e}")
+        print(color(f"  ✗ 设置显示行数失败（{LIMIT_INPUT}）：{e}", "red"))
         return False
 
 
@@ -455,7 +456,7 @@ def _click_exact_button(fr, page, selector: str, label: str) -> bool:
                 return True
         except Exception:
             continue
-    print(f"  ✗ 未找到可见的『{label}』按钮（{selector}）。")
+    print(color(f"  ✗ 未找到可见的『{label}』按钮（{selector}）。", "red"))
     return False
 
 
@@ -472,10 +473,10 @@ def approve_and_submit(fr, page) -> bool:
     # 2) 提交（Submit）—— 找不到则返回 False，绝不点击 Save/删除行等其它按钮。
     submitted = _click_exact_button(fr, page, "button.fr-btn-text.x-emb-submit", "提交/Submit")
     if not submitted:
-        print("  ✗ 未找到『提交/Submit』按钮，未提交。请手动在页面提交。")
+        print(color("  ✗ 未找到『提交/Submit』按钮，未提交。请手动在页面提交。", "red"))
         return False
     _shot(page, "submitted")
-    print("  ✅ 已提交。")
+    print(color("  ✅ 已提交。", "green"))
     return True
 
 
@@ -566,16 +567,16 @@ def run_init(fr, page, records) -> bool:
     print("列字母映射：", {c: resolve_letter(c)[0] for c in FILL_COLUMNS})
     missing0 = [c for c in FILL_COLUMNS if resolve_letter(c)[0] is None]
     if session is None or "方案号" not in letters:
-        print("✗ 未读到表头列布局，终止。")
+        print(color("✗ 未读到表头列布局，终止。", "red"))
         _shot(page, "fill_no_anchor")
         return False
     if missing0:
-        print(f"⚠ 以下列在表头未找到，将跳过：{missing0}")
+        print(color(f"⚠ 以下列在表头未找到，将跳过：{missing0}", "yellow"))
 
     rows_n = blank_row_numbers(fr, n)
     print(f"空白插入行（行号）：{rows_n}")
     if len(rows_n) < n:
-        print(f"⚠ 只找到 {len(rows_n)} 个空行，少于 {n}；按可用的填。")
+        print(color(f"⚠ 只找到 {len(rows_n)} 个空行，少于 {n}；按可用的填。", "yellow"))
 
     ok_all = True
     for rec, row_n in zip(records, rows_n):
@@ -675,23 +676,23 @@ def run_update(fr, page, records, option: str) -> dict:
     excel_ruleids = set(excel_by_ruleid)
 
     if not excel_ruleids:
-        print("✗ Excel 中没有可用的 ruleid（全为空或无数据），没有可靠匹配键，终止更新。")
+        print(color("✗ Excel 中没有可用的 ruleid（全为空或无数据），没有可靠匹配键，终止更新。", "red"))
         return stats
     if not excel_scheme_nos:
-        print("✗ Excel 中没有可用的方案号，无法作为查询条件，终止更新。")
+        print(color("✗ Excel 中没有可用的方案号，无法作为查询条件，终止更新。", "red"))
         return stats
     if not excel_targets:
-        print("⚠ Excel 的『目标版本』集合为空，Stage1 粗筛将不带目标版本条件，"
-              "所有 ruleid 可能直接走 Stage2 精选。")
+        print(color("⚠ Excel 的『目标版本』集合为空，Stage1 粗筛将不带目标版本条件，"
+                    "所有 ruleid 可能直接走 Stage2 精选。", "yellow"))
 
     # 约定一个 Excel 对应一个方案号；若不止一个，告警并对每个方案号分组各跑一轮 Stage1。
     if len(excel_scheme_nos) > 1:
-        print(f"⚠ 本 Excel 出现多个方案号 {sorted(excel_scheme_nos)!r}（约定应只有一个），"
-              "将对每个方案号分别执行 Stage1 粗筛。")
+        print(color(f"⚠ 本 Excel 出现多个方案号 {sorted(excel_scheme_nos)!r}（约定应只有一个），"
+                    "将对每个方案号分别执行 Stage1 粗筛。", "yellow"))
     # 目标版本正常只有一个；若多个则把它们都作为 Stage1 过滤值（逐个方案号×目标版本查询）。
     if len(excel_targets) > 1:
-        print(f"⚠ 本 Excel 出现多个目标版本 {sorted(excel_targets)!r}（约定应只有一个），"
-              "将对每个目标版本分别查询。")
+        print(color(f"⚠ 本 Excel 出现多个目标版本 {sorted(excel_targets)!r}（约定应只有一个），"
+                    "将对每个目标版本分别查询。", "yellow"))
 
     satisfied_ruleids: set[str] = set()
 
@@ -725,15 +726,15 @@ def run_update(fr, page, records, option: str) -> dict:
             rows, letters, session = _run_query(fr, page, filters)
 
             if session is None or "方案号" not in letters:
-                print("✗ 查询后未读到表头列布局，跳过此次 Stage1 查询。")
+                print(color("✗ 查询后未读到表头列布局，跳过此次 Stage1 查询。", "red"))
                 _shot(page, "update_no_anchor")
                 continue
             missing = _header_guard(letters, option, "stage1")
             if missing:
-                print(f"✗ 表头缺少 Stage1 所需列 {missing}，无法安全匹配，终止更新。")
+                print(color(f"✗ 表头缺少 Stage1 所需列 {missing}，无法安全匹配，终止更新。", "red"))
                 return stats
             if len(rows) >= LIMIT_MAX:
-                print(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。")
+                print(color(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。", "yellow"))
                 stats["truncation_warnings"] += 1
 
             for row in rows:
@@ -763,15 +764,15 @@ def run_update(fr, page, records, option: str) -> dict:
             {"方案号": k_scheme, "目标版本": k_target, "设备扩展信息": k_ext},
         )
         if session is None or "方案号" not in letters:
-            print(f"✗ 查询后未读到表头列布局，Rule ID={rid!r} 跳过。")
+            print(color(f"✗ 查询后未读到表头列布局，Rule ID={rid!r} 跳过。", "red"))
             stats["skipped_no_match"] += 1
             continue
         missing = _header_guard(letters, option, "stage2")
         if missing:
-            print(f"✗ 表头缺少 Stage2 所需列 {missing}，无法安全匹配，终止更新。")
+            print(color(f"✗ 表头缺少 Stage2 所需列 {missing}，无法安全匹配，终止更新。", "red"))
             return stats
         if len(rows) >= LIMIT_MAX:
-            print(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。")
+            print(color(f"⚠ 查询结果达到上限 {LIMIT_MAX}，结果可能被截断；按当前显示的行继续处理。", "yellow"))
             stats["truncation_warnings"] += 1
 
         matches = [r for r in rows if norm_ruleid(r.get("ruleid", "")) == rid]
@@ -780,12 +781,12 @@ def run_update(fr, page, records, option: str) -> dict:
                 stats["stage2_updated"] += 1
                 satisfied_ruleids.add(rid)
         elif len(matches) == 0:
-            print(f"⚠ Rule ID={rid!r} 精选查询结果中未找到该 ruleid，跳过。"
-                  f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
+            print(color(f"⚠ Rule ID={rid!r} 精选查询结果中未找到该 ruleid，跳过。"
+                        f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}", "yellow"))
             stats["skipped_no_match"] += 1
         else:
-            print(f"⚠ Rule ID={rid!r} 精选查询命中多行（歧义 {len(matches)} 行），跳过不猜。"
-                  f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}")
+            print(color(f"⚠ Rule ID={rid!r} 精选查询命中多行（歧义 {len(matches)} 行），跳过不猜。"
+                        f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}", "yellow"))
             stats["skipped_ambiguous"] += 1
 
     print("\n======== 更新汇总 ========")
@@ -795,7 +796,7 @@ def run_update(fr, page, records, option: str) -> dict:
     print(f"  歧义跳过：{stats['skipped_ambiguous']}")
     print(f"  候选但不在 Excel（未动）：{stats['candidates_skipped_not_in_excel']}")
     if stats["truncation_warnings"]:
-        print(f"  ⚠ 结果可能被截断的查询次数：{stats['truncation_warnings']}（已按显示行处理）")
+        print(color(f"  ⚠ 结果可能被截断的查询次数：{stats['truncation_warnings']}（已按显示行处理）", "yellow"))
     return stats
 
 
@@ -848,7 +849,7 @@ def main() -> int:
     records = read_updated_excel(excel)  # 文件不存在时抛 FileNotFoundError，快速失败
     n = len(records)
     if n == 0:
-        print("✗ Excel 中没有数据行。")
+        print(color("✗ Excel 中没有数据行。", "red"))
         return 1
     if option == "init":
         print(f"读取到 {n} 条记录，将插入 {n} 行并填写。")
@@ -886,30 +887,33 @@ def main() -> int:
                 page.wait_for_timeout(2500)
                 fr_perf = _report_frame(page)
                 if fr_perf is None:
-                    print("✗ 未找到绩效页 frame，无法校验成功率；安全失败，abort 升级。")
+                    print(color("✗ 未找到绩效页 frame，无法校验成功率；安全失败，abort 升级。", "red"))
                     _shot(page, "perf_no_frame")
                     return 2
                 if not check_success_rate(fr_perf, page, records, option):
-                    print("\n⛔ 成功率闸门未通过：中止本次升级事务，"
-                          "run_update 未执行，不进入人工提交环节。")
+                    print(color("\n⛔ 成功率闸门未通过：中止本次升级事务，"
+                                "run_update 未执行，不进入人工提交环节。", "red"))
                     return 2
-                print("\n✅ 成功率闸门通过，继续执行升级 DASS。")
+                print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
 
             navigate_to_fillin(page)
             page.wait_for_timeout(2500)
             fr = _report_frame(page)
             if fr is None:
-                print("✗ 未找到填报表 frame")
+                print(color("✗ 未找到填报表 frame", "red"))
                 return 1
 
             if option == "init":
                 ok_all = run_init(fr, page, records)
                 _shot(page, "fill_done")
-                print(f"\n{'✅' if ok_all else '⚠'} 填写完成（尚未验证、尚未提交）。")
+                if ok_all:
+                    print(color("\n✅ 填写完成（尚未验证、尚未提交）。", "green"))
+                else:
+                    print(color("\n⚠ 填写完成（尚未验证、尚未提交）。", "yellow"))
             else:
                 run_update(fr, page, records, option)
                 _shot(page, "update_done")
-                print("\n✅ 更新完成（尚未验证、尚未提交）。")
+                print(color("\n✅ 更新完成（尚未验证、尚未提交）。", "green"))
 
             if config.HEADED:
                 print("\n======== 人工核对环节 ========")
@@ -924,9 +928,9 @@ def main() -> int:
                     print("\n开始批复并提交 ...")
                     ok_submit = approve_and_submit(fr, page)
                     if ok_submit:
-                        print("\n✅ 记录已提交。可在浏览器确认结果。")
+                        print(color("\n✅ 记录已提交。可在浏览器确认结果。", "green"))
                     else:
-                        print("\n⚠ 未能自动提交，请在浏览器手动完成。")
+                        print(color("\n⚠ 未能自动提交，请在浏览器手动完成。", "yellow"))
                     try:
                         input("\n按回车关闭浏览器 ... ")
                     except EOFError:
@@ -941,7 +945,7 @@ def main() -> int:
                 print("非可见模式（HEADED=0），不进行交互提交；请人工核对后提交。")
             return 0
         except Exception as e:
-            print(f"✗ 出错：{e}")
+            print(color(f"✗ 出错：{e}", "red"))
             _shot(page, "fill_error")
             return 1
         finally:

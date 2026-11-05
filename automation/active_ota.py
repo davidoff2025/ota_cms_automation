@@ -50,6 +50,7 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from . import config
+from ._log import ok, warn, err, color
 from .login import login, _shot
 # 复用 DASS 侧常量/工具，绝不修改其实现：
 from .dass_fill import norm_ruleid, OTA_V4_OUTPUTS
@@ -161,19 +162,19 @@ def summarize(results: list[dict]) -> str:
         st = r.get("status", "")
         if st == STATUS_ONLINE:
             n_online += 1
-            lines.append(f"  [汇总] Rule ID={rid!r}  状态=online ✅（已上线）")
+            lines.append(f"  [汇总] Rule ID={rid!r}  状态={color('online ✅', 'green')}（已上线）")
         elif st == STATUS_CONFLICT_ABORT:
             n_conflict += 1
             cf = r.get("conflict_ruleid", "")
             bound = r.get("mac_group_bound", None)
             mac_desc = ("mac组非空" if bound else "mac组为空") if bound is not None else "mac组判定不确定"
             lines.append(
-                f"  [汇总] Rule ID={rid!r}  状态=冲突中止 ⛔（被冲突号={cf!r}，{mac_desc}）"
+                f"  [汇总] Rule ID={rid!r}  状态={color('冲突中止 ⛔', 'red')}（被冲突号={cf!r}，{mac_desc}）"
             )
         else:
             n_failed += 1
             note = r.get("note", "")
-            lines.append(f"  [汇总] Rule ID={rid!r}  状态=失败 ❌" + (f"（{note}）" if note else ""))
+            lines.append(f"  [汇总] Rule ID={rid!r}  状态={color('失败 ❌', 'red')}" + (f"（{note}）" if note else ""))
     lines.append(
         f"  —— 总数：{len(results)}  online：{n_online}  "
         f"冲突中止：{n_conflict}  失败：{n_failed}"
@@ -718,7 +719,7 @@ def _click_import_confirm(page, modal) -> bool:
     条件不满足（弹窗不在场）只打印不点并返回 False。
     """
     if modal is None or not modal.is_visible():
-        print("  ✗ [gate] 导入弹窗不在场，拒绝点击导入确认按钮。")
+        print(color("  ✗ [gate] 导入弹窗不在场，拒绝点击导入确认按钮。", "red"))
         return False
 
     # —— 第一步：优先点『下一步』进入第二步；没有『下一步』则视为单步向导。——
@@ -729,7 +730,7 @@ def _click_import_confirm(page, modal) -> bool:
         _abort_if_ui_error(page, "点『下一步』后")
         modal = _active_modal(page) or modal  # 第二步可能换了 modal 实例
         if modal is None or not modal.is_visible():
-            print("  ✗ [gate] 点『下一步』后导入弹窗不在场，拒绝继续。")
+            print(color("  ✗ [gate] 点『下一步』后导入弹窗不在场，拒绝继续。", "red"))
             return False
 
     # —— 第二步（或单步）：点完成/保存按钮真正完成导入。——
@@ -742,11 +743,11 @@ def _click_import_confirm(page, modal) -> bool:
 
     # 单步向导里『下一步』本身可能就是提交（无第二步按钮时）。
     if went_next:
-        print("  ⚠ 已点『下一步』但未找到第二步的『保存/完成/确定』按钮——"
-              "请确认导入是否已完成（可能第二步按钮文案不同，需按实跑日志校正）。")
+        print(color("  ⚠ 已点『下一步』但未找到第二步的『保存/完成/确定』按钮——"
+                    "请确认导入是否已完成（可能第二步按钮文案不同，需按实跑日志校正）。", "yellow"))
         return True
 
-    print("  ✗ 未找到任何导入完成按钮（下一步/保存/完成/确定/导入均未命中）。")
+    print(color("  ✗ 未找到任何导入完成按钮（下一步/保存/完成/确定/导入均未命中）。", "red"))
     return False
 
 
@@ -889,10 +890,10 @@ def _collect_rule_ids(page, template_name: str, expected: int) -> list[str]:
     # —— 4) 升序（小→大）返回 + 数量校验 ——
     seen_sorted = sorted(set(seen), key=lambda x: int(x) if x.isdigit() else 0)
     if len(seen_sorted) != expected:
-        print(f"  ⚠ 回收到 {len(seen_sorted)} 个 Rule ID，期望 {expected}（= Excel 去表头行数）。"
-              f"数量不符，请核对是否定位错模板行/翻页不全：{seen_sorted}")
+        print(color(f"  ⚠ 回收到 {len(seen_sorted)} 个 Rule ID，期望 {expected}（= Excel 去表头行数）。"
+                    f"数量不符，请核对是否定位错模板行/翻页不全：{seen_sorted}", "yellow"))
     else:
-        print(f"  ✓ 回收本批 Rule ID（{len(seen_sorted)} 个，升序）：{seen_sorted}")
+        print(color(f"  ✓ 回收本批 Rule ID（{len(seen_sorted)} 个，升序）：{seen_sorted}", "green"))
     return seen_sorted
 
 
@@ -1066,13 +1067,13 @@ def _click_online(page, modal, rule_id: str) -> bool:
         if row_idx < 0:
             rows = table.locator("tbody tr")
             n = rows.count()
-            print(f"  ✗ [gate] 待选规则 {rule_id!r} 未按规则ID列精确锁定到唯一目标行"
-                  f"（搜出 {n} 行），拒绝点『上线』。")
+            print(color(f"  ✗ [gate] 待选规则 {rule_id!r} 未按规则ID列精确锁定到唯一目标行"
+                        f"（搜出 {n} 行），拒绝点『上线』。", "red"))
             return False
         target = table.locator("tbody tr").nth(row_idx)
         return _click_button_in(target, page, "上线", f"上线({rule_id})")
     except Exception as e:
-        print(f"  ✗ 点『上线』失败 {rule_id!r}：{e}")
+        print(color(f"  ✗ 点『上线』失败 {rule_id!r}：{e}", "red"))
         return False
 
 
@@ -1086,7 +1087,7 @@ def _confirm_online(page) -> bool:
     """
     try:
         if page.get_by_text("确认上线该规则", exact=False).count() == 0:
-            print("  ✗ [gate] 未见『确认上线该规则?』确认框，拒绝点『确定』。")
+            print(color("  ✗ [gate] 未见『确认上线该规则?』确认框，拒绝点『确定』。", "red"))
             return False
         # 优先在二次确认容器作用域内取『确定』（避免误点编排弹窗底部提交按钮）。
         for sel in (".ant-modal-confirm", ".ant-popover", ".ant-popconfirm"):
@@ -1096,11 +1097,11 @@ def _confirm_online(page) -> bool:
                     return _click_button_in(scope, page, "确定", "确认上线-确定")
             except Exception:
                 continue
-        print("  ✗ [gate] 未定位到上线确认框的独立作用域（confirm/popconfirm），"
-              "为避免误点编排提交按钮，拒绝点『确定』。")
+        print(color("  ✗ [gate] 未定位到上线确认框的独立作用域（confirm/popconfirm），"
+                    "为避免误点编排提交按钮，拒绝点『确定』。", "red"))
         return False
     except Exception as e:
-        print(f"  ✗ 确认上线失败：{e}")
+        print(color(f"  ✗ 确认上线失败：{e}", "red"))
         return False
 
 
@@ -1125,14 +1126,14 @@ def _read_mac_group(page, modal, conflict_ruleid: str) -> str | None:
         page.wait_for_timeout(1200)
         return _read_mac_group_from_table(_selected_table(modal))
     except Exception as e:
-        print(f"  ✗ 读取被冲突号 {conflict_ruleid!r} 的 mac组 失败：{e}")
+        print(color(f"  ✗ 读取被冲突号 {conflict_ruleid!r} 的 mac组 失败：{e}", "red"))
         return None
 
 
 def _click_replace_confirm(page) -> bool:
     """D7/D-f gate：冲突『规则替换』弹窗点『确定』替换。点前断言弹窗仍在场。"""
     if not _conflict_modal_present(page):
-        print("  ✗ [gate] 规则替换弹窗不在场，拒绝点『确定』替换。")
+        print(color("  ✗ [gate] 规则替换弹窗不在场，拒绝点『确定』替换。", "red"))
         return False
     modal = page.locator(".ant-modal", has_text="规则替换").first
     return _click_button_in(modal, page, "确定", "规则替换-确定")
@@ -1168,7 +1169,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
     # 之后逐条只用 Rule ID 搜（待选区上线搜 / 已选区查状态），不再重设设备类型。
     if device_code:
         if not _set_device_type_once(page, modal, device_code):
-            print(f"✗ 已选规则区设置『设备类型』={device_code!r} 失败，按约定终止 online（不逐条上线）。")
+            print(color(f"✗ 已选规则区设置『设备类型』={device_code!r} 失败，按约定终止 online（不逐条上线）。", "red"))
             return [{"ruleid": rid, "status": STATUS_FAILED,
                      "note": f"设备类型设置失败，终止：{device_code!r}"} for rid in rule_ids]
 
@@ -1201,7 +1202,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
             print(f"  冲突：规则替换弹窗，被冲突号解析为 {conflict_rid!r}")
             _shot(page, f"active_conflict_{rid}")
             if not conflict_rid:
-                print("  ⚠ 未能解析被冲突号，保守中止该条（点取消）。")
+                print(color("  ⚠ 未能解析被冲突号，保守中止该条（点取消）。", "yellow"))
                 _click_replace_cancel(page)
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = ""
@@ -1211,7 +1212,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
 
             mac_text = _read_mac_group(page, modal, conflict_rid)
             if mac_text is None:
-                print(f"  ⚠ mac组 读取不确定，保守中止该条（点取消）。被冲突号={conflict_rid!r}")
+                print(color(f"  ⚠ mac组 读取不确定，保守中止该条（点取消）。被冲突号={conflict_rid!r}", "yellow"))
                 _click_replace_cancel(page)
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
@@ -1220,7 +1221,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 continue
 
             if mac_group_is_bound(mac_text):
-                print(f"  mac组 非空（{mac_text!r}）→ 回弹窗点『确定』替换上线。")
+                print(color(f"  mac组 非空（{mac_text!r}）→ 回弹窗点『确定』替换上线。", "green"))
                 if _click_replace_confirm(page):
                     page.wait_for_timeout(1500)
                     res["status"] = STATUS_ONLINE
@@ -1230,14 +1231,14 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 res["mac_group_bound"] = True
                 results.append(res)
             else:
-                print(f"  mac组 为空（{mac_text!r}）→ 点『取消』中止该条并记录。")
+                print(color(f"  mac组 为空（{mac_text!r}）→ 点『取消』中止该条并记录。", "red"))
                 _click_replace_cancel(page)
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
                 res["mac_group_bound"] = False
                 results.append(res)
         else:
-            print("  无冲突弹窗，记为 online 候选（阶段3 回读确认）。")
+            print(color("  无冲突弹窗，记为 online 候选（阶段3 回读确认）。", "green"))
             _shot(page, f"active_online_{rid}")
             res["status"] = STATUS_ONLINE
             results.append(res)
@@ -1303,7 +1304,7 @@ def _is_online(page, modal, rule_id: str) -> bool:
         )
         return bool(has_row)
     except Exception as e:
-        print(f"  ✗ online 回读失败 {rule_id!r}：{e}")
+        print(color(f"  ✗ online 回读失败 {rule_id!r}：{e}", "red"))
         return False
 
 
@@ -1467,7 +1468,7 @@ def main() -> int:
                 print(f"[collect] 导入模板 Excel：{excel}")
                 rule_ids, name, remark = run_import(page, excel)
                 if not rule_ids:
-                    print("✗ [collect] 未回收到任何 Rule ID。")
+                    print(color("✗ [collect] 未回收到任何 Rule ID。", "red"))
                     return 2
                 print(f"\n[collect] 模板名称：{name}")
                 print(f"[collect] 备注：{remark}")
@@ -1479,9 +1480,10 @@ def main() -> int:
                 # Rule ID 升序逐行、第 1 行放最小值；升级方式按 OTA类型 代码映射；升级日期=今天）。
                 try:
                     n = write_rule_id_columns(excel, rule_ids)
-                    print(f"[collect] ✓ 已把『升级方式/升级日期/Rule ID』三列回写到 Excel（{n} 行）：{excel}")
+                    print("[collect] " + color(
+                        f"✓ 已把『升级方式/升级日期/Rule ID』三列回写到 Excel（{n} 行）：{excel}", "green"))
                 except Exception as e:
-                    print(f"[collect] ✗ 回写 Excel 三列失败：{e}")
+                    print("[collect] " + color(f"✗ 回写 Excel 三列失败：{e}", "red"))
                     if config.HEADED:
                         print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
                         time.sleep(20)
@@ -1502,7 +1504,7 @@ def main() -> int:
                     key=lambda x: int(x) if x.isdigit() else 0,
                 )
                 if not rule_ids:
-                    print("✗ [online] Excel 的『Rule ID』列没有可用的 Rule ID（列缺失或为空），终止。")
+                    print(color("✗ [online] Excel 的『Rule ID』列没有可用的 Rule ID（列缺失或为空），终止。", "red"))
                     return 2
                 print(f"[online] 从 Excel 读到 {len(rule_ids)} 个 Rule ID（升序）：{rule_ids}")
 
@@ -1512,11 +1514,11 @@ def main() -> int:
                     device_code = next(iter(device_codes))
                 elif len(device_codes) == 0:
                     device_code = ""
-                    print("⚠ [online] Excel『设备类型代码』列为空，上线搜索将只用 Rule ID（精度下降）。")
+                    print(color("⚠ [online] Excel『设备类型代码』列为空，上线搜索将只用 Rule ID（精度下降）。", "yellow"))
                 else:
                     device_code = ""
-                    print(f"⚠ [online] Excel 含多个设备类型代码 {sorted(device_codes)!r}，"
-                          "无法确定唯一值，上线搜索将只用 Rule ID（精度下降）。")
+                    print(color(f"⚠ [online] Excel 含多个设备类型代码 {sorted(device_codes)!r}，"
+                                "无法确定唯一值，上线搜索将只用 Rule ID（精度下降）。", "yellow"))
                 if device_code:
                     print(f"[online] 设备类型代码（搜索第二条件）：{device_code!r}")
 
@@ -1531,10 +1533,10 @@ def main() -> int:
                     time.sleep(20)
                 return summary_exit_code(final)
 
-            print(f"✗ 未知模式：{mode!r}")
+            print(color(f"✗ 未知模式：{mode!r}", "red"))
             return 2
         except Exception as e:
-            print(f"✗ 运行出错：{e}")
+            print(color(f"✗ 运行出错：{e}", "red"))
             _shot(page, "active_error")
             return 1
         finally:

@@ -40,32 +40,9 @@ from . import config as cms_config  # noqa: F401  触发 ota_cms 的 config/.env
 from .otagen.engine import OTAEngine
 from .otagen import transfer
 from .otagen.legacy_engine import OUTPUT_HEADERS
-
-# —— 终端着色（绿=成功/一致，黄=警告，红=错误）——
-# 仅当输出是 TTY 且未设 NO_COLOR 时上色；非交互/重定向/管道时自动退化为无色纯文本，
-# 避免把 ANSI 码写进被下游捕获的输出。
-_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
-_COLORS = {"green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
-           "bold": "\033[1m", "dim": "\033[2m"}
-_RESET = "\033[0m"
-
-
-def _c(text: str, color: str) -> str:
-    if not _USE_COLOR or color not in _COLORS:
-        return text
-    return f"{_COLORS[color]}{text}{_RESET}"
-
-
-def _ok(msg: str) -> str:      # 绿色 ✓
-    return _c(f"✓ {msg}", "green")
-
-
-def _warn(msg: str) -> str:    # 黄色 ⚠
-    return _c(f"⚠ {msg}", "yellow")
-
-
-def _err(msg: str) -> str:     # 红色 ✗
-    return _c(f"✗ {msg}", "red")
+# 终端着色（绿=成功/一致，黄=警告，红=错误）抽到共享模块 automation/_log.py；
+# 用别名保留本文件原有调用名 _ok/_warn/_err/_c，其余调用点零改动。
+from ._log import ok as _ok, warn as _warn, err as _err, color as _c
 
 
 def _build_parser() -> argparse.ArgumentParser:

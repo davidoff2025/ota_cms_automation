@@ -38,6 +38,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 from . import config
+from ._log import ok, warn, err, color
 from .dass_login import login, _shot
 from .dass_fill import norm_ruleid, _report_frame
 from .dass_perf import (
@@ -99,7 +100,7 @@ def parse_ruleid_spec(spec: str) -> list[str]:
             continue
         rid = norm_ruleid(seg)
         if not rid:
-            print(f"⚠ 跳过无法解析为 Rule ID 的片段：{seg.strip()!r}")
+            print(color(f"⚠ 跳过无法解析为 Rule ID 的片段：{seg.strip()!r}", "yellow"))
             continue
         _add(rid)
 
@@ -178,16 +179,18 @@ def _print_report(targets: list[str], rates: dict, pages: int = 1) -> tuple[list
     for rid in targets:
         info = rates.get(rid)
         if info is None:
-            print(f"  Rule ID={rid}  成功率=未找到（Stage1，已遍历全部 {pages} 页）  未找到")
+            print(color(f"  Rule ID={rid}  成功率=未找到（Stage1，已遍历全部 {pages} 页）  未找到", "yellow"))
             not_found.append(rid)
             continue
         rate = info.get("rate")
         if rate is None:
-            print(f"  Rule ID={rid}  成功率解析失败（原文 {info.get('rate_text', '')!r}）  不通过 ❌  （Stage1）")
+            print(color(
+                f"  Rule ID={rid}  成功率解析失败（原文 {info.get('rate_text', '')!r}）  不通过 ❌  （Stage1）",
+                "red"))
             failed.append(rid)
             continue
         passed = rate >= PASS_THRESHOLD
-        mark = "通过 ✅" if passed else "不通过 ❌"
+        mark = color("通过 ✅", "green") if passed else color("不通过 ❌", "red")
         print(f"  Rule ID={rid}  成功率={rate:.2f}%  {mark}  （Stage1）")
         if not passed:
             failed.append(rid)
@@ -201,13 +204,13 @@ def _print_summary(targets: list[str], failed: list[str], not_found: list[str], 
     print(f"  目标 Rule ID 总数：{total}")
     print(f"  通过：{passed_n}")
     if not failed and not_found == []:
-        print("  全部通过 ✅")
+        print(color("  全部通过 ✅", "green"))
         return
-    print("  以下不通过/未找到：")
+    print(color("  以下不通过/未找到：", "red"))
     if failed:
-        print(f"    不通过（< {PASS_THRESHOLD:.0f}% 或解析失败）：{failed}")
+        print(color(f"    不通过（< {PASS_THRESHOLD:.0f}% 或解析失败）：{failed}", "red"))
     if not_found:
-        print(f"    未找到（Stage1，已遍历全部 {pages} 页）：{not_found}")
+        print(color(f"    未找到（Stage1，已遍历全部 {pages} 页）：{not_found}", "yellow"))
 
 
 def _ruleid_sort_key(rid: str):
@@ -256,7 +259,7 @@ def main() -> int:
     try:
         mode = _validate_mode(args.list_all, args.ruleids)
     except ValueError as e:
-        print(f"✗ 参数错误：{e}")
+        print(color(f"✗ 参数错误：{e}", "red"))
         return 2
 
     if mode == "all":
@@ -271,7 +274,7 @@ def main() -> int:
     try:
         targets = _collect_targets(args.ruleids)
     except ValueError as e:
-        print(f"✗ Rule ID 解析失败：{e}")
+        print(color(f"✗ Rule ID 解析失败：{e}", "red"))
         return 2
 
     print(f"方案号：{args.plancode}")
@@ -298,7 +301,7 @@ def _run_targets(args, targets: list[str]) -> int:
             page.wait_for_timeout(2500)
             fr = _report_frame(page)
             if fr is None:
-                print("✗ 未找到绩效页 frame，无法查询。")
+                print(color("✗ 未找到绩效页 frame，无法查询。", "red"))
                 _shot(page, "perf_query_no_frame")
                 return 2
 
@@ -310,7 +313,7 @@ def _run_targets(args, targets: list[str]) -> int:
             )
             _shot(page, "perf_query_done")
             if rates is None:
-                print("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。")
+                print(color("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。", "red"))
                 _shot(page, "perf_query_missing_columns")
                 return 2
 
@@ -319,7 +322,7 @@ def _run_targets(args, targets: list[str]) -> int:
             _print_summary(targets, failed, not_found, pages)
             return 0 if (not failed and not not_found) else 1
         except Exception as e:
-            print(f"✗ 出错：{e}")
+            print(color(f"✗ 出错：{e}", "red"))
             _shot(page, "perf_query_error")
             return 1
         finally:
@@ -340,7 +343,7 @@ def _run_all(args) -> int:
             page.wait_for_timeout(2500)
             fr = _report_frame(page)
             if fr is None:
-                print("✗ 未找到绩效页 frame，无法查询。")
+                print(color("✗ 未找到绩效页 frame，无法查询。", "red"))
                 _shot(page, "perf_query_no_frame")
                 return 2
 
@@ -352,14 +355,14 @@ def _run_all(args) -> int:
             )
             _shot(page, "perf_query_done")
             if rates is None:
-                print("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。")
+                print(color("✗ 绩效页未解析到成功率/ruleid 列字母，安全失败。", "red"))
                 _shot(page, "perf_query_missing_columns")
                 return 2
 
             _print_all(rates, stats.get("pages", 1))
             return 0
         except Exception as e:
-            print(f"✗ 出错：{e}")
+            print(color(f"✗ 出错：{e}", "red"))
             _shot(page, "perf_query_error")
             return 1
         finally:

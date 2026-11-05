@@ -44,6 +44,7 @@ from __future__ import annotations
 import re
 
 from . import config
+from ._log import ok, warn, err, color
 from .dass_fill import (
     PREV_STAGE,
     norm_ruleid,
@@ -115,9 +116,9 @@ def navigate_to_perf(page) -> None:
     for text, wait_ms in (("Android New", 1500), ("OTA", 1500)):
         print(f"\n点击菜单：{text} ...")
         if _click_menu_in_any_frame(page, text):
-            print(f"  ✓ 已点击 {text}")
+            print(color(f"  ✓ 已点击 {text}", "green"))
         else:
-            print(f"  ⚠ 未找到菜单项：{text}")
+            print(color(f"  ⚠ 未找到菜单项：{text}", "yellow"))
             _dump_visible_menu(page)
         page.wait_for_timeout(wait_ms)
 
@@ -126,14 +127,14 @@ def navigate_to_perf(page) -> None:
     for leaf in PERF_MENU_LEAF_CANDIDATES:
         print(f"\n点击菜单：{leaf} ...")
         if _click_menu_in_any_frame(page, leaf):
-            print(f"  ✓ 已点击 {leaf}")
+            print(color(f"  ✓ 已点击 {leaf}", "green"))
             clicked = True
             page.wait_for_timeout(9000)  # 报表打开较慢
             break
         else:
-            print(f"  ⚠ 未找到菜单项：{leaf}")
+            print(color(f"  ⚠ 未找到菜单项：{leaf}", "yellow"))
     if not clicked:
-        print("  ✗ 未能点中绩效报表菜单叶子，打印可见菜单供校准：")
+        print(color("  ✗ 未能点中绩效报表菜单叶子，打印可见菜单供校准：", "red"))
         _dump_visible_menu(page)
         page.wait_for_timeout(2000)
 
@@ -567,9 +568,9 @@ def query_rates_stage1(
         fr, page, filters, target_ruleids, stats_out
     )
     if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
-        print(f"  ✗ 绩效页未解析到 "
-              f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
-              f"（letters={letters}）；安全失败。")
+        print(color(f"  ✗ 绩效页未解析到 "
+                    f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
+                    f"（letters={letters}）；安全失败。", "red"))
         return None
     result: dict[str, dict] = {}
     for row in rows:
@@ -604,11 +605,11 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     for rec in records:
         rid = norm_ruleid(rec.get("ruleid", ""))
         if not rid:
-            print(f"  ⚠ 跳过 ruleid 为空的 Excel 记录：方案号={rec.get('方案号', '')!r}")
+            print(color(f"  ⚠ 跳过 ruleid 为空的 Excel 记录：方案号={rec.get('方案号', '')!r}", "yellow"))
             continue
         excel_by_ruleid.setdefault(rid, rec)
     if not excel_by_ruleid:
-        print("  ✗ Excel 中没有可用的 Rule ID（全为空），无法校验成功率，abort 升级。")
+        print(color("  ✗ Excel 中没有可用的 Rule ID（全为空），无法校验成功率，abort 升级。", "red"))
         return False
 
     excel_ruleids = set(excel_by_ruleid)
@@ -657,9 +658,9 @@ def check_success_rate(fr, page, records, option: str) -> bool:
         # 跨页遍历（_perf_query 内）；只找这一个 rid，命中即提前停止翻页。
         rows, letters, session = _perf_query(fr, page, filters, {rid})
         if not letters.get(PERF_RULEID_HEADER) or not letters.get(PERF_SUCCESS_RATE_HEADER):
-            print(f"  ✗ 绩效页未解析到 "
-                  f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
-                  f"（letters={letters}）；安全失败，abort 升级。")
+            print(color(f"  ✗ 绩效页未解析到 "
+                        f"『{PERF_RULEID_HEADER}』/『{PERF_SUCCESS_RATE_HEADER}』列字母"
+                        f"（letters={letters}）；安全失败，abort 升级。", "red"))
             _shot(page, "perf_missing_columns")
             return False
         matches = [r for r in rows if norm_ruleid(r.get("ruleid", "")) == rid]
@@ -712,20 +713,20 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
         stage = info.get("stage", "未找到")
         if rate is None:
             if stage == "未找到":
-                rate_desc = "未找到"
+                rate_desc = color("未找到", "yellow")
                 not_found_n += 1
             else:
-                rate_desc = f"成功率解析失败（原文 {info.get('rate_text', '')!r}）"
+                rate_desc = color(f"成功率解析失败（原文 {info.get('rate_text', '')!r}）", "red")
                 fail_n += 1
-            verdict = "不通过 ❌"
+            verdict = color("不通过 ❌", "red")
             failures.append(rid)
         else:
             rate_desc = f"升级成功率={rate:.2f}%"
             if rate >= PASS_THRESHOLD:
-                verdict = "通过 ✅"
+                verdict = color("通过 ✅", "green")
                 pass_n += 1
             else:
-                verdict = "不通过 ❌"
+                verdict = color("不通过 ❌", "red")
                 failures.append(rid)
                 fail_n += 1
         lines.append(f"  Rule ID={rid!r}  {rate_desc}  {verdict}  来源阶段={stage}")
@@ -735,14 +736,16 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
     lines.append(f"  总数：{len(rids)}  通过：{pass_n}  不通过：{fail_n}  未找到：{not_found_n}")
 
     if not failures:
-        lines.append(f"\n======== 最终结论：放行 ✅ ========")
-        lines.append(f"  本批 {len(rids)} 个 Rule ID 成功率均 >= {PASS_THRESHOLD:.0f}%，放行升级。")
+        lines.append(color("\n======== 最终结论：放行 ✅ ========", "green"))
+        lines.append(color(
+            f"  本批 {len(rids)} 个 Rule ID 成功率均 >= {PASS_THRESHOLD:.0f}%，放行升级。", "green"))
         return "\n".join(lines), True
 
-    lines.append(f"\n======== 最终结论：abort ❌ 中止升级 ========")
-    lines.append(f"  以下 {len(failures)} 个 Rule ID 未达标"
-                 f"（< {PASS_THRESHOLD:.0f}% 或两阶段都查不到）：{failures}")
-    lines.append("  run_update 不执行，也不进入人工提交环节。")
+    lines.append(color("\n======== 最终结论：abort ❌ 中止升级 ========", "red"))
+    lines.append(color(
+        f"  以下 {len(failures)} 个 Rule ID 未达标"
+        f"（< {PASS_THRESHOLD:.0f}% 或两阶段都查不到）：{failures}", "red"))
+    lines.append(color("  run_update 不执行，也不进入人工提交环节。", "red"))
     return "\n".join(lines), False
 
 
