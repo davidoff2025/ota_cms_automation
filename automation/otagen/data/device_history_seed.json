@@ -1,5 +1,131 @@
 [
   {
+    "device_code": "A311D2AndrWM61FE",
+    "device_name": "",
+    "feature_code": "861003009000006000000101",
+    "mac_group": "测试A311D2AndrWM61FE"
+  },
+  {
+    "device_code": "MSD6886AndroidEM",
+    "device_name": "",
+    "feature_code": "861003009000005000000641",
+    "mac_group": "测试MSD6886AndroidEM"
+  },
+  {
+    "device_code": "MSD6886AndroidSA",
+    "device_name": "",
+    "feature_code": "861003009000008000000641",
+    "mac_group": "测试MSD6886AndroidSA"
+  },
+  {
+    "device_code": "MST6886AndroidNA",
+    "device_name": "",
+    "feature_code": "861003009000003000000641",
+    "mac_group": "测试MST6886AndroidNA"
+  },
+  {
+    "device_code": "MT6886KORAndro4K",
+    "device_name": "",
+    "feature_code": "861003009000017000000641",
+    "mac_group": "测试MT6886KORAndro4K"
+  },
+  {
+    "device_code": "MT8195Andr32P1S",
+    "device_name": "MT8195安卓32P1S",
+    "feature_code": "861003009000002000000747",
+    "mac_group": "测试MT8195Andr32P1S"
+  },
+  {
+    "device_code": "MT8195Andr32S6S",
+    "device_name": "MT8195安卓32S6S",
+    "feature_code": "861003009000001000000747",
+    "mac_group": "测试MT8195Andr32S6S"
+  },
+  {
+    "device_code": "MT9603AndrGTV4K",
+    "device_name": "MT9603安卓GTV4K",
+    "feature_code": "861003009000001000000743",
+    "mac_group": "测试MT9603AndrGTV4K"
+  },
+  {
+    "device_code": "MT9612AndroSA4K",
+    "device_name": "",
+    "feature_code": "861003009000002000000738",
+    "mac_group": "测试MT9612AndroSA4K"
+  },
+  {
+    "device_code": "MT9612EMAnd4K",
+    "device_name": "",
+    "feature_code": "861003009000003000000738",
+    "mac_group": "测试MT9612EMAnd4K"
+  },
+  {
+    "device_code": "MT9612NAAnd4KUHD",
+    "device_name": "",
+    "feature_code": "861003009000004000000738",
+    "mac_group": "测试MT9612NAAnd4KUHD"
+  },
+  {
+    "device_code": "MT9612NAAndr4K",
+    "device_name": "",
+    "feature_code": "861003009000001000000738",
+    "mac_group": "测试MT9612NAAndr4K"
+  },
+  {
+    "device_code": "MT9618AMAndGTV4K",
+    "device_name": "MT9618美洲安卓GTV4K",
+    "feature_code": "861003009000001000000740",
+    "mac_group": "测试MT9618AMAndGTV4K"
+  },
+  {
+    "device_code": "MT9618FRAndGTV4K",
+    "device_name": "MT9618画框安卓GTV4K",
+    "feature_code": "861003009000004000000740",
+    "mac_group": "测试MT9618FRAndGTV4K"
+  },
+  {
+    "device_code": "MT9618JPAndRLC",
+    "device_name": "",
+    "feature_code": "861003009000008000000740",
+    "mac_group": "测试MT9618JPAndRLC"
+  },
+  {
+    "device_code": "MT9618LAAndGTV4K",
+    "device_name": "MT9618激光安卓美洲GTV4K",
+    "feature_code": "861003009000005000000740",
+    "mac_group": "测试MT9618LAAndGTV4K"
+  },
+  {
+    "device_code": "MT9618PRAndGTV4K",
+    "device_name": "MT9618微投安卓全球GTV4K",
+    "feature_code": "861003009000006000000740",
+    "mac_group": "测试MT9618PRAndGTV4K"
+  },
+  {
+    "device_code": "MT9655AMAndrGTV",
+    "device_name": "MT9655美洲安卓GTV",
+    "feature_code": "861003009000001000000745",
+    "mac_group": "测试MT9655AMAndrGTV"
+  },
+  {
+    "device_code": "MT9655AndrWH80F",
+    "device_name": "MT9655安卓WH80F",
+    "feature_code": "861003009000004000000101",
+    "mac_group": "测试MT9655AndrWH80F"
+  },
+  {
+    "device_code": "MT9655JPAnGTVLas",
+    "device_name": "MT9603安卓GTV4K",
+    "feature_code": "861003009000006000000745",
+    "mac_group": "测试MT9655JPAnGTVLas"
+  },
+  {
+    "device_code": "MT9666AndrVW25E",
+    "device_name": "",
+    "feature_code": "861003009000003000000744",
+    "mac_group": "测试MT9666AndrVW25E"
+  },
+  {
     "device_code": "MT9666Android",
     "device_name": "MT9666安卓",
     "feature_code": "861003009000001000000744",
@@ -12,57 +138,21 @@
     "mac_group": "测试MT9900北美安卓4K"
   },
   {
-    "device_code": "MT9655JPAnGTVLas",
-    "device_name": "MT9603安卓GTV4K",
-    "feature_code": "861003009000006000000745",
-    "mac_group": "测试MT9655JPAnGTVLas"
+    "device_code": "MT9900NAAndGTV4K",
+    "device_name": "",
+    "feature_code": "861003009000010000000733",
+    "mac_group": "测试MT9900NAAndGTV4K"
   },
   {
-    "device_code": "MT9655AndrWH80F",
-    "device_name": "MT9655安卓WH80F",
-    "feature_code": "861003009000004000000101",
-    "mac_group": "测试MT9655AndrWH80F"
+    "device_code": "MT9900NAGTVLaser",
+    "device_name": "",
+    "feature_code": "861003009000019000000733",
+    "mac_group": "测试MT9900NAGTVLaser"
   },
   {
-    "device_code": "MT9618PRAndGTV4K",
-    "device_name": "MT9618微投安卓全球GTV4K",
-    "feature_code": "861003009000006000000740",
-    "mac_group": "测试MT9618PRAndGTV4K"
-  },
-  {
-    "device_code": "MT9618LAAndGTV4K",
-    "device_name": "MT9618激光安卓美洲GTV4K",
-    "feature_code": "861003009000005000000740",
-    "mac_group": "测试MT9618LAAndGTV4K"
-  },
-  {
-    "device_code": "MT9618FRAndGTV4K",
-    "device_name": "MT9618画框安卓GTV4K",
-    "feature_code": "861003009000004000000740",
-    "mac_group": "测试MT9618FRAndGTV4K"
-  },
-  {
-    "device_code": "MT9618AMAndGTV4K",
-    "device_name": "MT9618美洲安卓GTV4K",
-    "feature_code": "861003009000001000000740",
-    "mac_group": "测试MT9618AMAndGTV4K"
-  },
-  {
-    "device_code": "MT9603AndrGTV4K",
-    "device_name": "MT9603安卓GTV4K",
-    "feature_code": "861003009000001000000743",
-    "mac_group": "测试MT9603AndrGTV4K"
-  },
-  {
-    "device_code": "MT8195Andr32P1S",
-    "device_name": "MT8195安卓32P1S",
-    "feature_code": "861003009000002000000747",
-    "mac_group": "测试MT8195Andr32P1S"
-  },
-  {
-    "device_code": "MT9655AMAndrGTV",
-    "device_name": "MT9655美洲安卓GTV",
-    "feature_code": "861003009000001000000745",
-    "mac_group": "测试MT9655AMAndrGTV"
+    "device_code": "T963andrDP30FE",
+    "device_name": "T963安卓DP30FE",
+    "feature_code": "861003009000001000000103",
+    "mac_group": "测试T963andrDP30FE"
   }
 ]

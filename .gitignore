@@ -9,3 +9,6 @@ __pycache__/
 automation/otagen/data/outputs/
 automation/otagen/data/ota_message_templates.json
 automation/otagen/data/device_history.json
+
+# editor
+.vscode/
