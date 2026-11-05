@@ -414,17 +414,131 @@ def _read_mac_group_from_table(table) -> str | None:
 
 # —— 阶段1：导入建规则 ——
 
-def _click_import_confirm(page, modal) -> bool:
-    """D-f gate：点导入向导的『下一步/完成/确定』。点前断言确实处于导入弹窗。
+# UI 错误提示：导入点『下一步』或『保存』后，后端可能弹业务错误（实测如
+# 『第2行：目标版本已经存在Q0723_to_Q1028, devicecode: MT9655AMAndrGTV』『Service error』）。
+# 一旦出现这类可见错误提示，必须立即终止，不再继续向导/保存，并把原文记入错误。
+_UI_ERROR_SELECTORS = [
+    ".ant-message-error",                 # 顶部红色 message toast
+    ".ant-message-custom-content.ant-message-error",
+    ".ant-notification-notice-error",     # 右上角错误通知
+    ".ant-notice-error",
+    ".ant-form-item-explain-error",       # 字段下方红字（如“模板名称不能为空”）
+]
+# 关键错误词（命中任一即视为错误，覆盖 CMS 自定义样式/文案）。
+_UI_ERROR_KEYWORDS = ["Service error", "服务错误", "已经存在", "失败", "错误"]
 
+
+def _detect_ui_error(page) -> str | None:
+    """检测页面上是否出现可见的错误提示。命中返回错误原文（去空白），否则 None。
+
+    先查 ant-design 标准错误节点；再对错误 toast/通知容器里的可见文本做关键词匹配，
+    以覆盖自定义样式。只取可见元素，避免命中残留的隐藏节点。
+    """
+    # 1) 标准错误节点。
+    for sel in _UI_ERROR_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 10)):
+                el = loc.nth(i)
+                if el.is_visible():
+                    txt = (el.inner_text() or "").strip()
+                    if txt:
+                        return txt
+        except Exception:
+            continue
+    # 2) 消息/通知容器里的关键词匹配（覆盖非标准 error class 的提示）。
+    for container in (".ant-message", ".ant-notification", ".ant-modal-confirm-body"):
+        try:
+            loc = page.locator(container)
+            for i in range(min(loc.count(), 10)):
+                el = loc.nth(i)
+                if not el.is_visible():
+                    continue
+                txt = (el.inner_text() or "").strip()
+                if txt and any(kw in txt for kw in _UI_ERROR_KEYWORDS):
+                    return txt
+        except Exception:
+            continue
+    return None
+
+
+def _abort_if_ui_error(page, where: str) -> None:
+    """在关键写操作后调用：若检测到 UI 错误提示，截图 + 打印原文并抛异常终止。"""
+    err = _detect_ui_error(page)
+    if err:
+        _shot(page, "active_ui_error")
+        # 错误文案可能多行，压成单行便于日志阅读。
+        one_line = " ".join(err.split())
+        raise RuntimeError(f"检测到 UI 错误提示（{where}），已终止：{one_line}")
+
+
+def _fill_import_field(modal, selectors: list[str], value: str, label: str) -> bool:
+    """在导入弹窗作用域内，按候选选择器依次尝试定位可见输入框并填入 value。
+
+    成功填入并回读校验一致后返回 True；全部候选都未命中/回读不符则返回 False。
+    回读校验确保『填了但没生效』（如组件未绑定）也算失败，交由调用方中止，避免静默导入。
+    """
+    for sel in selectors:
+        try:
+            loc = modal.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            loc.click()
+            loc.fill("")
+            loc.fill(str(value))
+            got = (loc.input_value() or "").strip()
+            if got == str(value).strip():
+                print(f"  {label} 已填入：{value!r}（选择器 {sel!r}）")
+                return True
+            print(f"  ⚠ {label} 回读不符：期望 {value!r} 实得 {got!r}（选择器 {sel!r}），继续尝试下一个。")
+        except Exception as e:
+            print(f"  ⚠ {label} 用选择器 {sel!r} 填写异常：{e}，继续尝试下一个。")
+            continue
+    return False
+
+
+def _click_import_confirm(page, modal) -> bool:
+    """D-f gate：走完导入【两步向导】。点前断言确实处于导入弹窗。
+
+    实测（用户截图）导入弹窗第一步右下角是『下一步/取消』，点『下一步』后才进入第二步，
+    第二步再点完成按钮（『保存』等）导入才真正完成。所以不能点中第一个按钮就返回——
+    那正是之前备注看似填了、却没真正完成导入/未点保存的原因。
+
+    流程：
+      1) 第一步点『下一步』（若存在）；若没有『下一步』而直接是单步完成按钮，则退化为单步。
+      2) 等第二步渲染，点『保存/确定/完成/导入』完成导入。
     条件不满足（弹窗不在场）只打印不点并返回 False。
     """
     if modal is None or not modal.is_visible():
         print("  ✗ [gate] 导入弹窗不在场，拒绝点击导入确认按钮。")
         return False
-    for kw in ("下一步", "完成", "确定", "保存", "导入"):
-        if _click_button_in(modal, page, kw, f"导入确认({kw})"):
+
+    # —— 第一步：优先点『下一步』进入第二步；没有『下一步』则视为单步向导。——
+    went_next = _click_button_in(modal, page, "下一步", "导入向导第一步(下一步)")
+    if went_next:
+        page.wait_for_timeout(1800)
+        # 点『下一步』后后端可能弹业务错误（目标版本已存在 / Service error）——立即终止。
+        _abort_if_ui_error(page, "点『下一步』后")
+        modal = _active_modal(page) or modal  # 第二步可能换了 modal 实例
+        if modal is None or not modal.is_visible():
+            print("  ✗ [gate] 点『下一步』后导入弹窗不在场，拒绝继续。")
+            return False
+
+    # —— 第二步（或单步）：点完成/保存按钮真正完成导入。——
+    for kw in ("保存", "完成", "确定", "导入"):
+        if _click_button_in(modal, page, kw, f"导入完成({kw})"):
+            page.wait_for_timeout(1500)
+            # 点『保存』后同样可能弹业务错误——立即终止。
+            _abort_if_ui_error(page, f"点『{kw}』后")
             return True
+
+    # 单步向导里『下一步』本身可能就是提交（无第二步按钮时）。
+    if went_next:
+        print("  ⚠ 已点『下一步』但未找到第二步的『保存/完成/确定』按钮——"
+              "请确认导入是否已完成（可能第二步按钮文案不同，需按实跑日志校正）。")
+        return True
+
+    print("  ✗ 未找到任何导入完成按钮（下一步/保存/完成/确定/导入均未命中）。")
     return False
 
 
@@ -468,14 +582,33 @@ def run_import(page, excel_path: str) -> tuple[list[str], str, str]:
     page.wait_for_timeout(1500)
 
     # 模板名称（placeholder=必填）与备注（textarea）。
-    try:
-        modal.locator("input[placeholder='必填']").first.fill(name)
-    except Exception as e:
-        print(f"  ⚠ 模板名称输入框填写失败：{e}")
-    try:
-        modal.locator("textarea").first.fill(remark)
-    except Exception as e:
-        print(f"  ⚠ 备注输入框填写失败：{e}")
+    # 模板名称（placeholder=必填）。填不进直接中止——名称必填，否则导入无意义。
+    if not _fill_import_field(
+        modal,
+        [
+            "input[placeholder='必填']",
+        ],
+        name,
+        "模板名称",
+    ):
+        raise RuntimeError("模板名称输入框填写失败（未命中输入框）。")
+
+    # 备注：实测是普通 input（非 textarea），旁边有『备注』标签。按多候选稳健定位。
+    # 填不进直接中止——否则会像之前那样静默导入出一个备注为空的模板。
+    if not _fill_import_field(
+        modal,
+        [
+            "input[placeholder='备注']",
+            "textarea[placeholder='备注']",
+            # 兜底：所有非『必填』的可见文本输入框里取第一个（名称框 placeholder=必填，已排除）。
+            "input:not([placeholder='必填'])[type='text']",
+            "input:not([placeholder='必填']):not([type='file'])",
+            "textarea",
+        ],
+        remark,
+        "备注",
+    ):
+        raise RuntimeError(f"备注输入框填写失败（未命中输入框）。备注值={remark!r}")
 
     _shot(page, "active_import_dialog")
 
@@ -898,6 +1031,44 @@ def probe_online(page) -> None:
 # CLI
 # ======================================================================
 
+_HELP_TEXT = """\
+active_ota —— CMS OTA 规则：导入建规则 → 逐条上线并处理冲突 → 回读状态汇总。
+
+用法：
+  ./run_active_ota.sh [EXCEL] [--probe-online] [--selftest]
+  ./.venv/bin/python -m automation.active_ota [EXCEL] [--probe-online] [--selftest]
+
+运行模式（四选一）：
+  （无参数）        连 CMS 跑完整三阶段；导入模板取 OTA_V4_OUTPUTS 下最新的 .xlsx。【写线上数据】
+  EXCEL            连 CMS 跑完整三阶段；用指定路径的 .xlsx 作为导入模板。【写线上数据】
+  --probe-online   连 CMS，只读 dump「规则上下线编排」视图的选择器，不做任何写操作。【只读/安全】
+  --selftest       纯逻辑自测（名称/备注拼接、冲突号解析、mac组判定、汇总），不连浏览器。【离线/安全】
+  -h, --help       显示本帮助并退出。
+
+参数：
+  EXCEL            可选，导入模板 Excel 路径；省略则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
+                   只接受一个 Excel 路径；要求整表单一「设备类型代码」+单一「目标版本」，否则报错中止。
+
+完整流程三阶段（硬性决策 D1~D12）：
+  阶段1 导入建规则：规则名称 = 设备类型代码 + "_" + 目标版本末5位（例 MT9655AMAndrGTV_Q1015）；
+        备注 = 今天日期YYYYMMDD + "_USA_" + 导入行数（例 20261102_USA_9）。名称/备注填入导入弹窗后导入，
+        再从「查看规则」页回收本批新建的连续 Rule ID。
+  阶段2 逐条上线 + 冲突处理：在「升级事件 → 规则上下线」编排弹窗，待选区按 Rule ID 搜出 → 点「上线」→
+        确认框点「确定」；若弹「规则替换」冲突窗：解析被冲突 Rule ID → 去「已选规则」区查其 mac组，
+        mac组非空才点「确定」替换上线，mac组为空则点「取消」中止该条并记录。全自动，不加人工确认。
+  阶段3 状态汇总：逐个回读 Rule ID 最终状态（online / 冲突中止(mac组空) / 失败）并打印汇总。
+
+退出码：0 全部 online；2 存在冲突中止/未上线；1 运行出错。
+
+环境：
+  CMS_USERNAME / CMS_PASSWORD   在 config/.env 配置（run_active_ota.sh 会检查）。
+  CMS_HEADED=true（默认）         开可见浏览器窗口，便于盯着写流程。
+
+⚠ 安全提示：无参数 / 指定 EXCEL 的完整流程会【真实导入规则、上线、替换线上规则，不可逆】。
+  首次使用建议顺序：先 --selftest，再 --probe-online，再用仅含 1 条的测试 Excel 小批量试跑，确认无误后再整批。
+  所有写按钮（导入确定/上线确定/替换确定）均经二次确认 gate，条件不满足只打印不点。"""
+
+
 def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     """解析位置参数：可选 Excel 路径；可选 --probe-online 子命令。
 
@@ -907,13 +1078,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     excel: str | None = None
     for arg in argv:
         if arg in ("-h", "--help"):
-            print(
-                "用法：python -m automation.active_ota [EXCEL] [--probe-online] [--selftest]\n"
-                "  EXCEL         可选导入模板路径；不给则取 OTA_V4_OUTPUTS 下最新的 .xlsx。\n"
-                "  --probe-online  只读 dump 编排视图选择器（不做任何写操作）。\n"
-                "  --selftest    纯逻辑自测（不连浏览器）。\n"
-                "三阶段：导入建规则 → 逐条上线并处理冲突 → 回读状态汇总。\n"
-            )
+            print(_HELP_TEXT)
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"
