@@ -4,3 +4,8 @@ artifacts/
 __pycache__/
 *.pyc
 .agents/
+
+# otagen runtime-generated files (keep device_history_seed.json tracked)
+automation/otagen/data/outputs/
+automation/otagen/data/ota_message_templates.json
+automation/otagen/data/device_history.json

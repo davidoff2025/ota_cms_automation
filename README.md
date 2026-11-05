@@ -180,6 +180,52 @@ CMS 侧的 `active_ota` 模块（`automation/active_ota.py`）把「导入 OTA �
 
 ---
 
+## 六、OTA 模板 prep：生成 Excel → 严格校验 → 上传 S3：`./run_prep.sh`
+
+把粘贴/传入的升级信息文本，一键做成 OTA 导入 Excel，严格校验后再把 FTP 上的升级包下载并上传到 S3。
+与 CMS/DASS 的其它模块相互独立，所有生成逻辑都自带（`automation/otagen/`），不依赖 `ota_v4`。
+
+```bash
+# 从 stdin 粘贴文本（推荐）
+cat 文本.txt | ./run_prep.sh --device-code MT9655AMAndrGTV
+# 从文件读
+./run_prep.sh --file 文本.txt --device-code MT9655AMAndrGTV
+# 只生成+校验，不碰 FTP/S3（打印 S3 计划与 ftp zip 清单）
+cat 文本.txt | ./run_prep.sh --no-upload --device-code MT9655AMAndrGTV
+# 纯离线自测（不连 FTP/S3/~/.aws）
+./.venv/bin/python -m automation.prep --selftest
+```
+
+**输入**：给了 `--file` 读该文件，否则读 **stdin**。
+
+**参数（flags）**：
+
+- `--file PATH`：从文件读文本（省略则读 stdin）。
+- `--device-code` / `--device-name` / `--feature-code` / `--mac-group`：非空时覆盖从文本解析出的设备信息。
+- `--out-dir DIR`：生成 Excel 的输出目录（省略用 `automation/otagen/data/outputs`）。
+- `--no-upload`：只跑步骤1/2，打印生成件路径 + `s3://` 上传计划 + 待上传 ftp zip 清单，**绝不触碰 FTP/S3**。
+- `--selftest`：纯离线自测，校验生成/校验/地址抽取/S3 目标拼接等逻辑。
+
+**三步流程**：
+
+1. **生成**：`OTAEngine` 解析文本 → 生成「升级规则 + 升级提示语」两表的 Excel。
+2. **严格校验**：表名、表头（18 列）、每行升级文件地址（`https?://`、`.zip` 结尾、无 3+ 连续斜杠）、
+   OTA 类型 ∈ {1,2,11}、设备类型代码/特征码（24 位数字或空）/MAC 组/内部机型信息/设备扩展信息等。
+   **校验不通过直接返回 1，不上传**。
+3. **上传**：从源数据抽取 FTP `.zip` 地址 → 下载 → 上传 S3（`s3://fam-media-andr/ota/<设备码>/<YYYYMMDD>/`）。
+
+**返回码**：`0` 成功；`1` 业务失败（生成报错 / 校验不通过 / 无可上传地址 / 上传有失败项）；
+`2` 参数或安全失败（未读到文本 / `--file` 不存在）。
+
+**真实上传前置条件**（仅在不带 `--no-upload` 时需要）：
+
+- **FTP**：`config/.env` 里的 `OTA_FTP_PASS`（及可选 `OTA_FTP_USER`）非占位符 `__set_me__`。
+- **AWS**：区域/密钥**不在 `.env` 配置**，走 boto3 默认链（`~/.aws` / 实例角色 / 环境变量），region=`us-west`。
+
+> ⚠ 真实 S3 上传 / FTP 下载是**不可逆的外部 I/O**。演练请始终带 `--no-upload`。
+
+---
+
 ## 测试与验证
 
 - 核心模块带离线自测（不连浏览器）：
