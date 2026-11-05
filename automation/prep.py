@@ -277,8 +277,12 @@ def main() -> int:
     print(_c("—— 解析结果概览 ——", "bold"))
     print(f"  数据行数：{parsed_rows}")
 
+    # 输出目录优先级：--out-dir > 输入 .txt 所在目录（--file 时）> 项目内 otagen/data/outputs。
     if args.out_dir:
         out_dir = args.out_dir
+    elif args.file:
+        # 默认把生成的 Excel 放到与输入 .txt 相同的目录，方便与源文件一起归档。
+        out_dir = os.path.dirname(os.path.abspath(args.file))
     else:
         from .otagen import config as otagen_config
         out_dir = str(otagen_config.DATA_DIR / "outputs")
