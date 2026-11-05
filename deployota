@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# deployota —— OTA 部署统一入口（薄分发）。把子命令转发给对应模块：
+#   prep    生成 Excel → 校验 → 上传 S3
+#   upload  导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）
+#   online  逐条上线 + 冲突处理（CMS）
+#   dass    DASS 填报/更新（OPTION init/ota200/.../ota-all，含成功率闸门）
+#
+# 用法：
+#   ./deployota <子命令> [参数...]
+#   ./deployota --help                 列出子命令
+#   ./deployota <子命令> --help         查看该子命令帮助
+#
+# 本脚本只做分发，不改动各模块；旧入口 run_prep.sh / run_active_ota.sh /
+# run_dass.sh / run_login.sh 仍可用，二者并存。
+set -euo pipefail
+cd "$(dirname "$0")"
+
+PY="./.venv/bin/python"
+
+# 1. 确认虚拟环境存在。
+if [[ ! -x "$PY" ]]; then
+  echo "未找到虚拟环境，请先执行：" >&2
+  echo "  python3 -m venv .venv" >&2
+  echo "  ./.venv/bin/python -m pip install -r requirements.txt" >&2
+  echo "  ./.venv/bin/python -m playwright install chromium" >&2
+  exit 1
+fi
+
+# 2. 确认 config/.env 存在（凭据检查交给各子命令自身，这里只保证文件在）。
+if [[ ! -f config/.env ]]; then
+  echo "未找到 config/.env，正在从示例创建..." >&2
+  cp config/.env.example config/.env
+fi
+
+# 3. 转发给统一调度模块（它再分发到具体模块）。
+exec "$PY" -m automation.deployota "$@"
