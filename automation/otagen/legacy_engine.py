@@ -29,7 +29,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 
-AWS_PREFIX = os.getenv("OTA_AWS_PREFIX", "https://ota-dl.vidaahub.com")
+AWS_PREFIX = os.getenv("OTA_AWS_PREFIX", "https://ota-dl.intsmarthub.com")
 # Credentials must come from the environment — never hard-code secrets in source.
 # (v4's active FTP path is app/core/transfer.py, which reads app/core/config.py.)
 FTP_USER = os.getenv("OTA_FTP_USER", "ftpuser")

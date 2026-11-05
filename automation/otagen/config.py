@@ -42,7 +42,7 @@ STORAGE_BACKEND = os.getenv("OTA_STORAGE_BACKEND", "local")  # local | s3
 OUTPUT_S3_BUCKET = os.getenv("OTA_OUTPUT_S3_BUCKET", "")     # used when backend=s3
 
 # --- OTA domain constants (unchanged from v3) ---------------------------
-AWS_PREFIX = os.getenv("OTA_AWS_PREFIX", "https://ota-dl.vidaahub.com")
+AWS_PREFIX = os.getenv("OTA_AWS_PREFIX", "https://ota-dl.intsmarthub.com")
 S3_UPLOAD_BUCKET = os.getenv("OTA_S3_UPLOAD_BUCKET", "fam-media-andr")
 
 # --- FTP (download source ZIPs) -----------------------------------------
