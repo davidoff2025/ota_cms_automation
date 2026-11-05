@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import sys
@@ -67,6 +69,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", "-y", dest="assume_yes", action="store_true", default=False,
                    help="设备信息与映射表不一致时自动确认继续（非交互/管道场景用）；"
                         "默认不一致会等待人工确认，无法交互时退出。")
+    p.add_argument("--force", dest="force", action="store_true", default=False,
+                   help="即使输出目录已存在相同内容的 Excel 也强制重新生成（默认复用已有）。")
     return p
 
 
@@ -287,26 +291,35 @@ def main() -> int:
         from .otagen import config as otagen_config
         out_dir = str(otagen_config.DATA_DIR / "outputs")
 
-    # (2) 步骤1 生成。
+    # (2) 步骤1 生成（内容指纹去重：同一 source 内容已在该目录生成过则复用，不重复生成）。
     print(_c("—— 步骤1：生成 Excel ——", "bold"))
-    try:
-        res = eng.generate_excel(
-            sj,
-            device_code=device_code,
-            device_name=device_name,
-            feature_code=feature_code,
-            mac_group=mac_group,
-            output_dir=out_dir,
-        )
-    except ValueError as e:
-        print(_err("步骤1 生成失败："), file=sys.stderr)
-        print(str(e), file=sys.stderr)
-        return 1
+    content_hash = _source_fingerprint(text)
+    reused = None if args.force else _find_existing_excel(out_dir, content_hash)
+    if reused:
+        output_path = reused
+        final_device_code = device_code or ""
+        print(_ok(f"已存在相同内容的 Excel，跳过生成并复用：{output_path}"))
+        print(_c("  （如需强制重新生成，请加 --force）", "dim"))
+    else:
+        try:
+            res = eng.generate_excel(
+                sj,
+                device_code=device_code,
+                device_name=device_name,
+                feature_code=feature_code,
+                mac_group=mac_group,
+                output_dir=out_dir,
+            )
+        except ValueError as e:
+            print(_err("步骤1 生成失败："), file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            return 1
 
-    output_path = os.path.abspath(res["output_path"])
-    final_device_code = device_code or ""
-    print(_ok(f"已生成：{output_path}"))
-    print(f"  行数：{res.get('row_count')}  提示语数：{res.get('message_count')}")
+        output_path = os.path.abspath(res["output_path"])
+        final_device_code = device_code or ""
+        _record_excel_fingerprint(out_dir, content_hash, output_path)
+        print(_ok(f"已生成：{output_path}"))
+        print(f"  行数：{res.get('row_count')}  提示语数：{res.get('message_count')}")
 
     # (3) 步骤2 严格校验。
     print(_c("—— 步骤2：严格校验 ——", "bold"))
@@ -364,6 +377,50 @@ def main() -> int:
         return 1
     print(_ok("prep 全部完成：生成 → 校验 → 上传 → S3 回查，均 correct。"))
     return 0
+
+
+_PREP_INDEX_FILE = ".prep_index.json"
+
+
+def _source_fingerprint(text: str) -> str:
+    """source 文本内容的 SHA-256 指纹（内容一变就变），用于判定是否已生成过。"""
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _find_existing_excel(out_dir: str, content_hash: str) -> str | None:
+    """在 out_dir 的指纹索引里查该内容是否已生成过 Excel，且该文件仍存在。
+
+    返回已存在 xlsx 的绝对路径；没有记录、或记录的文件已被删则返回 None。
+    """
+    idx_path = os.path.join(out_dir, _PREP_INDEX_FILE)
+    try:
+        with open(idx_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+    except Exception:
+        return None
+    rel = idx.get(content_hash)
+    if not rel:
+        return None
+    path = rel if os.path.isabs(rel) else os.path.join(out_dir, rel)
+    return os.path.abspath(path) if os.path.isfile(path) else None
+
+
+def _record_excel_fingerprint(out_dir: str, content_hash: str, xlsx_path: str) -> None:
+    """把 内容hash -> 生成的 xlsx 文件名 记进 out_dir 的指纹索引（存文件名，便于目录迁移）。"""
+    idx_path = os.path.join(out_dir, _PREP_INDEX_FILE)
+    try:
+        with open(idx_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+        if not isinstance(idx, dict):
+            idx = {}
+    except Exception:
+        idx = {}
+    idx[content_hash] = os.path.basename(xlsx_path)
+    try:
+        with open(idx_path, "w", encoding="utf-8") as f:
+            json.dump(idx, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(_warn(f"写入指纹索引失败（不影响本次生成）：{e}"), file=sys.stderr)
 
 
 def _make_progress_printer():
