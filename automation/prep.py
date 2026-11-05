@@ -41,6 +41,32 @@ from .otagen.engine import OTAEngine
 from .otagen import transfer
 from .otagen.legacy_engine import OUTPUT_HEADERS
 
+# —— 终端着色（绿=成功/一致，黄=警告，红=错误）——
+# 仅当输出是 TTY 且未设 NO_COLOR 时上色；非交互/重定向/管道时自动退化为无色纯文本，
+# 避免把 ANSI 码写进被下游捕获的输出。
+_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_COLORS = {"green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
+           "bold": "\033[1m", "dim": "\033[2m"}
+_RESET = "\033[0m"
+
+
+def _c(text: str, color: str) -> str:
+    if not _USE_COLOR or color not in _COLORS:
+        return text
+    return f"{_COLORS[color]}{text}{_RESET}"
+
+
+def _ok(msg: str) -> str:      # 绿色 ✓
+    return _c(f"✓ {msg}", "green")
+
+
+def _warn(msg: str) -> str:    # 黄色 ⚠
+    return _c(f"⚠ {msg}", "yellow")
+
+
+def _err(msg: str) -> str:     # 红色 ✗
+    return _c(f"✗ {msg}", "red")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -174,9 +200,14 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
     text_code = str(pasted.get("device_code", "") or "").strip()
     text_feat = str(pasted.get("feature_code", "") or "").strip()
 
+    # —— 先打印从文本解析出的内容（透明可核对）——
+    lines.append(_c("—— 从文本解析出的设备信息 ——", "bold"))
+    lines.append(f"  设备类型代码（解析）：{text_code or _c('(未解析到)', 'yellow')}")
+    lines.append(f"  feature code（解析）：{text_feat or _c('(未解析到)', 'yellow')}")
+
     code = str(device_code or "").strip()
     if not code:
-        lines.append("✗ 设备校验：未能从文本解析出设备类型代码（也未由 --device-code 指定）。")
+        lines.append(_err("设备校验：未能确定设备类型代码（文本未解析到，且未用 --device-code 指定）。"))
         return False, lines
 
     preset = eng.device_preset(code)
@@ -184,21 +215,27 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
         any(r.get("device_code") == code for r in eng.app.load_device_history_seed())
 
     if not in_table:
-        lines.append(f"✗ 设备校验：设备类型代码 {code!r} 不在映射表中。")
+        lines.append(_err(f"设备校验：设备类型代码 {code!r} 不在映射表中（共 "
+                          f"{len(eng.app.load_device_history_seed())} 个已知设备）。"))
         return False, lines
 
     table_feat = str(preset.get("feature_code", "") or "").strip()
-    # feature 一致性：仅当文本【显式给了】feature 时才强比；否则以表为准（视为一致）。
+    # feature 一致性：仅当文本【显式给了】feature 时才强比；否则以表为准（黄色提示）。
     if text_feat and table_feat and text_feat != table_feat:
-        lines.append(f"✗ 设备校验：feature code 不一致 —— 文本={text_feat!r}，映射表={table_feat!r}（设备码 {code!r}）。")
+        lines.append(_err(f"设备校验：feature code 不一致 —— 文本={text_feat!r}，"
+                          f"映射表={table_feat!r}（设备码 {code!r}）。"))
         return False, lines
+    if not text_feat:
+        lines.append(_warn(f"文本未给出 feature code，将以映射表值为准：{table_feat or '(映射表也为空)'}"))
 
-    # 一致：打印四项（名称/feature/MAC 以映射表为权威来源）。
-    lines.append("✓ 设备信息与映射表一致：")
-    lines.append(f"  设备类型代码：{code}")
-    lines.append(f"  设备类型名称：{preset.get('device_name','') or '(映射表未填)'}")
-    lines.append(f"  feature code：{table_feat or '(映射表未填)'}")
-    lines.append(f"  测试MAC组：{preset.get('mac_group','') or ('测试'+code)}")
+    # 一致：绿色打印四项（名称/feature/MAC 以映射表为权威来源）。
+    name = preset.get("device_name", "") or ""
+    mac = preset.get("mac_group", "") or ("测试" + code)
+    lines.append(_ok("设备信息与映射表一致："))
+    lines.append(_c(f"  设备类型代码：{code}", "green"))
+    lines.append(_c(f"  设备类型名称：{name or '(映射表未填)'}", "green" if name else "yellow"))
+    lines.append(_c(f"  feature code：{table_feat or '(映射表未填)'}", "green" if table_feat else "yellow"))
+    lines.append(_c(f"  测试MAC组：{mac}", "green"))
     return True, lines
 
 
@@ -258,6 +295,11 @@ def main() -> int:
 
     sj = eng.parse_pasted_text(text)
 
+    # 解析内容概览（行数 / 提示语数 / FTP zip 数），透明可核对。
+    parsed_rows = len(sj.get("rows", [])) if isinstance(sj, dict) else 0
+    print(_c("—— 解析结果概览 ——", "bold"))
+    print(f"  数据行数：{parsed_rows}")
+
     if args.out_dir:
         out_dir = args.out_dir
     else:
@@ -265,6 +307,7 @@ def main() -> int:
         out_dir = str(otagen_config.DATA_DIR / "outputs")
 
     # (2) 步骤1 生成。
+    print(_c("—— 步骤1：生成 Excel ——", "bold"))
     try:
         res = eng.generate_excel(
             sj,
@@ -275,37 +318,43 @@ def main() -> int:
             output_dir=out_dir,
         )
     except ValueError as e:
-        print("步骤1 生成失败：", file=sys.stderr)
+        print(_err("步骤1 生成失败："), file=sys.stderr)
         print(str(e), file=sys.stderr)
         return 1
 
     output_path = os.path.abspath(res["output_path"])
     final_device_code = device_code or ""
+    print(_ok(f"已生成：{output_path}"))
+    print(f"  行数：{res.get('row_count')}  提示语数：{res.get('message_count')}")
 
     # (3) 步骤2 严格校验。
+    print(_c("—— 步骤2：严格校验 ——", "bold"))
     problems = _validate_excel(output_path)
     if problems:
-        print("步骤2 严格校验未通过：", file=sys.stderr)
+        print(_err("步骤2 严格校验未通过："), file=sys.stderr)
         for prob in problems:
-            print("- " + prob, file=sys.stderr)
+            print(_c("  - " + prob, "red"), file=sys.stderr)
         return 1
+    print(_ok("严格校验通过（sheet / 18 列表头 / 每行地址与 OTA 类型 / 设备字段 均合格）。"))
 
     # (4) 步骤3 上传（或 --no-upload 计划）。
     urls = eng.extract_ftp_zip_urls(sj)
     bucket, prefix = transfer.build_s3_destination(final_device_code)
 
     if args.no_upload:
+        print(_c("—— 步骤3：上传计划（--no-upload，不触碰 FTP/S3）——", "bold"))
         print(output_path)
-        print(f"行数：{res.get('row_count')}  提示语数：{res.get('message_count')}")
-        print(f"[--no-upload] S3 计划：s3://{bucket}/{prefix}")
+        print(_warn(f"[--no-upload] 仅预览，未上传。S3 计划：s3://{bucket}/{prefix}"))
         print(f"[--no-upload] 待上传 FTP zip（{len(urls)} 个）：")
         for u in urls:
             print(f"  - {u}")
         return 0
 
     if not urls:
-        print("无可上传的 FTP zip（源数据未含 ftp:// 地址）", file=sys.stderr)
+        print(_err("无可上传的 FTP zip（源数据未含 ftp:// 地址）"), file=sys.stderr)
         return 1
+
+    print(_c("—— 步骤3：FTP 下载 + 上传 S3 ——", "bold"))
 
     work_dir = tempfile.mkdtemp(prefix="otagen_")
     result = transfer.download_and_upload(
@@ -320,16 +369,18 @@ def main() -> int:
     print(f"S3 前缀：{result.s3_prefix}")
     print(f"已下载：{len(result.downloaded)}  已上传：{len(result.uploaded)}  失败：{len(result.failed)}")
     if result.failed:
-        print(f"失败项：{result.failed}", file=sys.stderr)
+        print(_err(f"上传失败项：{result.failed}"), file=sys.stderr)
         return 1
 
     # (5) 步骤3b 上传后校验：用 boto3 head_object 回查每个已上传文件确实在 S3 上。
+    print(_c("—— 步骤3b：上传后 S3 回查 ——", "bold"))
     verify_bad = _verify_s3_uploads(bucket, prefix, result.uploaded)
     if verify_bad:
-        print("步骤3b 上传后 S3 校验未通过（以下文件上传后在 S3 未找到）：", file=sys.stderr)
+        print(_err("步骤3b 上传后 S3 校验未通过（以下文件上传后在 S3 未找到）："), file=sys.stderr)
         for b in verify_bad:
-            print("- " + b, file=sys.stderr)
+            print(_c("  - " + b, "red"), file=sys.stderr)
         return 1
+    print(_ok("prep 全部完成：生成 → 校验 → 上传 → S3 回查，均 correct。"))
     return 0
 
 
@@ -344,7 +395,7 @@ def _verify_s3_uploads(bucket: str, prefix: str, filenames: list[str]) -> list[s
     import boto3
 
     s3 = boto3.client("s3")
-    print(f"上传后校验：head_object 回查 {len(filenames)} 个文件 @ s3://{bucket}/{prefix}")
+    print(f"head_object 回查 {len(filenames)} 个文件 @ s3://{bucket}/{prefix}")
     bad: list[str] = []
     for name in filenames:
         key = f"{prefix}{name}"
@@ -353,12 +404,12 @@ def _verify_s3_uploads(bucket: str, prefix: str, filenames: list[str]) -> list[s
             head = s3.head_object(Bucket=bucket, Key=key)
             size = head.get("ContentLength", "?")
             etag = str(head.get("ETag", "")).strip('"')
-            print(f"  ✓ 已确认存在：{uri}  (size={size}, etag={etag})")
+            print("  " + _ok(f"已确认存在：{uri}  (size={size}, etag={etag})"))
         except Exception as e:
-            print(f"  ✗ 未找到/校验失败：{uri}  ({e})", file=sys.stderr)
+            print("  " + _err(f"未找到/校验失败：{uri}  ({e})"), file=sys.stderr)
             bad.append(uri)
     if not bad:
-        print(f"✓ 上传后校验通过：{len(filenames)} 个文件均已确认在 S3。")
+        print(_ok(f"上传后校验通过：{len(filenames)} 个文件均已确认在 S3。"))
     return bad
 
 
