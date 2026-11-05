@@ -252,7 +252,45 @@ def main() -> int:
     print(f"已下载：{len(result.downloaded)}  已上传：{len(result.uploaded)}  失败：{len(result.failed)}")
     if result.failed:
         print(f"失败项：{result.failed}", file=sys.stderr)
-    return 1 if result.failed else 0
+        return 1
+
+    # (5) 步骤3b 上传后校验：用 boto3 head_object 回查每个已上传文件确实在 S3 上。
+    verify_bad = _verify_s3_uploads(bucket, prefix, result.uploaded)
+    if verify_bad:
+        print("步骤3b 上传后 S3 校验未通过（以下文件上传后在 S3 未找到）：", file=sys.stderr)
+        for b in verify_bad:
+            print("- " + b, file=sys.stderr)
+        return 1
+    return 0
+
+
+def _verify_s3_uploads(bucket: str, prefix: str, filenames: list[str]) -> list[str]:
+    """用 boto3 head_object 确认每个已上传文件真的在 S3 上（存在即成功），并打印 log。
+
+    返回"校验失败（未找到/查询异常）"的 s3:// 地址列表；空列表表示全部确认存在。
+    与上传同一套 boto3 凭据/region（~/.aws, us-west）。
+    """
+    if not filenames:
+        return []
+    import boto3
+
+    s3 = boto3.client("s3")
+    print(f"上传后校验：head_object 回查 {len(filenames)} 个文件 @ s3://{bucket}/{prefix}")
+    bad: list[str] = []
+    for name in filenames:
+        key = f"{prefix}{name}"
+        uri = f"s3://{bucket}/{key}"
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+            size = head.get("ContentLength", "?")
+            etag = str(head.get("ETag", "")).strip('"')
+            print(f"  ✓ 已确认存在：{uri}  (size={size}, etag={etag})")
+        except Exception as e:
+            print(f"  ✗ 未找到/校验失败：{uri}  ({e})", file=sys.stderr)
+            bad.append(uri)
+    if not bad:
+        print(f"✓ 上传后校验通过：{len(filenames)} 个文件均已确认在 S3。")
+    return bad
 
 
 # —— 不触碰 FTP/S3/~/.aws 的纯离线自测（python -m automation.prep --selftest）——
