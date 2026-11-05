@@ -60,6 +60,13 @@ DEVICE_CODE_HEADERS = ["设备类型代码"]
 TARGET_VERSION_HEADERS = ["目标完整版本", "目标版本"]
 RULEID_HEADERS = ["Rule ID", "ruleid", "RuleID"]
 
+# collect 回收 Rule ID 后要插入 Excel 的三列（顺序固定），紧跟在『OTA类型』列之后。
+# 逻辑照搬 ota_v4 app/core/legacy_engine.py 的 insert_rule_id_columns（用户授权参考）。
+RULE_ID_COLUMNS = ["升级方式", "升级日期", "Rule ID"]
+RULE_ID_INSERT_AFTER_HEADER = "OTA类型"
+# 升级方式由『OTA类型』列的数字代码映射而来（与 ota_v4 OTA_TYPE_CODE_TO_TEXT 一致）。
+OTA_TYPE_CODE_TO_TEXT = {"1": "正常升级", "2": "强制升级", "11": "FTE强制升级"}
+
 # mac组 判定为「空」的占位文本（去空白后命中任一即视为未绑定）。
 MAC_GROUP_EMPTY_TOKENS = {"", "无", "null", "none", "-", "—", "空"}
 
@@ -246,6 +253,75 @@ def read_import_excel(path: str, sheet_name: str = "升级规则") -> dict:
         "rule_ids": rule_ids,
         "count": len(rows),
     }
+
+
+def write_rule_id_columns(file_path: str, rule_ids: list[str], sheet_name: str = "升级规则") -> int:
+    """collect 回收 Rule ID 后，把『升级方式/升级日期/Rule ID』三列写回【同一个】Excel 文件。
+
+    逻辑照搬 ota_v4 app/core/legacy_engine.py insert_rule_id_columns（用户授权参考）：
+      · 三列紧跟在『OTA类型』列之后插入（位置固定），保留其余列顺序/内容；
+      · 升级方式 = 该行『OTA类型』数字代码映射（1→正常升级 / 2→强制升级 / 11→FTE强制升级）；
+      · 升级日期 = 今天 YYYYMMDD；
+      · Rule ID = 按数据行顺序逐行填 rule_ids（已升序，第 1 行放最小值）；
+      · 幂等保护：若已含这些列则报错不重复插入；
+      · Rule ID 数量必须 == 数据行数，否则报错（不猜）。
+    写回传入的 file_path 本身（覆盖更新，确保是一个文件）。返回写入的数据行数。
+    """
+    from openpyxl.utils import get_column_letter
+
+    if not file_path or not Path(file_path).exists():
+        raise ValueError(f"要回写的 Excel 文件不存在：{file_path!r}")
+
+    wb = load_workbook(file_path)
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.worksheets[0]
+
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+
+    # 幂等：已含任一目标列则拒绝重复插入。
+    if any(h in RULE_ID_COLUMNS for h in headers):
+        raise ValueError("该 Excel 已含『升级方式/升级日期/Rule ID』列，无需重复写入（幂等保护）。")
+
+    if RULE_ID_INSERT_AFTER_HEADER not in headers:
+        raise ValueError(f"表头未找到『{RULE_ID_INSERT_AFTER_HEADER}』列，无法定位三列插入位置。")
+    ota_col = headers.index(RULE_ID_INSERT_AFTER_HEADER) + 1  # 1-based
+    insert_at = ota_col + 1  # 紧跟 OTA类型 之后
+
+    # 统计数据行数（末尾非空数据行）。
+    data_row_count = 0
+    for r in range(2, ws.max_row + 1):
+        if any(ws.cell(row=r, column=c).value not in (None, "") for c in range(1, ws.max_column + 1)):
+            data_row_count = r - 1
+
+    assigned = [str(x) for x in rule_ids]
+    if len(assigned) != data_row_count:
+        raise ValueError(
+            f"Rule ID 数量({len(assigned)}) 与数据行数({data_row_count}) 不匹配，拒绝回写以免错位。"
+        )
+
+    today = datetime.now().strftime("%Y%m%d")
+
+    # 插入三列（openpyxl 只移动数据，不移动列宽；这里不额外处理列宽，保持简单）。
+    ws.insert_cols(insert_at, amount=len(RULE_ID_COLUMNS))
+    for offset, name in enumerate(RULE_ID_COLUMNS):
+        cell = ws.cell(row=1, column=insert_at + offset, value=name)
+        cell.number_format = "@"
+
+    # 逐行填值：升级方式（按 OTA类型 代码映射）/ 升级日期 / Rule ID（升序逐行）。
+    for r in range(2, data_row_count + 2):
+        ota_code = str(ws.cell(row=r, column=ota_col).value or "").strip()
+        upgrade_method = OTA_TYPE_CODE_TO_TEXT.get(ota_code, "")
+        rid = assigned[r - 2]
+        for offset, value in enumerate((upgrade_method, today, rid)):
+            c = ws.cell(row=r, column=insert_at + offset, value=value)
+            c.number_format = "@"
+
+    try:
+        wb.save(file_path)
+    except PermissionError:
+        raise ValueError(
+            "回写失败：Excel 文件可能正被 Excel / Numbers 打开并锁定，请关闭后重试。"
+        )
+    return data_row_count
 
 
 # ======================================================================
@@ -1398,6 +1474,19 @@ def main() -> int:
                 print(f"[collect] 本批 Rule ID（{len(rule_ids)} 个，升序）：")
                 for rid in rule_ids:
                     print(f"  {rid}")
+
+                # 回写：把『升级方式/升级日期/Rule ID』三列写回传入的同一个 Excel（紧跟 OTA类型 列后，
+                # Rule ID 升序逐行、第 1 行放最小值；升级方式按 OTA类型 代码映射；升级日期=今天）。
+                try:
+                    n = write_rule_id_columns(excel, rule_ids)
+                    print(f"[collect] ✓ 已把『升级方式/升级日期/Rule ID』三列回写到 Excel（{n} 行）：{excel}")
+                except Exception as e:
+                    print(f"[collect] ✗ 回写 Excel 三列失败：{e}")
+                    if config.HEADED:
+                        print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
+                        time.sleep(20)
+                    return 2
+
                 if config.HEADED:
                     print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
                     time.sleep(20)
