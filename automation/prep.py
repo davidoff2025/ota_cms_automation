@@ -348,11 +348,27 @@ def main() -> int:
         print(_err("无可上传的 FTP zip（源数据未含 ftp:// 地址）"), file=sys.stderr)
         return 1
 
-    print(_c("—— 步骤3：FTP 下载 + 上传 S3 ——", "bold"))
+    # (4b) S3 预检：对每个 zip，若 S3 已存在同名文件且【大小一致】(与生成 Excel 里的「文件大小」比)，
+    #      则跳过该文件的下载+上传（MD5 作辅助：能比就比，比上更放心）。--force 时不预检、全量重传。
+    print(_c("—— 步骤3：S3 预检（大小+MD5 双重校验，一致则跳过）——", "bold"))
+    size_md5_by_zip = _zip_size_md5_from_excel(output_path)
+    skip_names = set()
+    if not args.force:
+        skip_names = _s3_precheck_skip(bucket, prefix, urls, size_md5_by_zip)
+    todo_urls = [u for u in urls if _zip_name_from_url(u) not in skip_names]
+
+    if not todo_urls:
+        print(_ok(f"全部 {len(urls)} 个文件 S3 上已存在且大小一致，跳过下载和上传（complete）。"))
+        print(output_path)
+        print(f"S3 前缀：s3://{bucket}/{prefix}")
+        print(_ok("prep 全部完成：生成 → 校验 → S3 已是最新（免下载免上传）。"))
+        return 0
+
+    print(_c(f"—— 步骤3：FTP 下载 + 上传 S3（{len(todo_urls)}/{len(urls)} 个需处理）——", "bold"))
 
     work_dir = tempfile.mkdtemp(prefix="otagen_")
     result = transfer.download_and_upload(
-        urls,
+        todo_urls,
         final_device_code,
         work_dir=work_dir,
         auto_upload=True,
@@ -362,6 +378,8 @@ def main() -> int:
     )
     print(output_path)
     print(f"S3 前缀：{result.s3_prefix}")
+    if skip_names:
+        print(_ok(f"S3 预检跳过（已存在且大小一致）：{len(skip_names)} 个"))
     print(f"已下载：{len(result.downloaded)}  已上传：{len(result.uploaded)}  失败：{len(result.failed)}")
     if result.failed:
         print(_err(f"上传失败项：{result.failed}"), file=sys.stderr)
@@ -421,6 +439,89 @@ def _record_excel_fingerprint(out_dir: str, content_hash: str, xlsx_path: str) -
             json.dump(idx, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(_warn(f"写入指纹索引失败（不影响本次生成）：{e}"), file=sys.stderr)
+
+
+def _zip_name_from_url(url: str) -> str:
+    """从 ftp://.../xxx.zip 取文件名 xxx.zip（用于与 S3 key / Excel 行对应）。"""
+    from urllib.parse import urlparse, unquote
+    return os.path.basename(unquote(urlparse(str(url)).path or "")).strip()
+
+
+def _zip_size_md5_from_excel(xlsx_path: str) -> dict:
+    """从生成的 Excel 读 {zip文件名: {"size": 源文件大小(int或None), "md5": 源MD5小写或None}}。
+
+    用『升级文件地址』列尾部的 zip 文件名作键，取同行『文件大小』『升级文件的MD5值』。
+    这些值来自源数据（Excel），不现算、不下载——用于 S3 预检的大小/MD5 比对。
+    """
+    out = {}
+    try:
+        wb = load_workbook(xlsx_path, data_only=True)
+        ws = wb["升级规则"] if "升级规则" in wb.sheetnames else wb.worksheets[0]
+        hdr = [str(ws.cell(1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+        iu = hdr.index("升级文件地址") + 1 if "升级文件地址" in hdr else None
+        isz = hdr.index("文件大小") + 1 if "文件大小" in hdr else None
+        im = hdr.index("升级文件的MD5值") + 1 if "升级文件的MD5值" in hdr else None
+        if not iu:
+            return out
+        for r in range(2, ws.max_row + 1):
+            url = str(ws.cell(r, iu).value or "").strip()
+            if not url:
+                continue
+            name = os.path.basename(url)
+            sz_raw = str(ws.cell(r, isz).value or "").strip() if isz else ""
+            sz = int(re.sub(r"[^\d]", "", sz_raw)) if re.sub(r"[^\d]", "", sz_raw) else None
+            md5 = (str(ws.cell(r, im).value or "").strip().lower() or None) if im else None
+            if name:
+                out[name] = {"size": sz, "md5": md5}
+    except Exception as e:
+        print(_warn(f"读取 Excel 大小/MD5 失败（将不跳过、照常上传）：{e}"), file=sys.stderr)
+    return out
+
+
+def _s3_precheck_skip(bucket: str, prefix: str, urls: list, size_md5_by_zip: dict) -> set:
+    """对每个 zip 查 S3：已存在且【大小一致】则加入跳过集合（MD5 能比则作辅助确认）。
+
+    返回可跳过（下载+上传都免）的 zip 文件名集合。查询异常/无法比对则不跳过（保守重传）。
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    s3 = boto3.client("s3")
+    skip = set()
+    for u in urls:
+        name = _zip_name_from_url(u)
+        if not name:
+            continue
+        key = f"{prefix}{name}"
+        expect = size_md5_by_zip.get(name, {})
+        exp_size = expect.get("size")
+        exp_md5 = expect.get("md5")
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+        except ClientError:
+            print(f"  S3 无同名对象，需上传：{name}")
+            continue
+        except Exception as e:
+            print(_warn(f"  S3 预检查询异常，保守重传：{name}（{e}）"))
+            continue
+        s3_size = head.get("ContentLength")
+        if exp_size is None:
+            print(_warn(f"  S3 有同名对象但 Excel 无『文件大小』可比，保守重传：{name}"))
+            continue
+        if s3_size != exp_size:
+            print(_warn(f"  S3 大小不一致（S3={s3_size} vs 源={exp_size}），需重传：{name}"))
+            continue
+        # 大小一致 -> 跳过。MD5 作辅助：若对象 metadata 存了 md5 且与源不符则不跳过（更稳）。
+        meta_md5 = str(head.get("Metadata", {}).get("md5", "")).strip().lower()
+        if exp_md5 and meta_md5 and meta_md5 != exp_md5:
+            print(_warn(f"  S3 大小一致但 MD5 metadata 不符（S3={meta_md5} vs 源={exp_md5}），需重传：{name}"))
+            continue
+        extra = ""
+        if exp_md5 and meta_md5 == exp_md5:
+            extra = "，MD5 亦一致"
+        print("  " + color(f"✓ 已存在且大小一致{extra}，跳过：{name}", "green"))
+        skip.add(name)
+    return skip
 
 
 def _make_progress_printer():
