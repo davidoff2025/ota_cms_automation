@@ -61,6 +61,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="生成 Excel 的输出目录；省略则用 automation/otagen/data/outputs。")
     p.add_argument("--no-upload", dest="no_upload", action="store_true", default=False,
                    help="只生成+校验并打印 S3 计划与 ftp zip 清单，绝不触碰 FTP/S3。")
+    p.add_argument("--yes", "-y", dest="assume_yes", action="store_true", default=False,
+                   help="设备信息与映射表不一致时自动确认继续（非交互/管道场景用）；"
+                        "默认不一致会等待人工确认，无法交互时退出。")
     return p
 
 
@@ -156,6 +159,49 @@ def _validate_excel(path: str) -> list[str]:
         wb.close()
 
 
+def _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group):
+    """把文本解析出的 设备类型代码/feature code 与映射表(seed)比对。
+
+    返回 (ok, lines)：ok 为 True 表示一致（code 在表中且文本 feature==表中 feature，
+    文本未显式给 feature 时只校验 code 存在）；lines 为要打印的日志行。
+    一致时 lines 打印 设备类型代码/设备类型名称/feature code/测试MAC组 四项；
+    不一致时 lines 说明具体差异（code 不在表 / feature 冲突 / code 缺失）。
+    """
+    lines = []
+    # 重新抽取文本里【原始】解析值（normalize 竖排后），用于与表比对。
+    norm = eng.reshape_vertical_paste(text) if str(text).strip() else text
+    pasted = eng.app.extract_form_fields_from_text(norm) if str(norm).strip() else {}
+    text_code = str(pasted.get("device_code", "") or "").strip()
+    text_feat = str(pasted.get("feature_code", "") or "").strip()
+
+    code = str(device_code or "").strip()
+    if not code:
+        lines.append("✗ 设备校验：未能从文本解析出设备类型代码（也未由 --device-code 指定）。")
+        return False, lines
+
+    preset = eng.device_preset(code)
+    in_table = bool(preset.get("feature_code") or preset.get("device_name")) or \
+        any(r.get("device_code") == code for r in eng.app.load_device_history_seed())
+
+    if not in_table:
+        lines.append(f"✗ 设备校验：设备类型代码 {code!r} 不在映射表中。")
+        return False, lines
+
+    table_feat = str(preset.get("feature_code", "") or "").strip()
+    # feature 一致性：仅当文本【显式给了】feature 时才强比；否则以表为准（视为一致）。
+    if text_feat and table_feat and text_feat != table_feat:
+        lines.append(f"✗ 设备校验：feature code 不一致 —— 文本={text_feat!r}，映射表={table_feat!r}（设备码 {code!r}）。")
+        return False, lines
+
+    # 一致：打印四项（名称/feature/MAC 以映射表为权威来源）。
+    lines.append("✓ 设备信息与映射表一致：")
+    lines.append(f"  设备类型代码：{code}")
+    lines.append(f"  设备类型名称：{preset.get('device_name','') or '(映射表未填)'}")
+    lines.append(f"  feature code：{table_feat or '(映射表未填)'}")
+    lines.append(f"  测试MAC组：{preset.get('mac_group','') or ('测试'+code)}")
+    return True, lines
+
+
 def main() -> int:
     args = _build_parser().parse_args()
 
@@ -186,6 +232,29 @@ def main() -> int:
     # （预设默认 '测试'+设备类型代码，与引擎 resolve 的建议值一致）。
     if not mac_group and device_code:
         mac_group = eng.device_preset(device_code).get("mac_group", "")
+
+    # (1b) 设备信息与映射表一致性校验（生成前）。
+    #   从文本解析出的 设备类型代码/feature code 与 mapping table(seed) 比对：
+    #   一致 -> 打印 4 项(代码/名称/feature/测试MAC组) 并继续；
+    #   不一致 -> 打印差异，等待人工确认(yes/y 继续，其它退出)；--yes 自动继续；无法交互则退出。
+    ok, lines = _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group)
+    for ln in lines:
+        print(ln)
+    if not ok:
+        if args.assume_yes:
+            print("已指定 --yes：设备信息与映射表不一致，仍继续。")
+        elif not sys.stdin.isatty():
+            print("✗ 设备信息与映射表不一致，且当前为非交互输入（无法读确认），已退出。"
+                  "如确需继续请加 --yes。", file=sys.stderr)
+            return 2
+        else:
+            try:
+                ans = input("设备信息与映射表不一致，是否仍继续生成？[yes/y 继续，其它退出]：").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans not in ("yes", "y"):
+                print("已取消：设备信息与映射表不一致，未生成。", file=sys.stderr)
+                return 2
 
     sj = eng.parse_pasted_text(text)
 
