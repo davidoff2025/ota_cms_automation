@@ -364,58 +364,92 @@ def _set_device_type_once(page, modal, device_code: str) -> bool:
     """进页面后【只调用一次】：在「已选规则」区的『设备类型』框设置设备类型代码。
 
     用户确认的交互：在『设备类型』框【输入】设备类型代码 → 页面自动弹出匹配下拉 → 选中该项
-    （不是从静态列表里挑；是输入触发自动匹配）。选项文字 == 设备类型代码（精确）。
-    设备类型只设这一次，后续逐条只用 Rule ID 搜。成功返回 True；失败返回 False（上层据此终止）。
+    （不是从静态列表里挑；是输入触发自动匹配）。设备类型只设这一次，后续逐条只用 Rule ID 搜。
+    成功返回 True；失败返回 False（上层据此终止整个 online）。
 
-    作用域为「已选规则」区：findings §8.1 已选区搜索表单是弹窗内【第 1 个】搜索表单
-    （待选表单 form.ant-form-inline 在其后）。故这里锚弹窗内第 1 个『设备类型』ant-select。
-    选择器/交互在编排视图未实跑复现，用标准 ant-select 可搜索输入交互，失败即返回 False。
+    ★ 已按 findings §9（HEADED 实跑校正）重写 —— 根因：设备类型是 **antd v3 ant-select**，
+      旧代码用的是 antd v4 选择器，全部对不上（§9.0）。校正要点：
+      · 控件：v3 `.ant-select`（已选区 enabled / 待选区 disabled）；输入框 `input.ant-select-search__field`
+        （无 id/placeholder，未展开时 visible:false，必须先 click 容器聚焦）——不是 v4 的
+        `ant-select-selection-search-input`（§9.1）。
+      · 触发联想：先 `click` 已选区 `.ant-select` 容器聚焦，再 `page.keyboard.type(want)`（§9.2）。
+      · 浮层：`.ant-select-dropdown`（**挂在 body 下、不在 modal 内，必须全局 page.locator 取**），
+        选项 `.ant-select-dropdown-menu-item`（**v3，不是 v4 的 `.ant-select-item-option`**）（§9.3）。
+      · 选中：候选项文字是 `代码（中文名）`（≠ 设备类型代码），必须【包含匹配】或回车选中 `-active`
+        高亮项，不能用精确相等（§9.4）。
+      · 回读校验：读 v3 `.ant-select-selection-selected-value`（v4 的 `.ant-select-selection-item`
+        在此控件取不到）（§9.4）。
+
+    作用域为「已选规则」区：弹窗内含『设备类型』的 `.ant-form-item` 有 2 个，已选区为可编辑
+    （`.ant-select` 非 disabled），待选区为 `.ant-select-disabled`（自动带值只读，不设它）（§9.1）。
     """
     want = str(device_code).strip()
 
-    # a) 定位「已选规则」区的『设备类型』ant-select 触发器（弹窗内第 1 个）。
+    # a) 定位「已选规则」区（可编辑、非 disabled）的『设备类型』ant-select 触发器（§9.1）。
     trigger = None
     try:
-        item = modal.locator(".ant-form-item", has_text="设备类型").first
-        if item.count():
-            cand = item.locator(".ant-select").first
-            if cand.count():
-                trigger = cand
+        # 优先：含『设备类型』的 form-item 里取非 disabled 的 .ant-select（已选区）。
+        cand = modal.locator(
+            ".ant-form-item:has-text('设备类型') .ant-select:not(.ant-select-disabled)"
+        ).first
+        if cand.count():
+            trigger = cand
     except Exception:
         trigger = None
     if trigger is None:
         try:
-            cand = modal.locator(".ant-select").first  # 弹窗内第 1 个 select = 已选区设备类型
-            if cand.count():
-                trigger = cand
+            # 兜底：含『设备类型』的 form-item 里的第 1 个 .ant-select（DOM 顺序第 1 个=已选区）。
+            item = modal.locator(".ant-form-item", has_text="设备类型").first
+            if item.count():
+                cand = item.locator(".ant-select").first
+                if cand.count():
+                    trigger = cand
         except Exception:
             trigger = None
     if trigger is None:
-        print("  ✗ 未定位到「已选规则」区『设备类型』控件。")
+        print("  ✗ 未定位到「已选规则」区（可编辑）的『设备类型』控件。")
         return False
+
+    def _verify_selected() -> bool:
+        """回读该 v3 ant-select 的显示值，确认已选中 want（避免只输文本未选中导致『请输入设备类型』）。"""
+        try:
+            page.wait_for_timeout(300)
+            # v3 显示值容器：.ant-select-selection-selected-value；文字是 `代码（中文名）`，用包含匹配。
+            sel = trigger.locator(".ant-select-selection-selected-value").first
+            if sel.count():
+                txt = (sel.inner_text() or "").strip()
+                if txt and want in txt:
+                    return True
+            # 兜底：读 .ant-select-selection 整体可见文本（覆盖 title 属性里带值的情况）。
+            whole = (trigger.inner_text() or "").strip()
+            return bool(whole) and want in whole
+        except Exception:
+            return False
 
     try:
         trigger.scroll_into_view_if_needed(timeout=2000)
+        # b) 先 click 外层容器聚焦并展开下拉（v3 搜索框展开前不可见，必须先聚焦容器）。
         trigger.click()
         page.wait_for_timeout(300)
 
-        # b) 逐字键入设备类型代码，触发服务端自动匹配下拉（fill 有时不触发联想，用 type 更接近真人输入）。
-        search_input = trigger.locator("input.ant-select-selection-search-input").first
-        if search_input.count():
-            try:
-                search_input.click()
-            except Exception:
-                pass
-            search_input.fill("")
-            search_input.type(want, delay=40)
-        else:
-            page.keyboard.type(want, delay=40)
+        # c) 逐字键入设备类型代码触发联想。优先对 v3 搜索框 input 输入；取不到则全局键盘输入（§9.2）。
+        search_input = trigger.locator("input.ant-select-search__field").first
+        typed_via_input = False
+        try:
+            if search_input.count():
+                search_input.fill("")
+                search_input.type(want, delay=60)
+                typed_via_input = True
+        except Exception:
+            typed_via_input = False
+        if not typed_via_input:
+            page.keyboard.type(want, delay=60)
 
-        # c) 轮询等自动匹配浮层出现并有可见选项（最多 ~4s）。
-        dropdown = page.locator(".ant-select-dropdown:visible")
-        options = dropdown.locator(".ant-select-item-option")
+        # d) 轮询等 v3 联想浮层出现并有可见选项（浮层在 body 下，全局取；选项用 v3 class）（§9.3）。
+        dropdown = page.locator(".ant-select-dropdown")
+        options = dropdown.locator(".ant-select-dropdown-menu-item")
         appeared = False
-        for _ in range(20):
+        for _ in range(25):
             page.wait_for_timeout(200)
             try:
                 if options.count() > 0 and options.first.is_visible():
@@ -424,42 +458,24 @@ def _set_device_type_once(page, modal, device_code: str) -> bool:
             except Exception:
                 continue
 
-        def _verify_selected() -> bool:
-            """回读该 ant-select 的显示值，确认已选中 want（避免只输文本未选中导致『请输入设备类型』）。"""
-            try:
-                page.wait_for_timeout(300)
-                txt = (trigger.locator(".ant-select-selection-item").first.inner_text() or "").strip()
-                return want in txt or txt in want and txt != ""
-            except Exception:
-                return False
-
         if appeared:
             n = options.count()
-            # c1) 精确相等优先。
+            # d1) 包含匹配点击（候选项文字是 `代码（中文名）`，不能用精确相等）（§9.4）。
             for i in range(n):
                 el = options.nth(i)
                 try:
-                    if el.is_visible() and (el.inner_text() or "").strip() == want:
-                        el.click()
-                        if _verify_selected():
-                            print(f"  ✓ 已选规则区『设备类型』已设置（精确项）：{want!r}")
-                            return True
-                except Exception:
-                    continue
-            # c2) 包含匹配（选项文本可能带额外字符）。
-            for i in range(n):
-                el = options.nth(i)
-                try:
+                    if not el.is_visible():
+                        continue
                     t = (el.inner_text() or "").strip()
-                    if el.is_visible() and want in t:
+                    if want in t:
                         el.click()
                         if _verify_selected():
-                            print(f"  ✓ 已选规则区『设备类型』已设置（包含匹配项『{t}』）：{want!r}")
+                            print(f"  ✓ 已选规则区『设备类型』已设置（候选项『{t}』包含匹配）：{want!r}")
                             return True
                 except Exception:
                     continue
 
-        # c3) 回车兜底：ant-select 通常高亮首个匹配项，回车即选中。
+        # d2) 回车兜底：唯一/首个匹配项通常已带 `-active` 高亮，回车即选中（§9.4）。
         try:
             page.keyboard.press("Enter")
             if _verify_selected():
@@ -469,7 +485,7 @@ def _set_device_type_once(page, modal, device_code: str) -> bool:
             pass
 
         print(f"  ✗ 『设备类型』输入 {want!r} 后未能选中自动匹配项"
-              f"（浮层出现={appeared}）。请按实跑 DOM 校正下拉/选项选择器。")
+              f"（联想浮层出现={appeared}）。若反复失败请 --probe-online 复核 §9 选择器。")
     except Exception as e:
         print(f"  ✗ 『设备类型』设置交互异常：{e}")
     return False
@@ -924,22 +940,61 @@ def _search_pending_rule(page, modal, rule_id: str) -> bool:
         return False
 
 
+def _find_pending_row_by_ruleid(table, rule_id: str):
+    """在待选表里按『规则ID』列文本精确锁定目标行，返回 0-based 行索引；找不到/歧义返回 -1。
+
+    findings §9.5 实测：单个 RuleID（如 65369）可能搜出多行，不能用"恰好 1 行"gate。
+    改为按规则ID列（列头含『规则ID』，§8.3 索引 0）文本精确等于归一化 rule_id 的行定位。
+    若命中多行（同号多行）同样视为歧义返回 -1，由上层保守拒点。
+    """
+    want = norm_ruleid(rule_id)
+    try:
+        idx = table.evaluate(
+            """(t, want) => {
+                const heads = [...t.querySelectorAll('thead th, thead td')]
+                    .map(h => (h.innerText || '').trim());
+                let col = heads.findIndex(x => x.replace(/\\s/g,'').indexOf('规则ID') >= 0);
+                if (col < 0) col = 0;  // §8.3：规则ID 为第 1 列
+                const rows = [...t.querySelectorAll('tbody tr')];
+                const hits = [];
+                rows.forEach((r, i) => {
+                    const cells = r.querySelectorAll('td, th');
+                    if (!cells.length || !cells[col]) return;
+                    const txt = (cells[col].innerText || '').replace(/\\D/g, '');
+                    if (txt && txt === want) hits.push(i);
+                });
+                if (hits.length === 1) return hits[0];
+                return -1;  // 0 行或多行同号 -> 歧义
+            }""",
+            want,
+        )
+        return int(idx) if idx is not None else -1
+    except Exception:
+        return -1
+
+
 def _click_online(page, modal, rule_id: str) -> bool:
-    """D-f gate：在搜出的待选行点『上线』。点前断言该行唯一在场；失败只打印不点。
+    """D-f gate：在待选表里按规则ID列精确锁定目标行后点该行『上线』。失败只打印不点。
 
     待选表 = 弹窗内独有 vxe-editable 的 .vxe-table（findings §8.1）。
-    ⚠ 行级『上线』按钮文本（是否全角空格）在探测环境两区 No Data 未实跑复现（findings §8.4），
-      下方按用户截图/DOM 推断用 `_click_button_in` 去空白子串匹配 `上线`（兼容潜在全角 `上 线`）。
+    ★ findings §9.5（HEADED 实跑校正）：
+      · 单个 RuleID 可能搜出多行（实测 65369 搜出 2 行），旧代码"搜出恰好 1 行才点"的 gate 会误拒。
+        改为按『规则ID』列文本精确等于目标号的行定位（唯一命中才点，多行同号/0 行则保守拒点）。
+      · 行内『上线』实测文本为 `上 线`（**半角空格**，非 danger 红色），与 `编 辑` class 完全相同，
+        不能靠 class 区分；用 `_click_button_in` 去空白子串匹配 `上线`（兼容半角/全角空格），
+        不会误命中 `编辑`。
     """
     try:
         table = _pending_table(modal)
-        rows = table.locator("tbody tr")
-        # 仅当搜出恰好一行时才点，避免误点他行（保守 gate）。
-        visible_rows = [rows.nth(i) for i in range(rows.count()) if rows.nth(i).is_visible()]
-        if len(visible_rows) != 1:
-            print(f"  ✗ [gate] 待选规则 {rule_id!r} 搜出 {len(visible_rows)} 行（非唯一），拒绝点『上线』。")
+        row_idx = _find_pending_row_by_ruleid(table, rule_id)
+        if row_idx < 0:
+            rows = table.locator("tbody tr")
+            n = rows.count()
+            print(f"  ✗ [gate] 待选规则 {rule_id!r} 未按规则ID列精确锁定到唯一目标行"
+                  f"（搜出 {n} 行），拒绝点『上线』。")
             return False
-        return _click_button_in(visible_rows[0], page, "上线", f"上线({rule_id})")
+        target = table.locator("tbody tr").nth(row_idx)
+        return _click_button_in(target, page, "上线", f"上线({rule_id})")
     except Exception as e:
         print(f"  ✗ 点『上线』失败 {rule_id!r}：{e}")
         return False
