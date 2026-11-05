@@ -397,41 +397,79 @@ def _set_device_type_once(page, modal, device_code: str) -> bool:
     try:
         trigger.scroll_into_view_if_needed(timeout=2000)
         trigger.click()
-        page.wait_for_timeout(400)
-        # b) 输入设备类型代码，触发自动匹配下拉。
-        search_input = trigger.locator("input.ant-select-selection-search-input").first
-        if search_input.count() and search_input.is_visible():
-            search_input.fill(want)
-        else:
-            # 退化：若无独立搜索 input，直接键入（聚焦后输入）。
-            page.keyboard.type(want)
-        page.wait_for_timeout(700)  # 等自动匹配下拉返回
+        page.wait_for_timeout(300)
 
-        # c) 在浮层里选中文本精确等于 device_code 的匹配项。
-        option = page.locator(".ant-select-dropdown:visible .ant-select-item-option")
-        n = option.count()
-        for i in range(n):
-            el = option.nth(i)
+        # b) 逐字键入设备类型代码，触发服务端自动匹配下拉（fill 有时不触发联想，用 type 更接近真人输入）。
+        search_input = trigger.locator("input.ant-select-selection-search-input").first
+        if search_input.count():
             try:
-                if el.is_visible() and (el.inner_text() or "").strip() == want:
-                    el.click()
-                    print(f"  ✓ 已选规则区『设备类型』已设置：{want!r}")
-                    page.wait_for_timeout(400)
-                    return True
-            except Exception:
-                continue
-        # 自动匹配后若恰好只剩 1 项，选它（容错；但要求其文本包含 want，避免误选）。
-        if n == 1:
-            try:
-                only = option.first
-                if want in (only.inner_text() or ""):
-                    only.click()
-                    print(f"  ✓ 已选规则区『设备类型』按唯一匹配项设置：目标 {want!r}")
-                    page.wait_for_timeout(400)
-                    return True
+                search_input.click()
             except Exception:
                 pass
-        print(f"  ✗ 『设备类型』输入 {want!r} 后未在自动匹配下拉中找到精确匹配项（共 {n} 项）。")
+            search_input.fill("")
+            search_input.type(want, delay=40)
+        else:
+            page.keyboard.type(want, delay=40)
+
+        # c) 轮询等自动匹配浮层出现并有可见选项（最多 ~4s）。
+        dropdown = page.locator(".ant-select-dropdown:visible")
+        options = dropdown.locator(".ant-select-item-option")
+        appeared = False
+        for _ in range(20):
+            page.wait_for_timeout(200)
+            try:
+                if options.count() > 0 and options.first.is_visible():
+                    appeared = True
+                    break
+            except Exception:
+                continue
+
+        def _verify_selected() -> bool:
+            """回读该 ant-select 的显示值，确认已选中 want（避免只输文本未选中导致『请输入设备类型』）。"""
+            try:
+                page.wait_for_timeout(300)
+                txt = (trigger.locator(".ant-select-selection-item").first.inner_text() or "").strip()
+                return want in txt or txt in want and txt != ""
+            except Exception:
+                return False
+
+        if appeared:
+            n = options.count()
+            # c1) 精确相等优先。
+            for i in range(n):
+                el = options.nth(i)
+                try:
+                    if el.is_visible() and (el.inner_text() or "").strip() == want:
+                        el.click()
+                        if _verify_selected():
+                            print(f"  ✓ 已选规则区『设备类型』已设置（精确项）：{want!r}")
+                            return True
+                except Exception:
+                    continue
+            # c2) 包含匹配（选项文本可能带额外字符）。
+            for i in range(n):
+                el = options.nth(i)
+                try:
+                    t = (el.inner_text() or "").strip()
+                    if el.is_visible() and want in t:
+                        el.click()
+                        if _verify_selected():
+                            print(f"  ✓ 已选规则区『设备类型』已设置（包含匹配项『{t}』）：{want!r}")
+                            return True
+                except Exception:
+                    continue
+
+        # c3) 回车兜底：ant-select 通常高亮首个匹配项，回车即选中。
+        try:
+            page.keyboard.press("Enter")
+            if _verify_selected():
+                print(f"  ✓ 已选规则区『设备类型』已设置（回车选中高亮项）：{want!r}")
+                return True
+        except Exception:
+            pass
+
+        print(f"  ✗ 『设备类型』输入 {want!r} 后未能选中自动匹配项"
+              f"（浮层出现={appeared}）。请按实跑 DOM 校正下拉/选项选择器。")
     except Exception as e:
         print(f"  ✗ 『设备类型』设置交互异常：{e}")
     return False
