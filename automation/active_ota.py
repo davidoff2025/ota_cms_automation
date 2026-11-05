@@ -617,35 +617,37 @@ def run_import(page, excel_path: str) -> tuple[list[str], str, str]:
         raise RuntimeError("导入确认按钮点击失败（gate 未满足或按钮缺失）。")
     page.wait_for_timeout(2500)
 
-    # 回读本批连续 Rule ID range。
-    rule_ids = _collect_rule_ids(page, device_code, target_version, count)
+    # 回读本批 Rule ID：按模板名称在「OTA升级模板」列表定位本批行 → 点「查看规则」→ 读规则ID。
+    rule_ids = _collect_rule_ids(page, name, count)
     _shot(page, "active_view_rules")
     return rule_ids, name, remark
 
 
-def _collect_rule_ids(page, device_code: str, target_version: str, expected: int) -> list[str]:
-    """导入后在『查看规则』按 设备类型代码+目标版本 读 规则ID 列，取本批连续区间（降序）。
+def _collect_rule_ids(page, template_name: str, expected: int) -> list[str]:
+    """导入后回读本批 Rule ID（升序，数量须等于 Excel 去表头的数据行数）。
 
-    查看规则页搜索框只有 规则ID/设备扩展信息（findings §1.4），无设备类型代码/目标版本服务端过滤，
-    故读 vxe 表『设备类型代码』『目标版本』『规则ID』三列文本自行过滤，含 .vxe-pager 翻页。
-    断言 len==expected，否则告警（避免混入旧规则）。
+    真实路径（用户截图确认）：
+      1) 左侧菜单「OTA升级模板」进入模板列表（序号/标题/创建人/备注/导入时间/操作）。
+      2) 顶部搜索框按标题搜 template_name 缩小范围，再在「标题」列【精确匹配】本批那一行。
+      3) 点该行「查看规则」弹出规则页，读『规则ID』列【全部】ID。
+      4) 升序（小→大）返回，并断言数量 == expected（Excel 去表头行数）；不符则告警。
     """
-    # 切到『查看规则』tab（findings §1）。
-    try:
-        tab = page.locator(".ant-tabs-tab", has_text="查看规则").first
-        if tab.count():
-            tab.click()
-            page.wait_for_timeout(1500)
-    except Exception as e:
-        print(f"  ⚠ 切换到『查看规则』tab 失败：{e}")
+    # —— 1) 进「OTA升级模板」列表（左侧菜单项）——
+    if not _open_template_list(page):
+        raise RuntimeError("未能进入「OTA升级模板」模板列表页。")
 
+    # —— 2) 顶部搜索框按标题搜，再精确匹配定位本批行，点其「查看规则」——
+    if not _open_view_rules_for_template(page, template_name):
+        raise RuntimeError(f"未能在模板列表按标题精确匹配到本批行并点『查看规则』：{template_name!r}")
+
+    # —— 3) 读规则页『规则ID』列全部 ID（含翻页）——
     seen: list[str] = []
     page_guard = 0
     while page_guard < 50:
         page_guard += 1
         batch = page.evaluate(
-            """({dc, tv}) => {
-                // vxe-table 表头->列索引，再按行读 设备类型代码/目标版本/规则ID。
+            """() => {
+                // vxe-table 表头->列索引，按行读『规则ID』列。
                 const tables = Array.from(document.querySelectorAll('.vxe-table, table'));
                 const out = [];
                 for (const t of tables) {
@@ -653,53 +655,123 @@ def _collect_rule_ids(page, device_code: str, target_version: str, expected: int
                     if (!heads.length) continue;
                     const names = Array.from(heads).map(h => (h.innerText||'').trim());
                     const idxRule = names.findIndex(x => x.indexOf('规则ID') >= 0);
-                    const idxDc = names.findIndex(x => x.indexOf('设备类型代码') >= 0);
-                    const idxTv = names.findIndex(x => x.indexOf('目标版本') >= 0);
                     if (idxRule < 0) continue;
                     const rows = t.querySelectorAll('tbody tr');
                     for (const r of rows) {
                         const cells = r.querySelectorAll('td, th');
                         if (!cells.length) continue;
                         const rid = cells[idxRule] ? (cells[idxRule].innerText||'').trim() : '';
-                        const cdc = idxDc >= 0 && cells[idxDc] ? (cells[idxDc].innerText||'').trim() : '';
-                        const ctv = idxTv >= 0 && cells[idxTv] ? (cells[idxTv].innerText||'').trim() : '';
-                        if (!rid) continue;
-                        out.push({rid, cdc, ctv});
+                        if (rid) out.push(rid);
                     }
                 }
                 return out;
-            }""",
-            {"dc": device_code, "tv": target_version},
+            }"""
         )
-        for item in batch:
-            rid = norm_ruleid(item.get("rid", ""))
-            if not rid:
-                continue
-            # 只保留本批（设备类型代码 + 目标版本 匹配；若列缺失则不强制过滤）。
-            cdc = item.get("cdc", "")
-            ctv = item.get("ctv", "")
-            if cdc and cdc != device_code:
-                continue
-            if ctv and target_version and ctv != target_version:
-                continue
-            if rid not in seen:
+        for raw in batch:
+            rid = norm_ruleid(raw)
+            if rid and rid not in seen:
                 seen.append(rid)
 
         if len(seen) >= expected:
             break
-        # 翻页：vxe 分页器下一页按钮。
         if not _goto_next_page(page):
             break
         page.wait_for_timeout(1200)
 
-    # 按数值降序（本批为连续一段）。
-    seen_sorted = sorted(set(seen), key=lambda x: int(x) if x.isdigit() else 0, reverse=True)
+    # —— 4) 升序（小→大）返回 + 数量校验 ——
+    seen_sorted = sorted(set(seen), key=lambda x: int(x) if x.isdigit() else 0)
     if len(seen_sorted) != expected:
-        print(f"  ⚠ 回收到 {len(seen_sorted)} 个 Rule ID，期望 {expected}。可能翻页不全或混入旧规则，"
-              f"请核对：{seen_sorted}")
+        print(f"  ⚠ 回收到 {len(seen_sorted)} 个 Rule ID，期望 {expected}（= Excel 去表头行数）。"
+              f"数量不符，请核对是否定位错模板行/翻页不全：{seen_sorted}")
     else:
-        print(f"  ✓ 回收本批 Rule ID（{len(seen_sorted)} 个，降序）：{seen_sorted}")
+        print(f"  ✓ 回收本批 Rule ID（{len(seen_sorted)} 个，升序）：{seen_sorted}")
     return seen_sorted
+
+
+def _open_template_list(page) -> bool:
+    """点左侧菜单「OTA升级模板」进入模板列表页。返回是否成功进入。
+
+    用户截图确认入口为左侧导航项「OTA升级模板」（整机升级管理分组下）。
+    """
+    for sel in (
+        "li:has-text('OTA升级模板')",
+        ".ant-menu-item:has-text('OTA升级模板')",
+        "span:has-text('OTA升级模板')",
+        "a:has-text('OTA升级模板')",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.click()
+                page.wait_for_timeout(1800)
+                return True
+        except Exception:
+            continue
+    print("  ⚠ 未点中左侧菜单「OTA升级模板」（选择器需按实跑校正）。")
+    return False
+
+
+def _open_view_rules_for_template(page, template_name: str) -> bool:
+    """在模板列表：顶部搜索框按标题搜 template_name → 「标题」列精确匹配本批行 → 点其「查看规则」。
+
+    选择器按用户截图/DOM 推断，需实跑校正：标题搜索框 placeholder 可能为『标题』或在
+    『导入机型/标题』区；列表为 vxe/ant 表格，标题列文本精确等于 template_name。
+    """
+    # a) 顶部按标题搜索缩小范围（搜不到搜索框则跳过，直接在整表里精确匹配）。
+    for sel in (
+        "input[placeholder='标题']",
+        "input[placeholder*='标题']",
+    ):
+        try:
+            box = page.locator(sel).first
+            if box.count() and box.is_visible():
+                box.fill("")
+                box.fill(template_name)
+                # 点搜索按钮（若有）。
+                btn = page.get_by_role("button", name="搜索").first
+                if btn.count():
+                    btn.click()
+                page.wait_for_timeout(1500)
+                break
+        except Exception:
+            continue
+
+    # b) 在「标题」列精确匹配本批行，点该行「查看规则」。含翻页兜底。
+    page_guard = 0
+    while page_guard < 50:
+        page_guard += 1
+        clicked = page.evaluate(
+            """(tname) => {
+                const tables = Array.from(document.querySelectorAll('.vxe-table, table'));
+                for (const t of tables) {
+                    const heads = t.querySelectorAll('thead th, thead td');
+                    if (!heads.length) continue;
+                    const names = Array.from(heads).map(h => (h.innerText||'').trim());
+                    const idxTitle = names.findIndex(x => x.indexOf('标题') >= 0);
+                    if (idxTitle < 0) continue;
+                    const rows = t.querySelectorAll('tbody tr');
+                    for (const r of rows) {
+                        const cells = r.querySelectorAll('td, th');
+                        if (!cells.length || !cells[idxTitle]) continue;
+                        const title = (cells[idxTitle].innerText||'').trim();
+                        if (title !== tname) continue;  // 精确匹配
+                        // 该行操作列里找『查看规则』按钮/链接并点击。
+                        const cand = Array.from(r.querySelectorAll('button, a, span'))
+                            .find(e => (e.innerText||'').trim().indexOf('查看规则') >= 0);
+                        if (cand) { cand.click(); return true; }
+                    }
+                }
+                return false;
+            }""",
+            template_name,
+        )
+        if clicked:
+            page.wait_for_timeout(2000)
+            return True
+        if not _goto_next_page(page):
+            break
+        page.wait_for_timeout(1200)
+    return False
 
 
 def _goto_next_page(page) -> bool:
@@ -1032,49 +1104,59 @@ def probe_online(page) -> None:
 # ======================================================================
 
 _HELP_TEXT = """\
-active_ota —— CMS OTA 规则：导入建规则 → 逐条上线并处理冲突 → 回读状态汇总。
+active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续再 consolidate）。
 
 用法：
-  ./run_active_ota.sh [EXCEL] [--probe-online] [--selftest]
-  ./.venv/bin/python -m automation.active_ota [EXCEL] [--probe-online] [--selftest]
+  ./run_active_ota.sh collect [EXCEL]      # 导入模板建规则 + 收集本批 Rule ID
+  ./run_active_ota.sh online  [EXCEL]      # 从 Excel 读 Rule ID → 逐条上线 + 冲突 + 汇总
+  ./run_active_ota.sh --probe-online       # 只读 dump 编排视图选择器
+  ./run_active_ota.sh --selftest           # 纯逻辑自测（不连浏览器）
+  ./.venv/bin/python -m automation.active_ota <同上>
 
-运行模式（四选一）：
-  （无参数）        连 CMS 跑完整三阶段；导入模板取 OTA_V4_OUTPUTS 下最新的 .xlsx。【写线上数据】
-  EXCEL            连 CMS 跑完整三阶段；用指定路径的 .xlsx 作为导入模板。【写线上数据】
+子命令 / 模式：
+  collect [EXCEL]  连 CMS：导入模板 → 建规则 → 去「OTA升级模板」按标题精确匹配本批行 →
+                   「查看规则」读『规则ID』列，升序打印本批 Rule ID（数量应 = Excel 去表头行数）。【写线上数据：导入】
+  online  [EXCEL]  连 CMS：从 Excel 的【Rule ID】列读本批 Rule ID → 在「升级事件 → 规则上下线」
+                   编排弹窗逐条上线 + 处理「规则替换」冲突 → 回读状态汇总。【写线上数据：上线/替换】
   --probe-online   连 CMS，只读 dump「规则上下线编排」视图的选择器，不做任何写操作。【只读/安全】
   --selftest       纯逻辑自测（名称/备注拼接、冲突号解析、mac组判定、汇总），不连浏览器。【离线/安全】
   -h, --help       显示本帮助并退出。
 
 参数：
-  EXCEL            可选，导入模板 Excel 路径；省略则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
-                   只接受一个 Excel 路径；要求整表单一「设备类型代码」+单一「目标版本」，否则报错中止。
+  EXCEL            可选，Excel 路径；省略则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
+                   collect 要求整表单一「设备类型代码」+单一「目标版本」，否则报错中止。
+                   online 从表头为【Rule ID】（或 ruleid / RuleID）的列读本批 Rule ID。
 
-完整流程三阶段（硬性决策 D1~D12）：
-  阶段1 导入建规则：规则名称 = 设备类型代码 + "_" + 目标版本末5位（例 MT9655AMAndrGTV_Q1015）；
-        备注 = 今天日期YYYYMMDD + "_USA_" + 导入行数（例 20261102_USA_9）。名称/备注填入导入弹窗后导入，
-        再从「查看规则」页回收本批新建的连续 Rule ID。
-  阶段2 逐条上线 + 冲突处理：在「升级事件 → 规则上下线」编排弹窗，待选区按 Rule ID 搜出 → 点「上线」→
-        确认框点「确定」；若弹「规则替换」冲突窗：解析被冲突 Rule ID → 去「已选规则」区查其 mac组，
-        mac组非空才点「确定」替换上线，mac组为空则点「取消」中止该条并记录。全自动，不加人工确认。
-  阶段3 状态汇总：逐个回读 Rule ID 最终状态（online / 冲突中止(mac组空) / 失败）并打印汇总。
+决策要点（D1~D12）：
+  名称 = 设备类型代码 + "_" + 目标版本末5位（例 MT9655AMAndrGTV_Q1015）。
+  备注 = 今天日期YYYYMMDD + "_USA_" + 导入行数（例 20261102_USA_9，行数去表头）。
+  冲突「规则替换」：解析被冲突 Rule ID → 去「已选规则」查其 mac组，非空才点「确定」替换上线，
+         mac组为空则点「取消」中止该条并记录。上线全自动，不加人工确认。
 
-退出码：0 全部 online；2 存在冲突中止/未上线；1 运行出错。
+退出码：0 全部成功；2 缺子命令/无 Rule ID/存在冲突中止或未上线；1 运行出错。
 
 环境：
   CMS_USERNAME / CMS_PASSWORD   在 config/.env 配置（run_active_ota.sh 会检查）。
   CMS_HEADED=true（默认）         开可见浏览器窗口，便于盯着写流程。
 
-⚠ 安全提示：无参数 / 指定 EXCEL 的完整流程会【真实导入规则、上线、替换线上规则，不可逆】。
+⚠ 安全提示：collect 会真实导入规则；online 会真实上线/替换线上规则，均不可逆。
   首次使用建议顺序：先 --selftest，再 --probe-online，再用仅含 1 条的测试 Excel 小批量试跑，确认无误后再整批。
   所有写按钮（导入确定/上线确定/替换确定）均经二次确认 gate，条件不满足只打印不点。"""
 
 
-def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
-    """解析位置参数：可选 Excel 路径；可选 --probe-online 子命令。
+_SUBCOMMANDS = ("collect", "online")
 
-    返回 (mode, excel)。mode ∈ {"run", "probe"}。
+
+def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
+    """解析子命令 + 可选 Excel 路径。
+
+    返回 (mode, excel)。mode ∈ {"collect", "online", "probe"}。
+      collect [EXCEL]   导入模板建规则 + 收集本批 Rule ID（升序打印）。
+      online  [EXCEL]   从 Excel 的『Rule ID』列读本批 Rule ID → 逐条上线 + 冲突 + 汇总。
+      --probe-online    只读 dump 编排视图选择器。
+    不给 EXCEL 则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
     """
-    mode = "run"
+    mode: str | None = None
     excel: str | None = None
     for arg in argv:
         if arg in ("-h", "--help"):
@@ -1084,6 +1166,11 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             mode = "probe"
         elif arg == "--selftest":
             continue  # 在 __main__ 处理
+        elif arg in _SUBCOMMANDS:
+            if mode is not None:
+                print(f"✗ 只能指定一个子命令，已有 {mode!r} 又遇到 {arg!r}。")
+                raise SystemExit(2)
+            mode = arg
         elif arg.startswith("-"):
             print(f"✗ 未知参数：{arg!r}。用法见 -h。")
             raise SystemExit(2)
@@ -1092,6 +1179,10 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
         else:
             print(f"✗ 多余参数：{arg!r}。只接受一个 Excel 路径。")
             raise SystemExit(2)
+
+    if mode is None:
+        print("✗ 缺少子命令。用法：collect [EXCEL] | online [EXCEL] | --probe-online。详见 -h。")
+        raise SystemExit(2)
     return mode, excel
 
 
@@ -1111,25 +1202,51 @@ def main() -> int:
 
             if not excel:
                 excel = latest_updated_excel(OTA_V4_OUTPUTS)
-            print(f"导入模板 Excel：{excel}")
 
-            # 阶段1：导入建规则。
-            rule_ids, name, remark = run_import(page, excel)
-            if not rule_ids:
-                print("✗ 阶段1 未回收到任何 Rule ID，终止。")
-                return 2
+            # —— 子命令 collect：导入建规则 + 收集本批 Rule ID（升序打印），不上线 ——
+            if mode == "collect":
+                print(f"[collect] 导入模板 Excel：{excel}")
+                rule_ids, name, remark = run_import(page, excel)
+                if not rule_ids:
+                    print("✗ [collect] 未回收到任何 Rule ID。")
+                    return 2
+                print(f"\n[collect] 模板名称：{name}")
+                print(f"[collect] 备注：{remark}")
+                print(f"[collect] 本批 Rule ID（{len(rule_ids)} 个，升序）：")
+                for rid in rule_ids:
+                    print(f"  {rid}")
+                if config.HEADED:
+                    print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
+                    time.sleep(20)
+                return 0
 
-            # 阶段2：逐条上线 + 冲突处理。
-            results = run_online(page, rule_ids)
+            # —— 子命令 online：从 Excel『Rule ID』列读本批 Rule ID → 逐条上线 + 冲突 + 汇总 ——
+            if mode == "online":
+                print(f"[online] 读取 Excel：{excel}")
+                info = read_import_excel(excel)
+                # read_import_excel 已按 RULEID_HEADERS（含『Rule ID』）读该列并 norm_ruleid。
+                rule_ids = sorted(
+                    {r for r in info.get("rule_ids", []) if r},
+                    key=lambda x: int(x) if x.isdigit() else 0,
+                )
+                if not rule_ids:
+                    print("✗ [online] Excel 的『Rule ID』列没有可用的 Rule ID（列缺失或为空），终止。")
+                    return 2
+                print(f"[online] 从 Excel 读到 {len(rule_ids)} 个 Rule ID（升序）：{rule_ids}")
 
-            # 阶段3：状态汇总。
-            final = read_final_status(page, rule_ids, results)
-            print("\n" + summarize(final))
+                # 阶段2：逐条上线 + 冲突处理。
+                results = run_online(page, rule_ids)
+                # 阶段3：状态汇总。
+                final = read_final_status(page, rule_ids, results)
+                print("\n" + summarize(final))
 
-            if config.HEADED:
-                print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
-                time.sleep(20)
-            return summary_exit_code(final)
+                if config.HEADED:
+                    print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
+                    time.sleep(20)
+                return summary_exit_code(final)
+
+            print(f"✗ 未知模式：{mode!r}")
+            return 2
         except Exception as e:
             print(f"✗ 运行出错：{e}")
             _shot(page, "active_error")
@@ -1239,6 +1356,25 @@ def _selftest() -> int:
 
     # —— norm_ruleid 复用对齐（与 dass_fill 口径一致）——
     check("norm_ruleid 去逗号对齐", norm_ruleid("65,246") == norm_ruleid("65246"))
+
+    # —— CLI 子命令解析（collect / online / probe / 缺子命令 / 多子命令 / 未知参数）——
+    check("CLI collect 带 Excel", _parse_cli(["collect", "/x.xlsx"]) == ("collect", "/x.xlsx"))
+    check("CLI online 带 Excel", _parse_cli(["online", "/x.xlsx"]) == ("online", "/x.xlsx"))
+    check("CLI collect 不带 Excel", _parse_cli(["collect"]) == ("collect", None))
+    check("CLI online 顺序无关（Excel 在前）", _parse_cli(["/x.xlsx", "online"]) == ("online", "/x.xlsx"))
+    check("CLI --probe-online", _parse_cli(["--probe-online"]) == ("probe", None))
+
+    def _expect_exit(argv):
+        try:
+            _parse_cli(argv)
+            return False
+        except SystemExit as e:
+            return e.code == 2
+
+    check("CLI 缺子命令报错退出2", _expect_exit([]))
+    check("CLI 缺子命令（仅 Excel）报错退出2", _expect_exit(["/x.xlsx"]))
+    check("CLI 多子命令报错退出2", _expect_exit(["collect", "online"]))
+    check("CLI 未知参数报错退出2", _expect_exit(["--bogus"]))
 
     print("\n自测结果：", "全部通过 ✅" if ok else "存在失败 ❌")
     return 0 if ok else 1

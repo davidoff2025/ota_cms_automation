@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # CMS active_ota：导入 OTA 模板建规则 → 逐条上线并处理冲突 → 回读状态汇总。
 #
-# 用法：
-#   ./run_active_ota.sh                      # 取 ota_v4 输出目录里最新的 .xlsx 作为导入模板
-#   ./run_active_ota.sh "/路径/模板.xlsx"      # 指定导入模板 Excel
-#   ./run_active_ota.sh --probe-online        # 只读 dump 编排视图选择器（不做任何写操作）
-#   ./run_active_ota.sh --selftest            # 纯逻辑自测（不连浏览器）
+# 用法（两个独立子命令；一条龙后续再 consolidate）：
+#   ./run_active_ota.sh collect ["/路径/模板.xlsx"]   # 导入模板建规则 + 收集本批 Rule ID（升序打印）
+#   ./run_active_ota.sh online  ["/路径/模板.xlsx"]   # 从 Excel 的『Rule ID』列读 → 逐条上线 + 冲突 + 汇总
+#   ./run_active_ota.sh --probe-online               # 只读 dump 编排视图选择器（不做任何写操作）
+#   ./run_active_ota.sh --selftest                   # 纯逻辑自测（不连浏览器）
+#   不给 Excel 则取 ota_v4 输出目录里最新的 .xlsx。
 #
-# 三阶段（硬性决策 D1~D12）：
-#   阶段1 导入建规则：规则名称 = 设备类型代码 + "_" + 目标版本末5位；
-#         备注 = 今天日期YYYYMMDD_USA_<导入行数>。名称/备注填入导入弹窗后导入。
-#   阶段2 逐条上线 + 冲突处理：待选区按 Rule ID 搜出 → 上线 → 确认框确定；
-#         若弹『规则替换』冲突窗：解析被冲突号 → 查其 mac组，非空才替换上线，为空则取消中止该条。
-#   阶段3 状态汇总：每个 Rule ID 回读 online / 冲突中止 / 失败。
+# collect：导入建规则（名称=设备类型代码_目标版本末5位；备注=今天YYYYMMDD_USA_去表头行数），
+#          再去「OTA升级模板」按标题精确匹配本批行 →「查看规则」读『规则ID』列，升序打印。
+# online ：读 Excel（sheet『升级规则』）里表头为『Rule ID』的列 → 在「升级事件→规则上下线」
+#          编排弹窗逐条上线；遇『规则替换』冲突：查被冲突号的 mac组，非空才替换上线、为空则取消中止该条；
+#          最后回读每个 Rule ID 的状态（online / 冲突中止 / 失败）并汇总。
 #
 # 安全：所有写操作（导入确定/上线确定/替换确定）均经二次确认 gate，条件不满足不点。
 #       端到端写流程改线上生产数据，请在知情下运行本脚本。
