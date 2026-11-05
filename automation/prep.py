@@ -345,6 +345,7 @@ def main() -> int:
         auto_upload=True,
         cleanup_after_upload=True,
         log=print,
+        progress=_make_progress_printer(),
     )
     print(output_path)
     print(f"S3 前缀：{result.s3_prefix}")
@@ -363,6 +364,33 @@ def main() -> int:
         return 1
     print(_ok("prep 全部完成：生成 → 校验 → 上传 → S3 回查，均 correct。"))
     return 0
+
+
+def _make_progress_printer():
+    """返回一个 progress(pct, msg) 回调，用于显示 FTP 下载 / S3 上传进度百分比。
+
+    节流：仅当百分比较上次增加 >=2%、或消息文案变化、或到达 100% 时才输出，避免分块回调刷屏。
+    TTY 下用回车 `\\r` 原地刷新同一行（末尾达 100% 换行）；非 TTY（管道/重定向）下按节流打印整行，
+    不写入 ANSI/回车控制符，保证被捕获输出干净。
+    """
+    state = {"last_pct": -100.0, "last_msg": ""}
+    is_tty = sys.stdout.isatty()
+
+    def progress(pct: float, msg: str) -> None:
+        pct = max(0.0, min(100.0, float(pct)))
+        changed_msg = (msg != state["last_msg"])
+        if pct - state["last_pct"] < 2.0 and not changed_msg and pct < 100.0:
+            return
+        state["last_pct"] = pct
+        state["last_msg"] = msg
+        line = f"  [{pct:5.1f}%] {msg}"
+        if is_tty:
+            end = "\n" if pct >= 100.0 else ""
+            print("\r" + line.ljust(70), end=end, flush=True)
+        else:
+            print(line, flush=True)
+
+    return progress
 
 
 def _verify_s3_uploads(bucket: str, prefix: str, filenames: list[str]) -> list[str]:
