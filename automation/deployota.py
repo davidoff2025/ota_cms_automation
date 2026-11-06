@@ -34,6 +34,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "upload": ("automation.active_ota", ["collect"]),
     "online": ("automation.active_ota", ["online"]),
     "dass":   ("automation.dass_fill",  []),
+    "summary": ("automation.summary",   []),
 }
 
 _PROG = "deployota"
@@ -53,6 +54,7 @@ def _usage() -> str:
         "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
         "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
         "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门）",
+        "  summary  从更新后的 Excel（含 Rule ID）打印 OTA 部署信息汇总",
         "",
         "示例：",
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
