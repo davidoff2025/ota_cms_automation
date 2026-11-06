@@ -102,7 +102,7 @@ def _write_all(records: list[dict]) -> None:
     _export_csv()
 
 
-def append_record(rec: dict) -> tuple[bool, str]:
+def append_record(rec: dict, force_status: str | None = None) -> tuple[bool, str]:
     """写入一条部署记录，按身份键做作废+替换。返回 (是否新写入, 说明)。
 
     三种情况（身份键 = 设备类型代码+源版本+目标版本+设备扩展码集合，不含 Rule ID）：
@@ -111,12 +111,23 @@ def append_record(rec: dict) -> tuple[bool, str]:
          写入一条新记录『有效』。
       3) 新身份键 → 直接写入『有效』。
     老记录不删除，仅标记作废（保留可追溯）。写入后同步导出 CSV。
+
+    force_status：可选，强制写入记录的状态。
+      - None（默认）→ 写入『有效』(STATUS_ACTIVE)，与历史行为完全一致（Excel 入口不传该参数，零影响）。
+      - STATUS_VOID → 新记录以『作废』状态落库（用于回填 CMS 中备注含 VOID 的历史记录）；
+        若 rec 未带『作废时间』则补当前时刻。
+    身份键的三分支逻辑（情况1/2/3）不受 force_status 影响。
     """
     os.makedirs(db_dir(), exist_ok=True)
     rec = dict(rec)
     # 入库时间=写库时刻（兜底）；部署时间来自 Excel 升级日期，不在此用 now 冒充。
     rec.setdefault("入库时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    rec["状态"] = STATUS_ACTIVE
+    if force_status is None:
+        rec["状态"] = STATUS_ACTIVE
+    else:
+        rec["状态"] = force_status
+        if force_status == STATUS_VOID:
+            rec.setdefault("作废时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     all_recs = load_all()
     ident = _identity_key(rec)
@@ -291,6 +302,85 @@ def _print_history(limit: int | None, device: str | None,
     return 0
 
 
+def _selftest() -> int:
+    """最小纯逻辑自测：仅写 OTA_DEPLOY_DB_DIR 指向的临时库，绝不触碰真实部署库。
+
+    覆盖 append_record 的 force_status 语义与身份键三分支：
+      - 不传 force_status → 状态『有效』；
+      - force_status=STATUS_VOID → 状态『作废』且『作废时间』非空；
+      - 同身份键不同 Rule ID → 旧『有效』记录被作废。
+    """
+    import tempfile
+
+    failures: list[str] = []
+
+    def check(cond: bool, msg: str) -> None:
+        if cond:
+            print(f"  PASS: {msg}")
+        else:
+            failures.append(msg)
+            print(f"  FAIL: {msg}")
+
+    tmp = tempfile.mkdtemp(prefix="depdb_selftest_")
+    old = os.environ.get("OTA_DEPLOY_DB_DIR")
+    os.environ["OTA_DEPLOY_DB_DIR"] = tmp
+    try:
+        print(f"[selftest] 临时库目录 = {tmp}")
+
+        base = {
+            "设备类型代码": "DEV_X",
+            "源版本": "1.0.0",
+            "目标版本": "2.0.0",
+            "设备扩展码集合": "A,B",
+            "Rule ID列表": "100,101",
+            "Rule ID范围": "100 ~ 101",
+            "规则条数": 2,
+        }
+
+        # 1) 不传 force_status → 有效。
+        wrote, _ = append_record(dict(base))
+        check(wrote, "默认写入返回新写入")
+        recs = load_all()
+        check(len(recs) == 1 and recs[-1].get("状态") == STATUS_ACTIVE,
+              "默认写入状态为『有效』")
+
+        # 2) force_status=STATUS_VOID → 作废且作废时间非空（新身份键，避免与情况3耦合）。
+        void_rec = dict(base)
+        void_rec["设备类型代码"] = "DEV_Y"
+        wrote, _ = append_record(void_rec, force_status=STATUS_VOID)
+        check(wrote, "VOID 写入返回新写入")
+        recs = load_all()
+        last = recs[-1]
+        check(last.get("状态") == STATUS_VOID, "force_status=VOID 写入状态为『作废』")
+        check(bool(str(last.get("作废时间", "")).strip()), "VOID 记录『作废时间』非空")
+
+        # 3) 同身份键不同 Rule ID → 旧『有效』记录被作废。
+        regen = dict(base)
+        regen["Rule ID列表"] = "200,201"
+        regen["Rule ID范围"] = "200 ~ 201"
+        wrote, _ = append_record(regen)
+        check(wrote, "同身份键重新生成返回新写入")
+        recs = load_all()
+        dev_x = [r for r in recs if r.get("设备类型代码") == "DEV_X"]
+        old_active = [r for r in dev_x if r.get("Rule ID列表") == "100,101"]
+        new_active = [r for r in dev_x if r.get("Rule ID列表") == "200,201"]
+        check(len(old_active) == 1 and old_active[0].get("状态") == STATUS_VOID,
+              "同身份键旧 Rule ID 记录被作废")
+        check(len(new_active) == 1 and new_active[0].get("状态") == STATUS_ACTIVE,
+              "同身份键新 Rule ID 记录为『有效』")
+
+        if failures:
+            print(f"[selftest] 失败 {len(failures)} 项。")
+            return 1
+        print("[selftest] 全部 PASS。")
+        return 0
+    finally:
+        if old is None:
+            os.environ.pop("OTA_DEPLOY_DB_DIR", None)
+        else:
+            os.environ["OTA_DEPLOY_DB_DIR"] = old
+
+
 def main() -> int:
     """history 查看入口：python -m automation.depdb [--device CODE] [--limit N] [--export]"""
     import argparse
@@ -303,7 +393,11 @@ def main() -> int:
                    help="按 Rule ID 或范围过滤（纯数字会判断是否落在某批区间内；也支持范围文本子串）。")
     p.add_argument("--limit", type=int, default=20, help="只显示最近 N 条（默认 20；0 表示全部）。")
     p.add_argument("--export", action="store_true", help="重新导出一份 CSV 后退出。")
+    p.add_argument("--selftest", action="store_true",
+                   help="运行纯逻辑自测（仅写临时库，绝不触碰真实部署库）后退出。")
     args = p.parse_args()
+    if args.selftest:
+        return _selftest()
     if args.export:
         _export_csv()
         print(f"已导出 CSV → {_csv_path()}")
