@@ -253,12 +253,17 @@ def _print_history(limit: int | None, device: str | None,
         print(warn("没有匹配的部署记录。"))
         print(color(f"（存储位置：{_jsonl_path()}）", "dim"))
         return 0
-    rows = rows[-limit:] if limit else rows
-    active_n = sum(1 for r in rows if str(r.get("状态", STATUS_ACTIVE)) == STATUS_ACTIVE)
-    void_n = len(rows) - active_n
-    print(color(f"========== OTA 部署历史（共 {len(rows)} 条：有效 {active_n} / 作废 {void_n}，"
-                f"存储：{db_dir()}）==========", "bold"))
-    for r in rows:
+    # 按『部署时间』升序排序（稳定排序；同日保持写入顺序），这样末尾 = 真正最新的部署。
+    # 注意：不能依赖文件写入顺序——回填是从新往旧抓的，文件末尾反而是最老的记录。
+    rows = sorted(rows, key=lambda r: str(r.get("部署时间", "")))
+    all_rows = rows                      # 过滤后的全部记录：总体统计基于它，不受 --limit 影响。
+    shown = rows[-limit:] if limit else rows   # 仅展示列表截取最近 N 条。
+
+    active_n = sum(1 for r in all_rows if str(r.get("状态", STATUS_ACTIVE)) == STATUS_ACTIVE)
+    void_n = len(all_rows) - active_n
+    print(color(f"========== OTA 部署历史（显示最近 {len(shown)} 条 / 共 {len(all_rows)} 条："
+                f"有效 {active_n} / 作废 {void_n}，存储：{db_dir()}）==========", "bold"))
+    for r in shown:
         status = str(r.get("状态", STATUS_ACTIVE))
         is_void = status == STATUS_VOID
         tag = (color("[作废]", "red") if is_void else color("[有效]", "green"))
@@ -269,22 +274,26 @@ def _print_history(limit: int | None, device: str | None,
                 f"[{r.get('升级类型','')}]  owner={owner}  {r.get('部署时间','')}{extra}")
         print(color(line, "dim") if is_void else line)
 
-    # —— 总体统计 summary（基于当前筛选后的 rows）——
-    platforms = sorted({str(r.get("设备类型代码", "")).strip() for r in rows if str(r.get("设备类型代码", "")).strip()})
-    owners = sorted({str(r.get("Owner", "")).strip() for r in rows if str(r.get("Owner", "")).strip()})
+    # —— 总体统计 summary（基于 all_rows：过滤后的全部记录，不受 --limit 截断影响）——
+    platforms = sorted({str(r.get("设备类型代码", "")).strip() for r in all_rows if str(r.get("设备类型代码", "")).strip()})
+    owners = sorted({str(r.get("Owner", "")).strip() for r in all_rows if str(r.get("Owner", "")).strip()})
     # 统计去重后的 Rule ID 总数（按『有效』记录的 Rule ID 列表汇总，避免作废/重复重复计数）。
     active_rids = set()
-    for r in rows:
+    for r in all_rows:
         if str(r.get("状态", STATUS_ACTIVE)) == STATUS_ACTIVE:
             active_rids.update(x.strip() for x in str(r.get("Rule ID列表", "")).split(",") if x.strip())
     rid_nums = sorted(int(x) for x in active_rids if x.isdigit())
     rid_span = f"{rid_nums[0]} ~ {rid_nums[-1]}" if rid_nums else "-"
+    # 部署时间跨度（all_rows 已按部署时间升序）。
+    dates = [str(r.get("部署时间", "")) for r in all_rows if str(r.get("部署时间", ""))]
+    date_span = f"{dates[0]} ~ {dates[-1]}" if dates else "-"
 
     print("")
     print(color("────────── 总体统计 / Overall Summary ──────────", "bold"))
     print(f"  平台数（设备类型）：{color(str(len(platforms)), 'bold')}"
-          f"    批次数：{color(str(len(rows)), 'bold')}"
-          f"（有效 {active_n} / 作废 {void_n}）")
+          f"    批次数：{color(str(len(all_rows)), 'bold')}"
+          f"（有效 {active_n} / 作废 {void_n}）"
+          f"    部署时间跨度：{date_span}")
     print(f"  有效 Rule ID 总数：{color(str(len(active_rids)), 'green')}"
           f"    范围：{color(rid_span, 'green')}")
     if owners:
@@ -292,7 +301,7 @@ def _print_history(limit: int | None, device: str | None,
     if platforms:
         # 每平台的有效批次数，便于一眼看分布。
         per = {}
-        for r in rows:
+        for r in all_rows:
             if str(r.get("状态", STATUS_ACTIVE)) == STATUS_ACTIVE:
                 per[r.get("设备类型代码", "")] = per.get(r.get("设备类型代码", ""), 0) + 1
         dist = "  ".join(f"{k}:{v}" for k, v in sorted(per.items()))
