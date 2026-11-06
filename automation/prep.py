@@ -53,7 +53,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 上传 S3（三步一键）。",
     )
     p.add_argument("--file", dest="file", default=None,
-                   help="从该路径读取升级信息文本；省略则从 stdin 读。")
+                   help="输入文件：.txt（升级信息文本）或 .xlsx/.xlsm（OTA 申请模板 Excel，直接解析）；"
+                        "省略则从 stdin 读文本。")
     p.add_argument("--device-code", dest="device_code", default="",
                    help="设备类型代码（方案号）；非空时覆盖文本解析值。")
     p.add_argument("--device-name", dest="device_name", default="",
@@ -166,7 +167,26 @@ def _validate_excel(path: str) -> list[str]:
         wb.close()
 
 
-def _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group):
+def _canonical_device_code(eng, code: str):
+    """把设备码规范成映射表里的写法（以映射表为标准，大小写不敏感匹配）。
+
+    返回 (规范后的设备码, 是否被改写)。先精确匹配；否则仅当大小写不敏感匹配【唯一】时才采用；
+    没有匹配或不唯一则原样返回（交给后面的映射表校验去报“不在映射表中”）。
+    """
+    code = str(code or "").strip()
+    if not code:
+        return code, False
+    table = [str(r.get("device_code", "")).strip() for r in eng.app.load_device_history_seed()]
+    if code in table:
+        return code, False
+    ci = [t for t in table if t and t.lower() == code.lower()]
+    if len(ci) == 1:
+        return ci[0], True
+    return code, False
+
+
+def _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group,
+                                  pasted_override=None):
     """把文本解析出的 设备类型代码/feature code 与映射表(seed)比对。
 
     返回 (ok, lines)：ok 为 True 表示一致（code 在表中且文本 feature==表中 feature，
@@ -176,8 +196,12 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
     """
     lines = []
     # 重新抽取文本里【原始】解析值（normalize 竖排后），用于与表比对。
-    norm = eng.reshape_vertical_paste(text) if str(text).strip() else text
-    pasted = eng.app.extract_form_fields_from_text(norm) if str(norm).strip() else {}
+    if pasted_override is not None:
+        # Excel 输入：设备码/feature 来自表格列（调用方已读好），不再从文本抽取。
+        pasted = pasted_override
+    else:
+        norm = eng.reshape_vertical_paste(text) if str(text).strip() else text
+        pasted = eng.app.extract_form_fields_from_text(norm) if str(norm).strip() else {}
     text_code = str(pasted.get("device_code", "") or "").strip()
     text_feat = str(pasted.get("feature_code", "") or "").strip()
 
@@ -223,28 +247,69 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
 def main() -> int:
     args = _build_parser().parse_args()
 
-    # (1) 读取文本来源。
+    # (1) 读取输入来源：.xlsx/.xlsm 直接按 Excel 解析；其余按文本（--file txt 或 stdin）。
+    excel_input = False
+    pasted_override = None
     if args.file:
         if not os.path.isfile(args.file):
             print(f"✗ 找不到 --file 指定的文件：{args.file}", file=sys.stderr)
             return 2
-        with open(args.file, "r", encoding="utf-8") as f:
-            text = f.read()
+        excel_input = _is_excel_input(args.file)
+        if excel_input:
+            text = ""  # Excel 输入没有文本；解析/指纹都走文件本身。
+        else:
+            with open(args.file, "r", encoding="utf-8") as f:
+                text = f.read()
     else:
         text = sys.stdin.read()
 
-    if text.strip() == "":
+    if not excel_input and text.strip() == "":
         print("✗ 未从 stdin/--file 读到任何文本", file=sys.stderr)
         return 2
 
     eng = OTAEngine()
 
-    # 设备信息：先从文本解析，再用 CLI 非空值覆盖。
-    info = eng.resolve_device_info_from_text(text)
-    device_code = args.device_code.strip() or info.get("device_code", "")
-    device_name = args.device_name.strip() or info.get("device_name", "")
-    feature_code = args.feature_code.strip() or info.get("feature_code", "")
-    mac_group = args.mac_group.strip() or info.get("mac_group", "")
+    if excel_input:
+        print(_c("—— 输入：Excel 文件（直接解析）——", "bold"))
+        print(f"  {os.path.abspath(args.file)}")
+        # 设备码 / feature code 是表格里的列，引擎不会抽取，这里自己读。
+        ex = _read_excel_device_fields(args.file)
+        codes, feats = ex["device_codes"], ex["feature_codes"]
+        if len(codes) > 1 and not args.device_code.strip():
+            print(_err(f"Excel 内含多个设备类型代码 {codes}，无法确定唯一值。"
+                       "请拆分文件，或用 --device-code 显式指定。"), file=sys.stderr)
+            return 2
+        if len(feats) > 1 and not args.feature_code.strip():
+            print(_err(f"Excel 内含多个 Feature Code {feats}，无法确定唯一值。"
+                       "请拆分文件，或用 --feature-code 显式指定。"), file=sys.stderr)
+            return 2
+        x_code = codes[0] if codes else ""
+        x_feat = feats[0] if feats else ""
+        pasted_override = {"device_code": x_code, "feature_code": x_feat}
+        device_code = args.device_code.strip() or x_code
+        feature_code = args.feature_code.strip() or x_feat
+        preset = eng.device_preset(device_code) if device_code else {}
+        device_name = args.device_name.strip() or preset.get("device_name", "")
+        feature_code = feature_code or preset.get("feature_code", "")
+        mac_group = args.mac_group.strip() or preset.get("mac_group", "")
+    else:
+        # 设备信息：先从文本解析，再用 CLI 非空值覆盖。
+        info = eng.resolve_device_info_from_text(text)
+        device_code = args.device_code.strip() or info.get("device_code", "")
+        device_name = args.device_name.strip() or info.get("device_name", "")
+        feature_code = args.feature_code.strip() or info.get("feature_code", "")
+        mac_group = args.mac_group.strip() or info.get("mac_group", "")
+
+    # 设备码以映射表写法为准（仅大小写不同时规范化），文件名 / S3 路径 / 生成的 Excel 都用规范写法。
+    canon, changed = _canonical_device_code(eng, device_code)
+    if changed:
+        print(_warn(f"设备类型代码已按映射表写法规范化：{device_code} → {canon}（仅大小写不同）"))
+        device_code = canon
+        # 名称 / MAC 组 / feature code 若是按原始写法查不到而为空，则按规范后的设备码补齐。
+        _p = eng.device_preset(device_code)
+        device_name = args.device_name.strip() or _p.get("device_name", "") or device_name
+        mac_group = args.mac_group.strip() or _p.get("mac_group", "") or mac_group
+        feature_code = args.feature_code.strip() or feature_code or _p.get("feature_code", "")
 
     # 若设备码经 CLI 覆盖后才确定、而 MAC 组仍为空，则按设备预设补齐
     # （预设默认 '测试'+设备类型代码，与引擎 resolve 的建议值一致）。
@@ -255,7 +320,8 @@ def main() -> int:
     #   从文本解析出的 设备类型代码/feature code 与 mapping table(seed) 比对：
     #   一致 -> 打印 4 项(代码/名称/feature/测试MAC组) 并继续；
     #   不一致 -> 打印差异，等待人工确认(yes/y 继续，其它退出)；--yes 自动继续；无法交互则退出。
-    ok, lines = _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group)
+    ok, lines = _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group,
+                                              pasted_override=pasted_override)
     for ln in lines:
         print(ln)
     if not ok:
@@ -274,7 +340,11 @@ def main() -> int:
                 print("已取消：设备信息与映射表不一致，未生成。", file=sys.stderr)
                 return 2
 
-    sj = eng.parse_pasted_text(text)
+    try:
+        sj = eng.parse_excel(args.file) if excel_input else eng.parse_pasted_text(text)
+    except Exception as e:
+        print(_err(f"解析输入失败：{e}"), file=sys.stderr)
+        return 1
 
     # 解析内容概览（行数 / 提示语数 / FTP zip 数），透明可核对。
     parsed_rows = len(sj.get("rows", [])) if isinstance(sj, dict) else 0
@@ -293,7 +363,7 @@ def main() -> int:
 
     # (2) 步骤1 生成（内容指纹去重：同一 source 内容已在该目录生成过则复用，不重复生成）。
     print(_c("—— 步骤1：生成 Excel ——", "bold"))
-    content_hash = _source_fingerprint(text)
+    content_hash = _file_fingerprint(args.file) if excel_input else _source_fingerprint(text)
     reused = None if args.force else _find_existing_excel(out_dir, content_hash)
     if reused:
         output_path = reused
@@ -342,10 +412,20 @@ def main() -> int:
         print(f"[--no-upload] 待上传 FTP zip（{len(urls)} 个）：")
         for u in urls:
             print(f"  - {u}")
+        if not urls:
+            other = _non_ftp_source_urls(eng, sj)
+            if other:
+                print(_warn(f"源数据的 zip 地址不是 ftp://（共 {len(other)} 个，如 {other[0]}），"
+                            "当前不支持下载，真实上传时会无文件可传。"))
         return 0
 
     if not urls:
-        print(_err("无可上传的 FTP zip（源数据未含 ftp:// 地址）"), file=sys.stderr)
+        other = _non_ftp_source_urls(eng, sj)
+        if other:
+            print(_err(f"无可上传的 FTP zip：源数据的 zip 地址不是 ftp://（共 {len(other)} 个，如 {other[0]}），"
+                       "当前只支持从 FTP 下载。"), file=sys.stderr)
+        else:
+            print(_err("无可上传的 FTP zip（源数据未含 ftp:// 地址）"), file=sys.stderr)
         return 1
 
     # (4b) S3 预检：对每个 zip，若 S3 已存在同名文件且【大小一致】(与生成 Excel 里的「文件大小」比)，
@@ -403,6 +483,79 @@ _PREP_INDEX_FILE = ".prep_index.json"
 def _source_fingerprint(text: str) -> str:
     """source 文本内容的 SHA-256 指纹（内容一变就变），用于判定是否已生成过。"""
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _file_fingerprint(path: str) -> str:
+    """文件字节内容的 SHA-256 指纹（Excel 输入用，不能按 utf-8 文本读）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_EXCEL_EXTS = (".xlsx", ".xlsm")
+
+
+def _is_excel_input(path) -> bool:
+    return bool(path) and str(path).lower().endswith(_EXCEL_EXTS)
+
+
+def _norm_header(s) -> str:
+    """表头归一：去掉不换行空格(\\xa0)/全角空格/所有空白并转小写，便于容错匹配。"""
+    return re.sub(r"[\s\u00a0\u3000]+", "", str(s or "")).lower()
+
+
+# 源 Excel（OTA 申请模板）里设备码 / feature code 的表头候选（均为 _norm_header 后的形式）。
+_DEVICE_HEADERS = ("设备类型代码", "设备类型代码（方案号）", "设备类型代码(方案号)", "方案号", "devicecode")
+_FEATURE_HEADERS = ("featurecode", "特征码", "feature")
+
+
+def _read_excel_device_fields(path: str) -> dict:
+    """从源 Excel 的列里读设备类型代码 / feature code（引擎对 Excel 不会抽取这两项）。
+
+    返回 {"device_codes": [去重保序], "feature_codes": [去重保序]}。读取失败返回空列表。
+    优先『升级规则』sheet，没有则取第一个 sheet；表头在第 1 行。
+    """
+    out = {"device_codes": [], "feature_codes": []}
+    try:
+        wb = load_workbook(path, data_only=True, read_only=True)
+        ws = wb["升级规则"] if "升级规则" in wb.sheetnames else wb.worksheets[0]
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None) or ()
+        norm = [_norm_header(h) for h in header]
+
+        def col(cands):
+            for i, h in enumerate(norm):
+                if h in cands:
+                    return i
+            return None
+
+        di, fi = col(_DEVICE_HEADERS), col(_FEATURE_HEADERS)
+        for r in rows:
+            for idx, key in ((di, "device_codes"), (fi, "feature_codes")):
+                if idx is None or idx >= len(r) or r[idx] is None:
+                    continue
+                v = str(r[idx]).strip()
+                if v and v not in out[key]:
+                    out[key].append(v)
+        wb.close()
+    except Exception as e:
+        print(_warn(f"读取 Excel 设备列失败：{e}"), file=sys.stderr)
+    return out
+
+
+def _non_ftp_source_urls(eng, sj) -> list:
+    """源数据里存在、但不是 ftp:// 的 zip 地址（如 http://...），用于提示用户为何没有可下载的 FTP zip。"""
+    seen = []
+    for row in sj.get("rows", []) if isinstance(sj, dict) else []:
+        try:
+            u = str(eng.app.find_zip_source_url_in_row(row) or "").strip()
+        except Exception:
+            u = ""
+        if u and not u.lower().startswith("ftp://") and u not in seen:
+            seen.append(u)
+    return seen
 
 
 def _find_existing_excel(out_dir: str, content_hash: str) -> str | None:
@@ -615,6 +768,16 @@ def _selftest() -> int:
             output_dir=out_dir,
         )
         gen = res["output_path"]
+
+        # 设备码以映射表写法为准：大小写不敏感匹配后规范化；精确匹配/无匹配则不改写。
+        check("规范化 MT9655andrWH80F -> MT9655AndrWH80F",
+              _canonical_device_code(eng, "MT9655andrWH80F") == ("MT9655AndrWH80F", True))
+        check("已是规范写法不改写",
+              _canonical_device_code(eng, "MT9655AndrWH80F") == ("MT9655AndrWH80F", False))
+        check("映射表外的设备码原样返回",
+              _canonical_device_code(eng, "NOT_A_DEVICE") == ("NOT_A_DEVICE", False))
+        check("MT9655AndrWH80F 映射表 feature code 已更正为 ...745",
+              eng.device_preset("MT9655AndrWH80F").get("feature_code") == "861003009000005000000745")
 
         wb = load_workbook(gen, read_only=True)
         try:
