@@ -35,6 +35,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "online": ("automation.active_ota", ["online"]),
     "dass":   ("automation.dass_fill",  []),
     "history": ("automation.depdb",     []),
+    "backfill": ("automation.depdb_backfill", []),
 }
 
 _PROG = "deployota"
@@ -55,6 +56,7 @@ def _usage() -> str:
         "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
         "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
         "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
+        "  backfill CMS 部署历史回补（只读抓取 OTA升级模板 → 去重合并入库；默认 dry-run，--commit 才写）",
         "",
         "示例：",
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",

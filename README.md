@@ -226,6 +226,45 @@ cat 文本.txt | ./run_prep.sh --no-upload --device-code MT9655AMAndrGTV
 
 ---
 
+## 七、CMS 部署历史回补（只读抓取）：`depdb_backfill`
+
+把 CMS 里历史的「OTA升级模板」批次**只读**抓回本地部署库（`depdb`），用于补齐早期（手工 Excel 之前）
+的部署记录。流程：登录 → 遍历「OTA升级模板」列表 → 按**创建人**过滤（默认 `devinw`）→ 逐条读
+标题/备注/创建人/创建时间 → 点「查看规则」读二级页 规则ID/设备类型代码/设备扩展信息/源版本/目标版本/
+升级方式 → 构造一条部署记录 → 经 `depdb.append_record` **去重合并**写入 → 翻页直到列表「创建时间」
+早于 `--since` 即停。
+
+```bash
+# 纯离线自测（不连浏览器，仅写临时库）
+./.venv/bin/python -m automation.depdb_backfill --selftest
+
+# 由用户亲自跑的 HEADED 全量抓取（默认 dry-run：只打印预览+统计，不写库）
+CMS_HEADED=true ./.venv/bin/python -m automation.depdb_backfill
+
+# 真正写库（去重合并）——必须显式加 --commit
+CMS_HEADED=true ./.venv/bin/python -m automation.depdb_backfill --commit
+
+# 也可经统一入口转发
+./deployota backfill --help
+```
+
+**参数语义**：
+
+- `--since YYYY-MM-DD`：回溯截止日期（默认 `2026-04-01`）。列表「创建时间」早于它即停止翻页；
+  等于当日不算早于；单行早于则跳过该行，整页都早才判停。
+- `--owner NAME`：只处理该创建人的模板，其余跳过（默认 `devinw`）。
+- `--commit` / `--dry-run`：互斥。**默认 dry-run**（只打印逐条预览 + 统计，不写库）；真正写入必须显式加 `--commit`。
+- `--max-pages N`：翻页保护上限（默认 100）。
+- `--limit N`：只抓前 N 个命中 owner 的模板（调试用）。
+
+**备注含 VOID**（忽略大小写）的批次以 `append_record(force_status=STATUS_VOID)` 落为**『作废』**，其余按『有效』写入。
+
+> ⚠ **只读安全边界**：脚本对 CMS 只做登录 / 翻页 / 点「查看规则」查看 / 读文本，**绝不**点击
+> 删除/上线/下线/新建/批量修改/导入/提交/替换 等任何写按钮，也**绝不清库**（只经 `append_record`
+> 追加/去重/作废替换）。**全量抓取与真实入库请由使用者亲自以 HEADED 运行**，实现/维护侧只跑离线 `--selftest`。
+
+---
+
 ## 测试与验证
 
 - 核心模块带离线自测（不连浏览器）：
