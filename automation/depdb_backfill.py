@@ -39,7 +39,6 @@ from ._log import ok, warn, err, color
 from .login import login, _shot
 from .active_ota import (
     _open_template_list,
-    _open_view_rules_for_template,
     _goto_next_page,
     norm_ruleid,
 )
@@ -340,15 +339,95 @@ def _read_rule_rows_current_page(page) -> list[dict]:
     )
 
 
-def collect_rule_rows(page, title: str, max_pages: int = 100) -> list[dict]:
-    """点某模板标题的「查看规则」进二级页，读全部规则行（含翻页累计）。只读。
+def _click_view_rules_by_row_index(page, data_idx: int) -> dict:
+    """按【行索引】点模板列表第 data_idx 个数据行自己的行内「查看规则」。只读。
 
-    调 _open_view_rules_for_template（含搜索+翻页定位+点查看规则），读当前页规则行后
-    用 _goto_next_page 翻页累计，_shot 截图关键步骤。读完由调用方重开列表返回。
+    与 read_template_rows 完全同口径：锚「表头含『标题』」的模板表，对有非空标题的
+    tbody tr 按出现顺序计数（跳过无标题行、去 vxe 固定列重复），命中目标 data_idx 时
+    【只在该行元素内】找文本含『查看规则』的 button/a/span 并 .click()。
+    绝不用顶部搜索框、绝不按标题文本跨行匹配（重名标题无法区分）。
+
+    返回 {"ok": bool, "title": str}——title 为被点击行的标题，供调用方校验是否与期望一致。
     """
-    if not _open_view_rules_for_template(page, title):
-        print(warn(f"未能在模板列表定位并点开『查看规则』：{title!r}（跳过该模板）。"))
+    return page.evaluate(
+        """(targetIdx) => {
+            const tables = Array.from(document.querySelectorAll('.vxe-table, table'));
+            const seenRows = new Set();
+            let dataIdx = -1;
+            for (const t of tables) {
+                const heads = t.querySelectorAll('thead th, thead td');
+                if (!heads.length) continue;
+                const names = Array.from(heads).map(h => (h.innerText||'').trim());
+                const idxTitle = names.findIndex(x => x.indexOf('标题') >= 0);
+                let idxTime = names.findIndex(x => x.indexOf('创建时间') >= 0);
+                if (idxTime < 0) idxTime = names.findIndex(x => x.indexOf('导入时间') >= 0);
+                if (idxTitle < 0) continue;  // 不是模板列表
+                const rows = t.querySelectorAll('tbody tr');
+                for (const r of rows) {
+                    const cells = r.querySelectorAll('td, th');
+                    if (!cells.length || !cells[idxTitle]) continue;
+                    const get = (i) => (i >= 0 && cells[i]) ? (cells[i].innerText||'').trim() : '';
+                    const title = get(idxTitle);
+                    if (!title) continue;
+                    const key = title + '||' + get(idxTime);
+                    if (seenRows.has(key)) continue;  // vxe 固定列可能重复渲染
+                    seenRows.add(key);
+                    dataIdx += 1;
+                    if (dataIdx !== targetIdx) continue;
+                    // 命中目标行：只在该行内找『查看规则』元素并点击。
+                    const els = r.querySelectorAll('button, a, span');
+                    for (const el of els) {
+                        if ((el.innerText||'').indexOf('查看规则') >= 0) {
+                            el.click();
+                            return {ok: true, title: title};
+                        }
+                    }
+                    return {ok: false, title: title};  // 该行无『查看规则』
+                }
+            }
+            return {ok: false, title: ''};  // 索引越界/未找到模板表
+        }""",
+        data_idx,
+    )
+
+
+def _return_to_template_list(page) -> str:
+    """二级『查看规则』页返回模板列表。返回 'tab'（点 antd tab 返回，保持翻页位置）或
+    'reopen'（兜底重开列表，会回到第 1 页）。
+
+    首选点 antd tab『OTA升级模板』——实测保持当前翻页位置，适合逐行遍历；点击异常/
+    tab 不在场时兜底调 _open_template_list（会重置回第 1 页，仅异常兜底用）。
+    """
+    try:
+        tab = page.locator(".ant-tabs-tab", has_text="OTA升级模板").first
+        if tab.count() > 0 and tab.is_visible():
+            tab.click()
+            page.wait_for_timeout(1000)
+            return "tab"
+    except Exception:
+        pass
+    _open_template_list(page)
+    return "reopen"
+
+
+def collect_rule_rows(page, row_idx: int, title: str, max_pages: int = 100) -> list[dict]:
+    """点模板列表第 row_idx 个数据行自己的「查看规则」进二级页，读全部规则行（含翻页累计）。只读。
+
+    按【行索引】点该行行内『查看规则』（_click_view_rules_by_row_index，不搜标题、不跨行匹配，
+    可区分重名标题），读当前页规则行后用 _goto_next_page 翻页累计，_shot 截图关键步骤。
+    读完由调用方 _return_to_template_list 返回列表。title 仅用于截图命名与点中行一致性校验。
+    """
+    clicked = _click_view_rules_by_row_index(page, row_idx)
+    if not clicked.get("ok"):
+        print(warn(f"未能在模板列表第 {row_idx} 行点开行内『查看规则』：{title!r}"
+                   f"（点中标题={clicked.get('title','')!r}，跳过该模板）。"))
         return []
+    clicked_title = str(clicked.get("title", "") or "").strip()
+    if clicked_title and title and clicked_title != title:
+        print(warn(f"第 {row_idx} 行点中标题 {clicked_title!r} 与预期 {title!r} 不符"
+                   f"（行索引口径漂移，跳过该模板）。"))
+        return []
+    page.wait_for_timeout(1500)
 
     rows: list[dict] = []
     seen: set[tuple] = set()
@@ -385,6 +464,7 @@ def run_backfill(page, args) -> dict:
         "replaced": 0,       # 作废替换（同身份键新 Rule ID）
         "voided": 0,         # VOID 作废落库
         "empty_rules": 0,    # 二级页读不到规则行、跳过
+        "void_empty": 0,     # VOID 批次且二级页空（规则已清空）、跳过（含在 empty_rules 内）
         "platforms": set(),  # 设备类型代码集合
         "rule_ids": set(),   # Rule ID 全集（去重）
     }
@@ -400,9 +480,11 @@ def run_backfill(page, args) -> dict:
         stats["scanned"] += len(rows)
 
         # 命中 owner 的目标行（先一次性读入内存再逐个进二级页，避免 DOM 丢上下文）。
+        # 每项记下该行在本页数据行里的【索引 i】（read_template_rows 返回顺序的下标），
+        # 逐行处理时用该索引点行内『查看规则』——与 _click_view_rules_by_row_index 同口径。
         targets: list[dict] = []
         all_before_since = len(rows) > 0
-        for row in rows:
+        for i, row in enumerate(rows):
             created = row.get("created", "")
             if not is_before_since(created, args.since):
                 all_before_since = False
@@ -411,23 +493,27 @@ def run_backfill(page, args) -> dict:
                 continue  # 其他创建人跳过
             if is_before_since(created, args.since):
                 continue  # 早于 since 的行跳过（整页都早则下方判停）
-            targets.append(row)
+            targets.append({"row": row, "idx": i})
 
         stats["owner_hits"] += len(targets)
 
-        for row in targets:
+        for item in targets:
             if args.limit is not None and stats["built"] >= args.limit:
                 print(warn(f"已达 --limit={args.limit}，停止抓取。"))
                 return stats
+            row = item["row"]
+            row_idx = item["idx"]
             title = str(row.get("title", "") or "").strip()
             remark = str(row.get("remark", "") or "")
-            print(color(f"  · 处理模板：{title!r}  备注={remark!r}  创建={row.get('created','')}", "dim"))
+            print(color(f"  · 处理模板[行{row_idx}]：{title!r}  备注={remark!r}  创建={row.get('created','')}", "dim"))
 
-            rule_rows = collect_rule_rows(page, title, max_pages=args.max_pages)
+            rule_rows = collect_rule_rows(page, row_idx, title, max_pages=args.max_pages)
             if not rule_rows:
                 stats["empty_rules"] += 1
-                # 读完二级页后重开列表，继续下一个 title。
-                _open_template_list(page)
+                if remark_has_void(remark):
+                    stats["void_empty"] += 1
+                # 读完二级页后返回列表（保持翻页位置），继续下一行。
+                _return_to_template_list(page)
                 continue
 
             rec = build_backfill_record(row, rule_rows, owner=args.owner)
@@ -461,8 +547,8 @@ def run_backfill(page, args) -> dict:
             else:
                 print(color("    （dry-run：未写库）", "dim"))
 
-            # 读完二级页后重开列表，继续下一个 title。
-            _open_template_list(page)
+            # 读完二级页后返回列表（保持翻页位置），继续下一行。
+            _return_to_template_list(page)
 
         # 截止判断：整页所有行都早于 since → 停止翻页（已进入更早历史）。
         if all_before_since:
@@ -489,7 +575,8 @@ def _print_summary(stats: dict, committed: bool) -> None:
               f"跳过重复：{stats['skipped_dup']}    "
               f"作废替换：{stats['replaced']}    "
               f"VOID 作废：{color(str(stats['voided']), 'red')}")
-    print(f"  二级页无规则跳过：{stats['empty_rules']}")
+    print(f"  二级页无规则跳过：{stats['empty_rules']}"
+          f"（其中 VOID 批次规则已清空：{stats.get('void_empty', 0)}）")
     platforms = sorted(stats["platforms"])
     rid_nums = sorted(int(x) for x in stats["rule_ids"] if x.isdigit())
     rid_span = f"{rid_nums[0]} ~ {rid_nums[-1]}" if rid_nums else "-"
