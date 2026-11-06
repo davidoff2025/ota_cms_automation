@@ -84,26 +84,49 @@ def _rule_id_range(rows):
     return rids[0], rids[-1]
 
 
-def _fmt_table(rows) -> str:
-    """把 rows 渲染成等宽对齐的文本表（中文按宽度 2 计算列宽）。"""
+def _wcwidth(s) -> int:
+    """按显示宽度计长度：CJK/全角字符记 2，其余记 1。"""
+    w = 0
+    for ch in str(s):
+        o = ord(ch)
+        # CJK 统一表意、全角标点、假名、全角符号等记 2 宽。
+        if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF or 0xAC00 <= o <= 0xD7A3
+                or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F
+                or 0xFF00 <= o <= 0xFF60 or 0xFFE0 <= o <= 0xFFE6
+                or 0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _pad(s, w):
+    return str(s) + " " * max(0, w - _wcwidth(s))
+
+
+def _box_table(rows) -> str:
+    """把 rows 渲染成 Unicode 方框线表格（表头着色、中文宽度对齐）。"""
     headers = [disp for disp, _ in _COLS]
-
-    def width(s):  # 粗略：非 ASCII 记 2 宽
-        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in str(s))
-
-    def pad(s, w):
-        return str(s) + " " * max(0, w - width(s))
-
-    colw = {h: width(h) for h in headers}
+    colw = {h: _wcwidth(h) for h in headers}
     for row in rows:
         for h in headers:
-            colw[h] = max(colw[h], width(row.get(h, "")))
+            colw[h] = max(colw[h], _wcwidth(row.get(h, "")))
 
-    sep = "  "
-    out = [sep.join(pad(h, colw[h]) for h in headers)]
-    out.append(sep.join("-" * colw[h] for h in headers))
+    def line(left, mid, right):
+        return left + mid.join("─" * (colw[h] + 2) for h in headers) + right
+
+    def cells(vals):
+        # 先用纯文本按显示宽度 pad 并拼好整行（对齐只基于纯文本，绝不把颜色码算进宽度）。
+        parts = [" " + _pad(vals.get(h, ""), colw[h]) + " " for h in headers]
+        return "│" + "│".join(parts) + "│"
+
+    out = [line("┌", "┬", "┐")]
+    # 表头整行拼好后再整体着色（一个 color 包裹整行，颜色码不参与任何对齐计算）。
+    out.append(color(cells({h: h for h in headers}), "bold"))
+    out.append(line("├", "┼", "┤"))
     for row in rows:
-        out.append(sep.join(pad(row.get(h, ""), colw[h]) for h in headers))
+        out.append(cells(row))
+    out.append(line("└", "┴", "┘"))
     return "\n".join(out)
 
 
@@ -116,14 +139,30 @@ def print_summary(xlsx_path: str) -> int:
     lo, hi = _rule_id_range(rows)
     rng = lo if lo == hi else f"{lo} ~ {hi}"
 
-    print(color("========== OTA 部署信息汇总 / OTA Deployment Summary ==========", "bold"))
+    # 标题框
+    title = "📦  OTA 部署信息汇总 / OTA Deployment Summary"
+    tw = _wcwidth(title)
+    print(color("╔" + "═" * (tw + 2) + "╗", "bold"))
+    print(color(f"║ {title} ║", "bold"))
+    print(color("╚" + "═" * (tw + 2) + "╝", "bold"))
+
+    # 概要行
     print(f"  设备类型代码：{color(device_code or '(未知)', 'bold')}"
-          f"   ·   部署规则总数：{color(str(len(rows)), 'bold')} 条"
-          f"   ·   Rule ID 范围：{color(rng, 'green')}")
+          f"    ·    部署规则总数：{color(str(len(rows)), 'bold')} 条"
+          f"    ·    Rule ID 范围：{color(rng, 'green')}")
     print("")
-    print(_fmt_table(rows))
+
+    # 明细表（方框线）
+    print(_box_table(rows))
     print("")
-    print(warn(f"灰度提醒：进行下一阶段灰度发布时，请提供本次的 Rule ID 信息。本次部署 Rule ID 范围：{rng}"))
+
+    # 灰度提醒（黄色，带边框更醒目）
+    tip = f"⚠ 灰度提醒：进行下一阶段灰度发布时，请提供本次的 Rule ID 信息。本次部署 Rule ID 范围：{rng}"
+    bw = _wcwidth(tip)
+    print(color("┌" + "─" * (bw + 2) + "┐", "yellow"))
+    print(color(f"│ {tip} │", "yellow"))
+    print(color("└" + "─" * (bw + 2) + "┘", "yellow"))
+
     print(ok(f"汇总完成（complete）：共 {len(rows)} 条规则。"))
     return 0
 

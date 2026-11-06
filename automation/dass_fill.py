@@ -915,6 +915,15 @@ def main() -> int:
                 _shot(page, "update_done")
                 print(color("\n✅ 更新完成（尚未验证、尚未提交）。", "green"))
 
+            # 更新 DASS 数据后自动显示 OTA 部署汇总（数据取自本次更新用的 Excel）。
+            # 仅当该 Excel 含 Rule ID 列时显示；没有则静默跳过（如 init 未回写 Rule ID）。
+            try:
+                from .summary import print_summary
+                print("")
+                print_summary(excel)
+            except Exception as e:
+                print(color(f"（部署汇总显示跳过：{e}）", "dim"))
+
             if config.HEADED:
                 print("\n======== 人工核对环节 ========")
                 print("请先在浏览器里逐行检查刚填入/更新的数据是否正确。")
