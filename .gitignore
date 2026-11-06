@@ -10,5 +10,7 @@ automation/otagen/data/outputs/
 automation/otagen/data/ota_message_templates.json
 automation/otagen/data/device_history.json
 
+# last Excel produced by `deployota prep` (per-machine state)
+.last_prep.json
 # editor
 .vscode/

@@ -53,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 上传 S3（三步一键）。",
     )
     p.add_argument("--file", dest="file", default=None,
-                   help="输入文件：.txt（升级信息文本）或 .xlsx/.xlsm（OTA 申请模板 Excel，直接解析）；"
+                   help="输入文件：.txt（升级信息文本）或 .xlsx/.xlsm（OTA 申请模板 Excel，直接解析；旧版 .xls 需先另存为 .xlsx）；"
                         "省略则从 stdin 读文本。")
     p.add_argument("--device-code", dest="device_code", default="",
                    help="设备类型代码（方案号）；非空时覆盖文本解析值。")
@@ -64,7 +64,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mac-group", dest="mac_group", default="",
                    help="MAC 组；非空时覆盖文本解析值。")
     p.add_argument("--out-dir", dest="out_dir", default=None,
-                   help="生成 Excel 的输出目录；省略则用 automation/otagen/data/outputs。")
+                   help="工作目录（生成 Excel 与去重索引的存放处）。省略时：给了 --file 则用该文件所在目录"
+                        "（相对路径也会先转成绝对路径），否则用 OTA_WORKSPACE。")
     p.add_argument("--no-upload", dest="no_upload", action="store_true", default=False,
                    help="只生成+校验并打印 S3 计划与 ftp zip 清单，绝不触碰 FTP/S3。")
     p.add_argument("--yes", "-y", dest="assume_yes", action="store_true", default=False,
@@ -247,12 +248,29 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
 def main() -> int:
     args = _build_parser().parse_args()
 
+    # 相对路径按「调用者所在目录」解析（deployota 会先 cd 到项目目录，不处理就会找不到文件）。
+    caller_cwd = os.environ.get("OTA_CALLER_CWD")
+    if caller_cwd:
+        if args.file:
+            args.file = os.path.join(caller_cwd, os.path.expanduser(args.file))
+        if args.out_dir:
+            args.out_dir = os.path.join(caller_cwd, os.path.expanduser(args.out_dir))
+
     # (1) 读取输入来源：.xlsx/.xlsm 直接按 Excel 解析；其余按文本（--file txt 或 stdin）。
     excel_input = False
     pasted_override = None
     if args.file:
         if not os.path.isfile(args.file):
             print(f"✗ 找不到 --file 指定的文件：{args.file}", file=sys.stderr)
+            return 2
+        base = os.path.basename(args.file)
+        if base.startswith("~$"):
+            print(_err(f"{base} 是 Excel 打开时产生的临时锁文件，不是真正的表格；请指定原文件。"),
+                  file=sys.stderr)
+            return 2
+        if args.file.lower().endswith((".xls", ".xlsb")):
+            print(_err(f"不支持旧版 Excel 格式（{os.path.splitext(args.file)[1]}）。"
+                       "请在 Excel 里另存为 .xlsx 后再用 --file 传入。"), file=sys.stderr)
             return 2
         excel_input = _is_excel_input(args.file)
         if excel_input:
@@ -400,6 +418,9 @@ def main() -> int:
             print(_c("  - " + prob, "red"), file=sys.stderr)
         return 1
     print(_ok("严格校验通过（sheet / 18 列表头 / 每行地址与 OTA 类型 / 设备字段 均合格）。"))
+    # 记下这份 Excel：后续 upload / online / dass 不给文件时默认接着用它。
+    from . import last_prep
+    last_prep.save(output_path)
 
     # (4) 步骤3 上传（或 --no-upload 计划）。
     urls = eng.extract_ftp_zip_urls(sj)

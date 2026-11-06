@@ -13,6 +13,8 @@
 # 本脚本只做分发，不改动各模块；旧入口 run_prep.sh / run_active_ota.sh /
 # run_dass.sh / run_login.sh 仍可用，二者并存。
 set -euo pipefail
+# 记下调用者所在目录：下面会 cd 到项目目录，相对路径参数（如 prep --file）要按它解析。
+export OTA_CALLER_CWD="$PWD"
 cd "$(dirname "$0")"
 
 PY="./.venv/bin/python"

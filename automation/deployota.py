@@ -40,6 +40,46 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
 
 _PROG = "deployota"
 
+# 需要 Excel 的子命令：命令行没给 Excel 时，默认用 prep 最近一次生成的那份。
+_EXCEL_SUBCOMMANDS = ("upload", "online", "dass")
+_EXCEL_EXTS = (".xlsx", ".xlsm")
+
+
+def _resolve_excel_args(rest: list[str]) -> list[str] | None:
+    """处理 upload/online/dass 的 Excel 参数；失败返回 None（已打印原因）。
+
+    - 命令行里已有 .xlsx/.xlsm 参数：相对路径按调用者所在目录（OTA_CALLER_CWD）转成绝对路径。
+    - 没有：取 prep 最近一次生成的 Excel 追加进去；找不到记录或文件已不在则报错，不猜。
+    - 带 -h/--help/--selftest 时原样转发，不注入。
+    """
+    import os
+    if any(a in ("-h", "--help", "--selftest") for a in rest):
+        return rest
+    base = os.environ.get("OTA_CALLER_CWD") or os.getcwd()
+    out, has_excel = [], False
+    for a in rest:
+        if not a.startswith("-") and a.lower().endswith(_EXCEL_EXTS):
+            has_excel = True
+            a = os.path.join(base, os.path.expanduser(a))
+        out.append(a)
+    if has_excel:
+        return out
+    from . import last_prep
+    rec = last_prep.load()
+    if not rec:
+        print("✗ 没有指定 Excel，也没有 prep 的生成记录。请先运行 ./deployota prep，或在命令里给出 Excel 路径。",
+              file=sys.stderr)
+        return None
+    path = rec["excel"]
+    if not os.path.isfile(path):
+        print(f"✗ prep 最近生成的 Excel 已不存在：{path}\n  请重新运行 prep，或在命令里给出 Excel 路径。",
+              file=sys.stderr)
+        return None
+    print(f"\033[32m✓ 未指定 Excel，使用 prep 最近生成的文件（{rec.get('time', '')}）：\033[0m\n  {path}"
+          if sys.stdout.isatty() and not os.environ.get("NO_COLOR") else
+          f"✓ 未指定 Excel，使用 prep 最近生成的文件（{rec.get('time', '')}）：\n  {path}")
+    return out + [path]
+
 
 def _usage() -> str:
     lines = [
@@ -58,11 +98,14 @@ def _usage() -> str:
         "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
         "  backfill CMS 部署历史回补（只读抓取 OTA升级模板 → 去重合并入库；默认 dry-run，--commit 才写）",
         "",
+        "upload / online / dass 不给 Excel 时，默认使用 prep 最近一次生成的那份（记录在 .last_prep.json）。",
+        "",
         "示例：",
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
-        "  ./deployota upload /路径/更新后的.xlsx",
-        "  ./deployota online /路径/更新后的.xlsx",
-        "  ./deployota dass ota200 /路径/更新后的.xlsx",
+        "  ./deployota upload                    # 用 prep 刚生成的 Excel",
+        "  ./deployota online                    # 同上（upload 已把 Rule ID 回写到这份 Excel）",
+        "  ./deployota dass ota200               # 同上",
+        "  ./deployota upload /路径/更新后的.xlsx   # 也可显式指定",
     ]
     return "\n".join(lines)
 
@@ -80,7 +123,12 @@ def main() -> int:
         return 2
 
     module, prefix = _SUBCOMMANDS[sub]
-    forwarded = prefix + argv[1:]
+    rest = argv[1:]
+    if sub in _EXCEL_SUBCOMMANDS:
+        rest = _resolve_excel_args(rest)
+        if rest is None:
+            return 2
+    forwarded = prefix + rest
 
     # 以“被转发模块作为 __main__”运行：等价于 python -m <module> <forwarded>，
     # 该模块的 if __name__ == "__main__" 守卫（含 --selftest/ main()）照常生效。
