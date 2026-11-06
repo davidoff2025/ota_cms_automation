@@ -34,6 +34,14 @@ def _bool(name: str, default: bool) -> bool:
 HOST = os.getenv("OTA_HOST", "127.0.0.1")          # AWS: 0.0.0.0
 PORT = int(os.getenv("OTA_PORT", "8000"))
 
+# --- OTA 工作目录 ---------------------------------------------------------
+# 统一的 OTA 工作环境根目录：生成的 Excel（prep 未显式指定 --out-dir 且未用 --file 时）、
+# 部署数据库(OTADATA) 等默认都落在这里。可用环境变量 OTA_WORKSPACE 或 config/.env 覆盖。
+WORKSPACE = os.getenv(
+    "OTA_WORKSPACE",
+    "/Users/devinwang/Documents/海信运维交接/OTA升级部署",
+)
+
 # --- Storage -------------------------------------------------------------
 # Where generated Excel files and run artifacts live. Local: ./data. On AWS,
 # point this at an EFS mount, or set OTA_STORAGE_BACKEND=s3 to use a bucket.

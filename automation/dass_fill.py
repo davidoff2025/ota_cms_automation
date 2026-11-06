@@ -37,6 +37,7 @@ OPTION 取值（直接写关键字，不加 --update 前缀）：
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -927,7 +928,8 @@ def main() -> int:
             # 并把本次部署写入永久存储（JSONL + CSV，幂等：同键已存在则不重复写）。
             try:
                 from .depdb import record_deployment_from_excel
-                wrote, msg = record_deployment_from_excel(excel)
+                owner = os.environ.get("OTA_OWNER", "").strip()
+                wrote, msg = record_deployment_from_excel(excel, owner=owner)
                 print(color(("✓ " if wrote else "· ") + msg, "green" if wrote else "dim"))
             except Exception as e:
                 print(color(f"（部署记录写入跳过：{e}）", "dim"))

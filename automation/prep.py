@@ -281,7 +281,7 @@ def main() -> int:
     print(_c("—— 解析结果概览 ——", "bold"))
     print(f"  数据行数：{parsed_rows}")
 
-    # 输出目录优先级：--out-dir > 输入 .txt 所在目录（--file 时）> 项目内 otagen/data/outputs。
+    # 输出目录优先级：--out-dir > 输入 .txt 所在目录（--file 时）> OTA 工作目录 OTA_WORKSPACE。
     if args.out_dir:
         out_dir = args.out_dir
     elif args.file:
@@ -289,7 +289,7 @@ def main() -> int:
         out_dir = os.path.dirname(os.path.abspath(args.file))
     else:
         from .otagen import config as otagen_config
-        out_dir = str(otagen_config.DATA_DIR / "outputs")
+        out_dir = otagen_config.WORKSPACE
 
     # (2) 步骤1 生成（内容指纹去重：同一 source 内容已在该目录生成过则复用，不重复生成）。
     print(_c("—— 步骤1：生成 Excel ——", "bold"))
