@@ -924,6 +924,14 @@ def main() -> int:
             except Exception as e:
                 print(color(f"（部署汇总显示跳过：{e}）", "dim"))
 
+            # 并把本次部署写入永久存储（JSONL + CSV，幂等：同键已存在则不重复写）。
+            try:
+                from .depdb import record_deployment_from_excel
+                wrote, msg = record_deployment_from_excel(excel)
+                print(color(("✓ " if wrote else "· ") + msg, "green" if wrote else "dim"))
+            except Exception as e:
+                print(color(f"（部署记录写入跳过：{e}）", "dim"))
+
             if config.HEADED:
                 print("\n======== 人工核对环节 ========")
                 print("请先在浏览器里逐行检查刚填入/更新的数据是否正确。")

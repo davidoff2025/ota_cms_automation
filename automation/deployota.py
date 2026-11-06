@@ -34,6 +34,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "upload": ("automation.active_ota", ["collect"]),
     "online": ("automation.active_ota", ["online"]),
     "dass":   ("automation.dass_fill",  []),
+    "history": ("automation.depdb",     []),
 }
 
 _PROG = "deployota"
@@ -52,7 +53,8 @@ def _usage() -> str:
         "  prep     生成 Excel → 严格校验 → 上传 S3（上传后 boto3 回查确认）",
         "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
         "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
-        "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示部署汇总）",
+        "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
+        "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
         "",
         "示例：",
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
