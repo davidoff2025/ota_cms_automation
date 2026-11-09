@@ -420,9 +420,28 @@ def _selected_table(modal):
     return modal.locator(".vxe-table").first
 
 
+def _pending_rule_id_box(modal):
+    """待选区『规则ID』输入框 = 弹窗内【第 2 个】input#ruleId（DOM 顺序：已选区在前、待选区在后）。
+
+    ★ 实跑校正（2026-11-09 截图）：已选区的搜索表单同样带 `form.ant-form-inline`，
+      原来的 `modal.locator("form.ant-form-inline").first` 实际取到了【已选区】表单，
+      导致上线时把 Rule ID 填进已选区、待选区始终没过滤（搜出 0 行或碰巧在首页才找到）。
+    少于 2 个 #ruleId 时抛 RuntimeError，宁可失败也不填错区。
+    """
+    boxes = modal.locator("input#ruleId")
+    n = boxes.count()
+    if n < 2:
+        raise RuntimeError(f"弹窗内只找到 {n} 个 #ruleId，无法确认待选区输入框（期望 2 个）。")
+    return boxes.nth(1)
+
+
 def _pending_form(modal):
-    """待选规则搜索表单 = 弹窗内 form.ant-form-inline（findings §8.1 block 2）。"""
-    return modal.locator("form.ant-form-inline").first
+    """待选规则搜索表单 = 待选区 #ruleId 输入框所在的 form（取不到 form 时取最近含按钮的祖先）。"""
+    box = _pending_rule_id_box(modal)
+    form = box.locator("xpath=ancestor::form[1]")
+    if form.count():
+        return form.first
+    return box.locator("xpath=ancestor::*[.//button][1]").first
 
 
 def _search_pending_zone(modal, page, rule_id: str) -> bool:
@@ -432,9 +451,15 @@ def _search_pending_zone(modal, page, rule_id: str) -> bool:
     搜索按钮文本无全角空格。先锚待选表单再取 #ruleId，避免与已选区同名控件混淆。
     （设备类型不在此设置——它已在进页面时于已选区设过一次。）
     """
-    form = _pending_form(modal)
-    form.locator("input#ruleId").first.fill(norm_ruleid(rule_id))
-    return _click_button_in(form, page, "搜索", "待选规则-搜索")
+    box = _pending_rule_id_box(modal)
+    want = norm_ruleid(rule_id)
+    box.fill(want)
+    # 填完核对：输入框里确实是目标号，且已选区（第 1 个 #ruleId）没被动过，才继续。
+    if (box.input_value() or "").strip() != want:
+        print(color(f"  ✗ 待选区『规则ID』框填入后值不符（期望 {want!r}）。", "red"))
+        return False
+    print(f"  ✓ 已在待选区『规则ID』框输入 {want!r}")
+    return _click_button_in(_pending_form(modal), page, "搜索", "待选规则-搜索")
 
 
 def _set_device_type_once(page, modal, device_code: str) -> bool:
@@ -1009,8 +1034,16 @@ def _search_pending_rule(page, modal, rule_id: str) -> bool:
     搜不到/异常返回 False（findings §8.1/8.2）。
     """
     try:
-        _search_pending_zone(modal, page, rule_id)
-        page.wait_for_timeout(1200)
+        if not _search_pending_zone(modal, page, rule_id):
+            return False
+        # 等待选表刷新出目标 Rule ID 那一行（最多约 8 秒；旧结果的行不算）。
+        # 等不到就照常返回，由上线 gate 按实际行数报错。
+        table = _pending_table(modal)
+        for _ in range(40):
+            page.wait_for_timeout(200)
+            if _find_pending_row_by_ruleid(table, rule_id) >= 0:
+                break
+        page.wait_for_timeout(300)
         return True
     except Exception as e:
         print(f"  ✗ 待选规则搜索 {rule_id!r} 失败：{e}")
@@ -1183,13 +1216,21 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
             results.append(res)
             continue
         if not _click_online(page, modal, rid):
-            res["note"] = "上线按钮 gate 未满足"
-            results.append(res)
-            continue
-        if not _confirm_online(page):
-            res["note"] = "上线确认框 gate 未满足"
-            results.append(res)
-            continue
+            # 点『上线』没成功时，可能其实已弹出「规则替换」冲突窗（挡住了表格）：有就走冲突替换，
+            # 没有才记失败；失败时留一张截图方便定位。
+            page.wait_for_timeout(800)
+            if not _conflict_modal_present(page):
+                _shot(page, f"active_gate_fail_{rid}")
+                res["note"] = "上线按钮 gate 未满足"
+                results.append(res)
+                continue
+        elif not _confirm_online(page):
+            page.wait_for_timeout(800)
+            if not _conflict_modal_present(page):
+                _shot(page, f"active_gate_fail_{rid}")
+                res["note"] = "上线确认框 gate 未满足"
+                results.append(res)
+                continue
 
         page.wait_for_timeout(1500)
         if _conflict_modal_present(page):
@@ -1210,6 +1251,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 results.append(res)
                 continue
 
+            # 判定原则：查被冲突 Rule ID 的 mac组；非空 → 直接替换；为空 → 中止该条。
             mac_text = _read_mac_group(page, modal, conflict_rid)
             if mac_text is None:
                 print(color(f"  ⚠ mac组 读取不确定，保守中止该条（点取消）。被冲突号={conflict_rid!r}", "yellow"))
@@ -1221,7 +1263,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 continue
 
             if mac_group_is_bound(mac_text):
-                print(color(f"  mac组 非空（{mac_text!r}）→ 回弹窗点『确定』替换上线。", "green"))
+                print(color(f"  被冲突号 {conflict_rid} 的 mac组 非空（{mac_text!r}）→ 回弹窗点『确定』替换上线。", "green"))
                 if _click_replace_confirm(page):
                     page.wait_for_timeout(1500)
                     res["status"] = STATUS_ONLINE
@@ -1231,7 +1273,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 res["mac_group_bound"] = True
                 results.append(res)
             else:
-                print(color(f"  mac组 为空（{mac_text!r}）→ 点『取消』中止该条并记录。", "red"))
+                print(color(f"  被冲突号 {conflict_rid} 的 mac组 为空（{mac_text!r}）→ 点『取消』中止该条并记录。", "red"))
                 _click_replace_cancel(page)
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
