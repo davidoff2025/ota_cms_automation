@@ -904,8 +904,10 @@ def main() -> int:
                 print(color("✗ 未找到填报表 frame", "red"))
                 return 1
 
+            fill_ok = True  # init 有行没填成功时置 False，最终以退出码 3 告知上层（publish 检查点4 据此判断）
             if option == "init":
                 ok_all = run_init(fr, page, records)
+                fill_ok = bool(ok_all)
                 _shot(page, "fill_done")
                 if ok_all:
                     print(color("\n✅ 填写完成（尚未验证、尚未提交）。", "green"))
@@ -962,7 +964,7 @@ def main() -> int:
                         time.sleep(30)
             else:
                 print("非可见模式（HEADED=0），不进行交互提交；请人工核对后提交。")
-            return 0
+            return 0 if fill_ok else 3
         except Exception as e:
             print(color(f"✗ 出错：{e}", "red"))
             _shot(page, "fill_error")

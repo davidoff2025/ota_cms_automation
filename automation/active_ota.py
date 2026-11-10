@@ -1488,11 +1488,12 @@ def probe_online(page) -> None:
 # ======================================================================
 
 _HELP_TEXT = """\
-active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续再 consolidate）。
+active_ota —— CMS OTA 规则。collect / online 可单独用，publish 把两步合并并设检查点。
 
 用法：
   ./run_active_ota.sh collect [EXCEL]      # 导入模板建规则 + 收集本批 Rule ID
   ./run_active_ota.sh online  [EXCEL]      # 从 Excel 读 Rule ID → 逐条上线 + 冲突 + 汇总
+  ./run_active_ota.sh publish [EXCEL]      # collect + online + dass init 合并，4 个检查点，任一失败醒目提醒
   ./run_active_ota.sh --probe-online       # 只读 dump 编排视图选择器
   ./run_active_ota.sh --selftest           # 纯逻辑自测（不连浏览器）
   ./.venv/bin/python -m automation.active_ota <同上>
@@ -1502,6 +1503,12 @@ active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续
                    「查看规则」读『规则ID』列，升序打印本批 Rule ID（数量应 = Excel 去表头行数）。【写线上数据：导入】
   online  [EXCEL]  连 CMS：从 Excel 的【Rule ID】列读本批 Rule ID → 在「升级事件 → 规则上下线」
                    编排弹窗逐条上线 + 处理「规则替换」冲突 → 回读状态汇总。【写线上数据：上线/替换】
+  publish [EXCEL] [--no-dass]
+                   collect + online + dass init 合并执行，4 个检查点（--no-dass 则只前 3 个）：
+                   ①导入上传成功 ②得到 Rule ID（数量==Excel行数，回写并回读一致）③全部上线成功
+                   ④DASS init 填报完成（上线全部成功后才跑；填写后仍需你在终端人工核对、输入 approve 才提交）。
+                   任一检查点失败：红色醒目提醒（原因+下一步）、后续步骤不执行、退出码 11/12/13。
+                   Excel 已含 Rule ID（说明导入过）时拒绝重复导入。【写线上数据：导入+上线/替换】
   --probe-online   连 CMS，只读 dump「规则上下线编排」视图的选择器，不做任何写操作。【只读/安全】
   --selftest       纯逻辑自测（名称/备注拼接、冲突号解析、mac组判定、汇总），不连浏览器。【离线/安全】
   -h, --help       显示本帮助并退出。
@@ -1517,7 +1524,8 @@ active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续
   冲突「规则替换」：解析被冲突 Rule ID → 去「已选规则」查其 mac组，非空才点「确定」替换上线，
          mac组为空则点「取消」中止该条并记录。上线全自动，不加人工确认。
 
-退出码：0 全部成功；2 缺子命令/无 Rule ID/存在冲突中止或未上线；1 运行出错。
+退出码：0 全部成功；2 缺子命令/无 Rule ID/存在冲突中止或未上线/publish 前置检查不通过；1 运行出错；
+         publish 检查点失败：11=导入 12=Rule ID 13=上线 14=DASS init。
 
 环境：
   CMS_USERNAME / CMS_PASSWORD   在 config/.env 配置（run_active_ota.sh 会检查）。
@@ -1528,13 +1536,197 @@ active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续
   所有写按钮（导入确定/上线确定/替换确定）均经二次确认 gate，条件不满足只打印不点。"""
 
 
-_SUBCOMMANDS = ("collect", "online")
+# —— publish：导入(upload) + 上线(online) 合并，三个检查点逐一把关 ——
+CP_NAMES = {1: "导入上传成功", 2: "得到 Rule ID", 3: "上线成功", 4: "DASS init 填报完成"}
+# 退出码：检查点 n 失败 → 10+n；前置检查不通过 → 2。
+EXIT_CP_FAIL = {1: 11, 2: 12, 3: 13, 4: 14}
+
+
+def format_checkpoint_report(cps: list[dict]) -> str:
+    """把三个检查点的结果排成可检索的报告（纯逻辑）。
+
+    cps 每项：{"n": 1|2|3, "status": "pass"|"fail"|"skip", "detail": str}。
+    全部 pass → 末行绿色『全部检查点通过』；有 fail → 末行红色『发布未完成』并点出第一个失败的检查点。
+    """
+    lines = ["======== publish 检查点报告 ========"]
+    first_fail = None
+    for cp in cps:
+        n, st, detail = cp["n"], cp["status"], cp.get("detail", "")
+        title = f"检查点{n} {CP_NAMES[n]}"
+        if st == "pass":
+            lines.append(color(f"  ✓ {title}", "green") + (f"：{detail}" if detail else ""))
+        elif st == "fail":
+            lines.append(color(f"  ✗ {title}：失败", "red") + (f" —— {detail}" if detail else ""))
+            if first_fail is None:
+                first_fail = n
+        else:
+            lines.append(color(f"  - {title}：未执行", "yellow") + (f"（{detail}）" if detail else ""))
+    if first_fail is None and all(c["status"] == "pass" for c in cps):
+        done = "已导入、拿到 Rule ID、全部上线成功" + ("、DASS init 已填报" if len(cps) >= 4 else "")
+        lines.append(color(f"  ★ 全部检查点通过：{done}。", "green"))
+    else:
+        lines.append(color(f"  ✗ 发布未完成：卡在检查点{first_fail or '?'}（{CP_NAMES.get(first_fail, '')}）。"
+                           "请按上面的提示处理，处理前不要直接重跑。", "red"))
+    return "\n".join(lines)
+
+
+def _cp_alert(n: int, reason: str, hints: list[str]) -> None:
+    """检查点失败时的醒目提醒：红色框 + 原因 + 下一步建议。"""
+    bar = "!" * 64
+    print("\n" + color(bar, "red"))
+    print(color(f"!! 检查点{n}【{CP_NAMES[n]}】失败", "red"))
+    print(color(f"!! 原因：{reason}", "red"))
+    for h in hints:
+        print(color(f"!! 建议：{h}", "red"))
+    print(color(bar, "red") + "\n")
+
+
+def _run_dass_init(excel: str) -> int:
+    """在子进程里跑 `dass_fill init <excel>`（它自己起浏览器；子进程继承终端，人工核对/批复照常交互）。"""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    return subprocess.run([sys.executable, "-m", "automation.dass_fill", "init", excel], cwd=str(root)).returncode
+
+
+def run_publish(page, excel: str, with_dass: bool = True) -> int:
+    """导入(upload) + 上线(online) + DASS init 合并执行，四个检查点（with_dass=False 则只前三个）：
+      1) 导入上传成功   —— 导入向导走完且无 UI 错误，模板在『OTA升级模板』列表里找到；
+      2) 得到 Rule ID   —— 回收到的 Rule ID 数 == Excel 数据行数，并成功回写、回读一致；
+      3) 上线成功       —— 全部 Rule ID 回读为已上线，无失败/冲突中止。
+      4) DASS init 填报完成 —— 上线全部成功后，用同一份 Excel 跑 dass init（填写后仍要你在终端人工核对、
+                          输入 approve 才提交）；退出码 0 才算通过，部分行没填成功(3)/出错都算失败。
+    任一检查点失败：立刻红色醒目提醒（原因+下一步），后面的步骤不再执行，返回 10+n。
+    返回 0 全部通过；2 前置检查不通过（未动 CMS）。
+    """
+    steps = (1, 2, 3, 4) if with_dass else (1, 2, 3)
+    cps = [{"n": n, "status": "skip", "detail": "前一步未通过，未执行"} for n in steps]
+
+    def finish(code: int) -> int:
+        print("\n" + format_checkpoint_report(cps))
+        if config.HEADED:
+            print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
+            time.sleep(20)
+        return code
+
+    def fail(n: int, reason: str, hints: list[str], shot: str | None = None) -> int:
+        cps[n - 1].update(status="fail", detail=reason)
+        _cp_alert(n, reason, hints)
+        if shot:
+            _shot(page, shot)
+        return finish(EXIT_CP_FAIL[n])
+
+    # —— 前置检查（不动 CMS）——
+    info = read_import_excel(excel)
+    count = info["count"]
+    if count == 0:
+        print(color("✗ [publish] 导入 Excel 没有数据行，终止（未动 CMS）。", "red"))
+        return 2
+    if any(info.get("rule_ids", [])):
+        print(color("✗ [publish] 这份 Excel 已经含有 Rule ID，说明之前已导入过；再导入会触发 CMS "
+                    "『目标版本已经存在』。终止（未动 CMS）。", "red"))
+        print(color("  只需要上线请用：./deployota online   需要重新导入请先确认 CMS 上的旧模板已处理。", "red"))
+        return 2
+    try:
+        device_code, target_versions = validate_import_target(info["device_codes"], info["target_versions"])
+    except ValueError as e:
+        print(color(f"✗ [publish] {e}（未动 CMS）", "red"))
+        return 2
+    name = build_rule_name(device_code, target_versions)
+    print(f"[publish] Excel：{excel}\n[publish] 设备类型代码={device_code!r}  模板名称={name!r}  数据行数={count}")
+
+    # —— 检查点1：导入上传成功 ——
+    print(color("\n▶ 检查点1：导入模板（upload）", "bold"))
+    try:
+        rule_ids, name, remark = run_import(page, excel)
+    except Exception as e:
+        return fail(1, str(e), [
+            f"到 CMS『OTA升级模板』列表核对标题 {name!r} 是否已经创建。",
+            "已创建就不要直接重跑（会报『目标版本已经存在』）：先处理掉旧模板，或手工取 Rule ID 填回 Excel 后用 ./deployota online。",
+            "未创建：按上面的错误原文修正 Excel 后重跑 ./deployota publish。",
+        ], "publish_cp1_fail")
+    cps[0].update(status="pass", detail=f"模板 {name!r} 已导入（备注 {remark!r}）")
+    print(color(f"✓ 检查点1 通过：模板 {name!r} 已导入。", "green"))
+
+    # —— 检查点2：得到 Rule ID ——
+    print(color("\n▶ 检查点2：核对 Rule ID 并回写 Excel", "bold"))
+    if not rule_ids:
+        return fail(2, "导入后未回收到任何 Rule ID。", [
+            f"模板 {name!r} 很可能已在 CMS 创建，请去『OTA升级模板→查看规则』确认。",
+            "不要重跑 publish；确认规则存在后，把 Rule ID 填进 Excel 的『Rule ID』列再用 ./deployota online。",
+        ], "publish_cp2_fail")
+    if len(rule_ids) != count:
+        return fail(2, f"回收到 {len(rule_ids)} 个 Rule ID，但 Excel 有 {count} 行数据（{rule_ids}）。", [
+            f"到 CMS 核对模板 {name!r} 的规则数量；数量对不上时不能自动上线，以免漏传或误传。",
+            "核对无误后，把 Rule ID 填进 Excel 再用 ./deployota online。",
+        ], "publish_cp2_fail")
+    try:
+        n_written = write_rule_id_columns(excel, rule_ids)
+        back = sorted((r for r in read_import_excel(excel).get("rule_ids", []) if r),
+                      key=lambda x: int(x) if x.isdigit() else 0)
+    except Exception as e:
+        return fail(2, f"Rule ID 回写 Excel 失败：{e}", [
+            f"规则已在 CMS 创建（{rule_ids}），请手工填入 Excel 的『Rule ID』列后用 ./deployota online。",
+        ], "publish_cp2_fail")
+    if back != sorted(rule_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        return fail(2, f"回写后回读 Excel 的 Rule ID 与回收结果不一致：写入 {rule_ids}，读回 {back}。", [
+            "请打开 Excel 核对『Rule ID』列后再用 ./deployota online。",
+        ], "publish_cp2_fail")
+    cps[1].update(status="pass", detail=f"{len(rule_ids)} 个（{rule_ids[0]}~{rule_ids[-1]}），已回写 Excel {n_written} 行并回读一致")
+    print(color(f"✓ 检查点2 通过：{len(rule_ids)} 个 Rule ID，已回写 Excel。", "green"))
+
+    # —— 检查点3：上线成功 ——
+    print(color("\n▶ 检查点3：逐条上线（online）", "bold"))
+    try:
+        results = run_online(page, rule_ids, device_code)
+        final = read_final_status(page, rule_ids, results)
+    except Exception as e:
+        return fail(3, f"上线过程出错：{e}", [
+            "Rule ID 已在 Excel 里。先到 CMS『规则上下线编排』核对哪些已上线，再用 ./deployota online 重跑（已上线的会自动跳过）。",
+        ], "publish_cp3_fail")
+    print("\n" + summarize(final))
+    bad = [r for r in final if r.get("status") != STATUS_ONLINE]
+    if bad:
+        detail = "；".join(
+            f"{r['ruleid']}={'冲突中止' if r.get('status') == STATUS_CONFLICT_ABORT else '失败'}"
+            + (f"（{r['note']}）" if r.get("note") else "")
+            for r in bad)
+        return fail(3, f"{len(bad)}/{len(final)} 条未上线：{detail}", [
+            "未上线的 Rule ID 见上方汇总；冲突中止 = 被冲突规则的 mac 组为空或无法确认，需人工处理。",
+            "处理完后用 ./deployota online 重跑（已上线的会自动跳过）。",
+        ], "publish_cp3_fail")
+    cps[2].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
+    print(color(f"✓ 检查点3 通过：{len(final)} 条 Rule ID 全部上线。", "green"))
+    if not with_dass:
+        return finish(0)
+
+    # —— 检查点4：DASS init 填报 ——
+    print(color("\n▶ 检查点4：DASS init 填报（填写后需你在终端人工核对并输入 approve 才提交）", "bold"))
+    try:
+        rc = _run_dass_init(excel)
+    except Exception as e:
+        return fail(4, f"无法启动 DASS 填报：{e}", [
+            "CMS 导入和上线都已完成，不要重跑 publish。单独跑：./deployota dass init",
+        ])
+    redo = "CMS 导入和上线都已完成，不要重跑 publish。排查后单独跑：./deployota dass init"
+    if rc == 3:
+        return fail(4, "DASS init 有行没填成功（退出码 3）。", [
+            "见上方 dass 日志里标 ⚠ 的行；到 DASS 填报页核对，补填或删掉多插的行。", redo])
+    if rc != 0:
+        return fail(4, f"DASS init 异常退出（退出码 {rc}）。", [
+            "见上方 dass 日志里的错误原文与 artifacts/ 里的截图。", redo])
+    cps[3].update(status="pass", detail=f"{len(final)} 条已填入 DASS（提交与否以你在终端的 approve 为准）")
+    print(color("✓ 检查点4 通过：DASS init 已填写完成。", "green"))
+    return finish(0)
+
+
+_SUBCOMMANDS = ("collect", "online", "publish")
 
 
 def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     """解析子命令 + 可选 Excel 路径。
 
-    返回 (mode, excel)。mode ∈ {"collect", "online", "probe"}。
+    返回 (mode, excel)。mode ∈ {"collect", "online", "publish", "probe"}。
+      publish [EXCEL]   collect + online 合并，3 个检查点。
       collect [EXCEL]   导入模板建规则 + 收集本批 Rule ID（升序打印）。
       online  [EXCEL]   从 Excel 的『Rule ID』列读本批 Rule ID → 逐条上线 + 冲突 + 汇总。
       --probe-online    只读 dump 编排视图选择器。
@@ -1548,8 +1740,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"
-        elif arg == "--selftest":
-            continue  # 在 __main__ 处理
+        elif arg in ("--selftest", "--no-dass"):
+            continue  # --selftest 在 __main__ 处理；--no-dass 在 main 里读（只对 publish 生效）
         elif arg in _SUBCOMMANDS:
             if mode is not None:
                 print(f"✗ 只能指定一个子命令，已有 {mode!r} 又遇到 {arg!r}。")
@@ -1565,7 +1757,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             raise SystemExit(2)
 
     if mode is None:
-        print("✗ 缺少子命令。用法：collect [EXCEL] | online [EXCEL] | --probe-online。详见 -h。")
+        print("✗ 缺少子命令。用法：collect [EXCEL] | online [EXCEL] | publish [EXCEL] | --probe-online。详见 -h。")
         raise SystemExit(2)
     return mode, excel
 
@@ -1657,6 +1849,10 @@ def main() -> int:
                     time.sleep(20)
                 return summary_exit_code(final)
 
+            # —— 子命令 publish：导入 + 取 Rule ID + 上线，三个检查点 ——
+            if mode == "publish":
+                return run_publish(page, excel, with_dass="--no-dass" not in sys.argv[1:])
+
             print(color(f"✗ 未知模式：{mode!r}", "red"))
             return 2
         except Exception as e:
@@ -1722,6 +1918,16 @@ def _selftest() -> int:
         raised_empty = True
     check("D3 空设备类型代码报错（大小!=1）", raised_empty)
 
+    # —— publish：检查点报告 ——
+    rep_ok = format_checkpoint_report([{"n": n, "status": "pass", "detail": "x"} for n in (1, 2, 3)])
+    check("publish 全通过含『全部检查点通过』", "全部检查点通过" in rep_ok and "✗" not in rep_ok)
+    rep_bad = format_checkpoint_report([
+        {"n": 1, "status": "pass"}, {"n": 2, "status": "fail", "detail": "数量不符"}, {"n": 3, "status": "skip"}])
+    check("publish 失败报告点出检查点2且后续未执行",
+          "卡在检查点2" in rep_bad and "检查点3 上线成功：未执行" in rep_bad and "数量不符" in rep_bad)
+    check("publish 退出码 11/12/13/14", EXIT_CP_FAIL == {1: 11, 2: 12, 3: 13, 4: 14})
+    check("publish 四项全通过文案含 DASS",
+          "DASS init 已填报" in format_checkpoint_report([{"n": n, "status": "pass"} for n in (1, 2, 3, 4)]))
     # —— D7：冲突号解析 ——
     check("D7 解析『和 65246 冲突』-> 65246",
           parse_conflict_ruleid("当前规则和 65246 冲突,是否替换?") == "65246")

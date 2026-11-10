@@ -8,6 +8,7 @@ run_dass.sh / run_login.sh）与本命令【并存】。
 子命令映射：
   prep    -> automation.prep            生成 Excel → 严格校验 → 上传 S3（上传后 boto3 校验）
   upload  -> automation.active_ota collect   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel
+  publish -> automation.active_ota publish   upload + online + dass init 合并，4 个检查点
   online  -> automation.active_ota online    在「规则上下线编排」逐条上线 + 冲突处理
   dass    -> automation.dass_fill       DASS 填报/更新（OPTION: init/ota200/.../ota-all，含成功率闸门）
 
@@ -33,6 +34,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "prep":   ("automation.prep",       []),
     "upload": ("automation.active_ota", ["collect"]),
     "online": ("automation.active_ota", ["online"]),
+    "publish": ("automation.active_ota", ["publish"]),
     "dass":   ("automation.dass_fill",  []),
     "history": ("automation.depdb",     []),
     "backfill": ("automation.depdb_backfill", []),
@@ -41,7 +43,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
 _PROG = "deployota"
 
 # 需要 Excel 的子命令：命令行没给 Excel 时，默认用 prep 最近一次生成的那份。
-_EXCEL_SUBCOMMANDS = ("upload", "online", "dass")
+_EXCEL_SUBCOMMANDS = ("upload", "online", "publish", "dass")
 _EXCEL_EXTS = (".xlsx", ".xlsm")
 
 
@@ -94,16 +96,18 @@ def _usage() -> str:
         "  prep     生成 Excel → 严格校验 → 上传 S3（上传后 boto3 回查确认）",
         "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
         "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
+        "  publish  upload + online + dass init 一步到位，4 个检查点（导入成功 / 得到 Rule ID / 上线成功 / DASS 填报完成），任一失败醒目提醒（--no-dass 则不含 DASS）",
         "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
         "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
         "  backfill CMS 部署历史回补（只读抓取 OTA升级模板 → 去重合并入库；默认 dry-run，--commit 才写）",
         "",
-        "upload / online / dass 不给 Excel 时，默认使用 prep 最近一次生成的那份（记录在 .last_prep.json）。",
+        "upload / online / publish / dass 不给 Excel 时，默认使用 prep 最近一次生成的那份（记录在 .last_prep.json）。",
         "",
         "示例：",
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
         "  ./deployota upload                    # 用 prep 刚生成的 Excel",
         "  ./deployota online                    # 同上（upload 已把 Rule ID 回写到这份 Excel）",
+        "  ./deployota publish                   # upload + online + dass init 一步到位，带检查点",
         "  ./deployota dass ota200               # 同上",
         "  ./deployota upload /路径/更新后的.xlsx   # 也可显式指定",
     ]
