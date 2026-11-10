@@ -76,13 +76,19 @@ MAC_GROUP_EMPTY_TOKENS = {"", "无", "null", "none", "-", "—", "空"}
 # 纯逻辑函数（不连浏览器，--selftest 覆盖全部分支）
 # ======================================================================
 
-def build_rule_name(device_code: str, target_version: str) -> str:
+def build_rule_name(device_code: str, target_version) -> str:
     """D1：规则名称 = 设备类型代码 + "_" + 目标版本最后 5 个字符。
+
+    target_version 可传单个字符串，或多个目标版本（list/tuple/set）：多个时去重、排序后，
+    各自取末 5 位用 "_" 连接，例 ["V1.3.9.4","V1.3.9.2"] -> DEV_3.9.2_3.9.4。
 
     例：build_rule_name("MT9655AMAndrGTV", "0100UQ1015") -> "MT9655AMAndrGTV_Q1015"。
     目标版本不足 5 位时取其全部（[-5:] 的自然语义）。两端去空白。
     """
     dc = str(device_code or "").strip()
+    if isinstance(target_version, (list, tuple, set, frozenset)):
+        tails = sorted({str(x or "").strip()[-5:] for x in target_version if str(x or "").strip()})
+        return f"{dc}_" + "_".join(tails)
     tv = str(target_version or "").strip()
     return f"{dc}_{tv[-5:]}"
 
@@ -120,11 +126,12 @@ def mac_group_is_bound(cell_text: str) -> bool:
     return t.lower() not in MAC_GROUP_EMPTY_TOKENS
 
 
-def validate_single_target(device_codes, target_versions) -> tuple[str, str]:
-    """D3：校验导入 Excel 只含单一设备类型代码 + 单一目标版本。
+def validate_import_target(device_codes, target_versions) -> tuple[str, list[str]]:
+    """D3：校验导入 Excel 只含单一设备类型代码；目标版本允许多个（至少 1 个）。
 
-    任一集合大小 != 1 → 抛带中文提示的 ValueError（列出实际多个值，不猜）。
-    恰好单一 → 返回 (device_code, target_version)。
+    设备类型代码个数 != 1，或没有任何目标版本 → 抛带中文提示的 ValueError（列出实际值，不猜）。
+    通过 → 返回 (device_code, 排序去重后的目标版本列表)。
+    （收集 Rule ID 按模板名称定位，不依赖目标版本，所以一份模板里可含多个目标版本。）
     """
     dcs = sorted(x for x in device_codes if str(x or "").strip())
     tvs = sorted(x for x in target_versions if str(x or "").strip())
@@ -133,12 +140,9 @@ def validate_single_target(device_codes, target_versions) -> tuple[str, str]:
             f"导入 Excel 的『设备类型代码』应为单一值，实际为 {dcs!r}（共 {len(dcs)} 个）。"
             "请检查模板，不混多个设备类型。"
         )
-    if len(tvs) != 1:
-        raise ValueError(
-            f"导入 Excel 的『目标版本』应为单一值，实际为 {tvs!r}（共 {len(tvs)} 个）。"
-            "请检查模板，不混多个目标版本。"
-        )
-    return dcs[0], tvs[0]
+    if not tvs:
+        raise ValueError("导入 Excel 的『目标版本』列没有任何值。")
+    return dcs[0], tvs
 
 
 # 阶段3 的每个 Rule ID 最终状态常量。
@@ -788,10 +792,14 @@ def run_import(page, excel_path: str) -> tuple[list[str], str, str]:
     count = info["count"]
     if count == 0:
         raise ValueError("导入 Excel 没有数据行。")
-    device_code, target_version = validate_single_target(
+    device_code, target_versions = validate_import_target(
         info["device_codes"], info["target_versions"]
     )
-    name = build_rule_name(device_code, target_version)
+    target_version = target_versions[0] if len(target_versions) == 1 else target_versions
+    if len(target_versions) > 1:
+        print(color(f"  ⚠ Excel 含 {len(target_versions)} 个目标版本 {target_versions}，"
+                    "模板名称会带上全部版本末 5 位。", "yellow"))
+    name = build_rule_name(device_code, target_versions)
     remark = build_remark(count)
     print(f"阶段1 导入：设备类型代码={device_code!r} 目标版本={target_version!r} 行数={count}")
     print(f"  规则名称(D1)={name!r}  备注(D2)={remark!r}")
@@ -1155,9 +1163,18 @@ def _read_mac_group(page, modal, conflict_ruleid: str) -> str | None:
       空判定沿用 mac_group_is_bound/MAC_GROUP_EMPTY_TOKENS；读不到一律 None → 上层保守中止。
     """
     try:
-        _search_selected_zone(modal, page, conflict_ruleid)
-        page.wait_for_timeout(1200)
-        return _read_mac_group_from_table(_selected_table(modal))
+        if not _search_selected_zone(modal, page, conflict_ruleid):
+            return None
+        table = _selected_table(modal)
+        # 等已选表刷新出被冲突号那一行（最多约 8 秒）；不把旧结果/No Data 当成 mac组 为空。
+        for _ in range(40):
+            page.wait_for_timeout(200)
+            if _find_pending_row_by_ruleid(table, conflict_ruleid) >= 0:
+                break
+        else:
+            print(color(f"  ✗ 已选区搜 {conflict_ruleid!r} 后未出现该行（No Data 或加载超时），mac组 无法确认。", "red"))
+            return None
+        return _read_mac_group_from_table(table)
     except Exception as e:
         print(color(f"  ✗ 读取被冲突号 {conflict_ruleid!r} 的 mac组 失败：{e}", "red"))
         return None
@@ -1211,6 +1228,13 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
         print(f"\n---- 上线 Rule ID={rid!r} ----")
         res = {"ruleid": rid, "status": STATUS_FAILED}
 
+        if _already_online(page, modal, rid):
+            print(color(f"  ✓ Rule ID {rid!r} 已在『已选规则』中（已上线）→ 跳过。", "green"))
+            res["status"] = STATUS_ONLINE
+            res["note"] = "已上线，跳过"
+            results.append(res)
+            continue
+
         if not _search_pending_rule(page, modal, rid):
             res["note"] = "待选规则搜索失败"
             results.append(res)
@@ -1233,6 +1257,13 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 continue
 
         page.wait_for_timeout(1500)
+        if _online_hint_visible(page):
+            print(color(f"  ✓ 系统提示 Rule ID {rid!r} 已上线 → 跳过。", "green"))
+            _shot(page, f"active_already_online_{rid}")
+            res["status"] = STATUS_ONLINE
+            res["note"] = "系统提示已上线，跳过"
+            results.append(res)
+            continue
         if _conflict_modal_present(page):
             # D7：先不点弹窗按钮，解析被冲突号。
             try:
@@ -1251,34 +1282,50 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 results.append(res)
                 continue
 
-            # 判定原则：查被冲突 Rule ID 的 mac组；非空 → 直接替换；为空 → 中止该条。
+            # 冲突弹窗的遮罩盖住整个编排弹窗，开着的时候点不到下面的『已选规则-搜索』（实跑截图：
+            # 被冲突号已填进框但表仍是 No Data）。所以先点『取消』关掉弹窗，再去已选区读 mac组。
+            _click_replace_cancel(page)
+            page.wait_for_timeout(800)
+
+            # 判定原则：查被冲突 Rule ID 的 mac组；非空 → 替换；为空 → 中止该条。
             mac_text = _read_mac_group(page, modal, conflict_rid)
             if mac_text is None:
-                print(color(f"  ⚠ mac组 读取不确定，保守中止该条（点取消）。被冲突号={conflict_rid!r}", "yellow"))
-                _click_replace_cancel(page)
+                print(color(f"  ⚠ mac组 读取不确定，保守中止该条。被冲突号={conflict_rid!r}", "yellow"))
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
                 res["mac_group_bound"] = None
                 results.append(res)
                 continue
 
-            if mac_group_is_bound(mac_text):
-                print(color(f"  被冲突号 {conflict_rid} 的 mac组 非空（{mac_text!r}）→ 回弹窗点『确定』替换上线。", "green"))
-                if _click_replace_confirm(page):
-                    page.wait_for_timeout(1500)
-                    res["status"] = STATUS_ONLINE
-                else:
-                    res["note"] = "替换确定 gate 未满足"
-                res["conflict_ruleid"] = conflict_rid
-                res["mac_group_bound"] = True
-                results.append(res)
-            else:
-                print(color(f"  被冲突号 {conflict_rid} 的 mac组 为空（{mac_text!r}）→ 点『取消』中止该条并记录。", "red"))
-                _click_replace_cancel(page)
+            if not mac_group_is_bound(mac_text):
+                print(color(f"  被冲突号 {conflict_rid} 的 mac组 为空（{mac_text!r}）→ 中止该条并记录。", "red"))
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
                 res["mac_group_bound"] = False
                 results.append(res)
+                continue
+
+            # mac组 非空 → 重新对这条点一次『上线』，第二次弹出冲突窗时点『确定』替换。
+            print(color(f"  被冲突号 {conflict_rid} 的 mac组 非空（{mac_text!r}）→ 重新上线并点『确定』替换。", "green"))
+            res["conflict_ruleid"] = conflict_rid
+            res["mac_group_bound"] = True
+            if not (_search_pending_rule(page, modal, rid)
+                    and _click_online(page, modal, rid)
+                    and _confirm_online(page)):
+                _shot(page, f"active_gate_fail_{rid}")
+                res["note"] = "冲突后重新上线 gate 未满足"
+                results.append(res)
+                continue
+            page.wait_for_timeout(1500)
+            if not _conflict_modal_present(page):
+                print(color("  重新上线后未再出现冲突弹窗，记为 online 候选（阶段3 回读确认）。", "yellow"))
+                res["status"] = STATUS_ONLINE
+            elif _click_replace_confirm(page):
+                page.wait_for_timeout(1500)
+                res["status"] = STATUS_ONLINE
+            else:
+                res["note"] = "替换确定 gate 未满足"
+            results.append(res)
         else:
             print(color("  无冲突弹窗，记为 online 候选（阶段3 回读确认）。", "green"))
             _shot(page, f"active_online_{rid}")
@@ -1348,6 +1395,41 @@ def _is_online(page, modal, rule_id: str) -> bool:
     except Exception as e:
         print(color(f"  ✗ online 回读失败 {rule_id!r}：{e}", "red"))
         return False
+
+
+def _already_online(page, modal, rule_id: str) -> bool:
+    """上线前预检：已选规则区按 Rule ID 能精确搜到该行 → 该规则已经在线，可跳过。
+
+    精确匹配规则ID列（不是只要有行就算）；最多等约 3 秒，搜不到/异常一律返回 False（照常上线）。
+    """
+    try:
+        if not _search_selected_zone(modal, page, rule_id):
+            return False
+        table = _selected_table(modal)
+        for _ in range(15):
+            page.wait_for_timeout(200)
+            if _find_pending_row_by_ruleid(table, rule_id) >= 0:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+_ONLINE_HINTS = ("已上线", "已经上线", "已在线", "已处于上线")
+
+
+def _online_hint_visible(page) -> bool:
+    """页面上的提示（toast / 通知 / 对话框）是否表示该规则已经上线。"""
+    try:
+        for sel in (".ant-message", ".ant-notification", ".ant-modal-confirm", ".ant-popover"):
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 5)):
+                txt = (loc.nth(i).inner_text() or "").replace(" ", "")
+                if any(h in txt for h in _ONLINE_HINTS):
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 # ======================================================================
@@ -1426,7 +1508,7 @@ active_ota —— CMS OTA 规则。拆成两个独立子命令（一条龙后续
 
 参数：
   EXCEL            可选，Excel 路径；省略则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
-                   collect 要求整表单一「设备类型代码」+单一「目标版本」，否则报错中止。
+                   collect 要求整表单一「设备类型代码」；「目标版本」可有多个（名称带上全部版本末5位）。
                    online 从表头为【Rule ID】（或 ruleid / RuleID）的列读本批 Rule ID。
 
 决策要点（D1~D12）：
@@ -1613,25 +1695,29 @@ def _selftest() -> int:
           re.fullmatch(r"\d{8}_USA_5", build_remark(5)) is not None)
 
     # —— D3：单一值校验 ——
-    dc, tv = validate_single_target({"MT9655AMAndrGTV"}, {"0100UQ1015"})
-    check("D3 单一值通过返回 (dc, tv)", dc == "MT9655AMAndrGTV" and tv == "0100UQ1015")
+    dc, tv = validate_import_target({"MT9655AMAndrGTV"}, {"0100UQ1015"})
+    check("D3 单一值通过返回 (dc, [tv])", dc == "MT9655AMAndrGTV" and tv == ["0100UQ1015"])
     check("D3 单一值忽略空串干扰",
-          validate_single_target({"DEV", ""}, {"V", "  "}) == ("DEV", "V"))
+          validate_import_target({"DEV", ""}, {"V", "  "}) == ("DEV", ["V"]))
     raised_dc = False
     try:
-        validate_single_target({"A", "B"}, {"V"})
+        validate_import_target({"A", "B"}, {"V"})
     except ValueError:
         raised_dc = True
     check("D3 多设备类型代码报错中止", raised_dc)
+    check("D3 多目标版本允许，返回排序列表",
+          validate_import_target({"A"}, {"V1.3.9.4", "V1.3.9.2"}) == ("A", ["V1.3.9.2", "V1.3.9.4"]))
+    check("D1 多目标版本名称带全部末5位",
+          build_rule_name("MT9666AndrWH80E", ["V1.3.9.4", "V1.3.9.2"]) == "MT9666AndrWH80E_3.9.2_3.9.4")
     raised_tv = False
     try:
-        validate_single_target({"A"}, {"V1", "V2"})
+        validate_import_target({"A"}, {"", "  "})
     except ValueError:
         raised_tv = True
-    check("D3 多目标版本报错中止", raised_tv)
+    check("D3 目标版本全空报错中止", raised_tv)
     raised_empty = False
     try:
-        validate_single_target(set(), {"V"})
+        validate_import_target(set(), {"V"})
     except ValueError:
         raised_empty = True
     check("D3 空设备类型代码报错（大小!=1）", raised_empty)

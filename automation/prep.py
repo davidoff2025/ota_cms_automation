@@ -245,6 +245,108 @@ def _check_device_against_mapping(eng, text, device_code, feature_code, device_n
     return True, lines
 
 
+def _device_in_table(eng, code: str) -> bool:
+    """设备类型代码是否已在映射表里（精确匹配）。"""
+    code = str(code or "").strip()
+    if not code:
+        return False
+    return any(str(r.get("device_code", "")).strip() == code
+               for r in eng.app.load_device_history_seed())
+
+
+def _save_device_to_mapping(eng, code, name, feature, mac) -> str:
+    """把新设备追加进映射表（device_history_seed.json），并刷新引擎缓存；返回文件路径。
+
+    已存在同代码（忽略大小写）时抛 ValueError，避免重复/覆盖。
+    """
+    import json
+    path = eng.app.get_resource_path("device_history_seed.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = []
+    if any(str(r.get("device_code", "")).lower() == code.lower() for r in data):
+        raise ValueError(f"映射表已有设备类型代码 {code!r}（忽略大小写），不重复写入。")
+    data.append({"device_code": code, "device_name": name,
+                 "feature_code": feature, "mac_group": mac})
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    if hasattr(eng.app, "_device_history_seed"):
+        del eng.app._device_history_seed  # 下次查询重新读文件
+    return path
+
+
+def _prompt_new_device(eng, code, feature, name, mac, ask=input):
+    """设备类型代码不在映射表时，交互录入 4 项：设备类型代码 / feature code / 设备类型名称 / MAC 组。
+
+    括号里是默认值（来自文件解析或命令行），直接回车采用默认；输入 q 取消。
+    返回 (code, feature, name, mac, saved_path_or_None)；取消返回 None。
+    feature code 必填（纯数字，通常 24 位，位数不符会二次确认）；名称可留空；MAC 组默认『测试+设备类型代码』。
+    """
+    def read(label, default="", required=False, validator=None):
+        while True:
+            shown = f"［默认 {default}］" if default else ""
+            ans = ask(f"  {label}{shown}（q 取消）：").strip()
+            if ans.lower() == "q":
+                return None
+            val = ans or default
+            if required and not val:
+                print(_warn(f"  {label}不能为空。"))
+                continue
+            if validator:
+                err = validator(val)
+                if err:
+                    print(_warn("  " + err))
+                    continue
+            return val
+
+    def v_code(v):
+        return None if re.fullmatch(r"[A-Za-z0-9_\-]+", v) else "设备类型代码只能含字母、数字、下划线、连字符。"
+
+    def v_feat(v):
+        return None if v.isdigit() else "feature code 应为纯数字。"
+
+    print(_c("—— 映射表里没有这个设备类型代码，请录入设备信息 ——", "bold"))
+    c = read("设备类型代码", code, True, v_code)
+    if c is None:
+        return None
+    # 录入的代码若与映射表只差大小写，直接提示并采用映射表写法，避免重复条目。
+    canon, changed = _canonical_device_code(eng, c)
+    if changed:
+        print(_warn(f"  映射表已有 {canon}（仅大小写不同），请直接用它，无需新增。"))
+        return None
+    f = read("feature code", feature, True, v_feat)
+    if f is None:
+        return None
+    if len(f) != 24:
+        a = ask(f"  ⚠ feature code 长度为 {len(f)}（映射表里通常是 24 位），确认无误？[y 确认，其它重输]：").strip().lower()
+        if a not in ("y", "yes"):
+            f = read("feature code", "", True, v_feat)
+            if f is None:
+                return None
+    n = read("设备类型名称（可留空）", name)
+    if n is None:
+        return None
+    m = read("MAC 组", mac or ("测试" + c), True)
+    if m is None:
+        return None
+    print(_c("  请确认：", "bold"))
+    print(f"    设备类型代码：{c}\n    feature code：{f}\n    设备类型名称：{n or '(空)'}\n    MAC 组：{m}")
+    a = ask("  保存到映射表以后自动识别？[y 保存并继续 / n 仅本次使用 / 其它取消]：").strip().lower()
+    if a in ("y", "yes"):
+        try:
+            path = _save_device_to_mapping(eng, c, n, f, m)
+            print(_ok(f"已保存到映射表：{path}"))
+            return c, f, n, m, path
+        except (ValueError, OSError) as e:
+            print(_err(f"保存映射表失败：{e}"), file=sys.stderr)
+            return None
+    if a in ("n", "no"):
+        return c, f, n, m, None
+    return None
+
+
 def main() -> int:
     args = _build_parser().parse_args()
 
@@ -334,12 +436,28 @@ def main() -> int:
     if not mac_group and device_code:
         mac_group = eng.device_preset(device_code).get("mac_group", "")
 
+    manual_unsaved = False
+    # (1a) 设备类型代码不在映射表（或没解析到）且是交互终端 → 引导录入 4 项并可保存进映射表。
+    #      非交互 / --yes 保持原行为（报不一致，--yes 才继续）。
+    if not args.assume_yes and sys.stdin.isatty() and not _device_in_table(eng, device_code):
+        got = _prompt_new_device(eng, device_code, feature_code, device_name, mac_group)
+        if got is None:
+            print("已取消：未录入设备信息，未生成。", file=sys.stderr)
+            return 2
+        device_code, feature_code, device_name, mac_group, _saved = got
+        manual_unsaved = _saved is None  # 仅本次使用：不在表里，跳过下面的映射表一致性校验
+        if pasted_override is not None:
+            pasted_override = {"device_code": device_code, "feature_code": feature_code}
+
     # (1b) 设备信息与映射表一致性校验（生成前）。
     #   从文本解析出的 设备类型代码/feature code 与 mapping table(seed) 比对：
     #   一致 -> 打印 4 项(代码/名称/feature/测试MAC组) 并继续；
     #   不一致 -> 打印差异，等待人工确认(yes/y 继续，其它退出)；--yes 自动继续；无法交互则退出。
-    ok, lines = _check_device_against_mapping(eng, text, device_code, feature_code, device_name, mac_group,
-                                              pasted_override=pasted_override)
+    if manual_unsaved:
+        ok, lines = True, [_warn("设备信息为本次手工录入（未保存到映射表），跳过映射表一致性校验。")]
+    else:
+        ok, lines = _check_device_against_mapping(eng, text, device_code, feature_code, device_name,
+                                                  mac_group, pasted_override=pasted_override)
     for ln in lines:
         print(ln)
     if not ok:
