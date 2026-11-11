@@ -21,7 +21,7 @@ CSV_NAME = "deployments.csv"
 # JSONL/CSV 的字段顺序（CSV 表头用它）。
 FIELDS = [
     "Rule ID范围", "Rule ID列表", "规则条数",
-    "设备类型代码", "设备类型名称", "源版本", "目标版本", "升级类型",
+    "设备类型代码", "设备类型名称", "源版本", "目标版本", "目标完整版本", "升级类型",
     "Owner", "状态", "部署时间", "入库时间", "设备扩展码集合",
     "作废时间", "批次号", "Excel路径",
 ]
@@ -77,6 +77,32 @@ def _identity_key(rec: dict) -> tuple:
         str(rec.get("目标版本", "")).strip(),
         str(rec.get("设备扩展码集合", "")).strip(),
     )
+
+
+def full_target_versions(rec: dict) -> list[str]:
+    """批次的『目标完整版本』列表（如 ['0100UQ1104']；一个批次可能有多个）。
+
+    来源依次：记录里的『目标完整版本』字段 → 『规则明细』里各规则的目标版本。都没有返回 []
+    （例如 CMS 回补的老批次：CMS 页面只给『版本变化』Q0602_to_Q0724，没有完整版本）。
+    """
+    v = str(rec.get("目标完整版本", "") or "").strip()
+    if v:
+        return [x for x in v.split("/") if x]
+    seen: list[str] = []
+    for d in rec.get("规则明细") or []:
+        t = str(d.get("目标版本", "") or "").strip()
+        if t and t not in seen:
+            seen.append(t)
+    return sorted(seen)
+
+
+def display_target(rec: dict) -> tuple[str, bool]:
+    """汇总里显示的目标版本：(文本, 是否为完整版本)。有完整版本显示完整版本（多个用 / 连接），
+    否则退回『版本变化』。"""
+    full = full_target_versions(rec)
+    if full:
+        return "/".join(full), True
+    return str(rec.get("目标版本", "") or ""), False
 
 
 def _ruleids(rec: dict) -> str:
@@ -213,6 +239,8 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
         # 去重身份键一直用 Excel『目标版本』列（版本变化，如 Q0305_to_Q1104）；汇总显示改成完整版本后，
         # _read_rows 把它单独放在『版本变化』里。老记录与新记录因此仍能正确去重。
         "目标版本": first.get("版本变化", "") or first.get("目标版本", ""),
+        # 汇总显示用：整批的目标完整版本（_read_rows 的『目标版本』已是完整版本；多个用 / 连接）。
+        "目标完整版本": "/".join(sorted({r.get("目标版本", "").strip() for r in rows if r.get("目标版本", "").strip()})),
         "升级类型": first.get("升级类型", ""),
         "Rule ID范围": rng,
         "规则条数": len(rids),
@@ -284,8 +312,10 @@ def _print_history(limit: int | None, device: str | None,
         tag = (color("[作废]", "red") if is_void else color("[有效]", "green"))
         extra = f"  作废于 {r.get('作废时间','')}" if is_void else ""
         owner = r.get("Owner", "") or "-"
+        tgt, is_full = display_target(r)
+        tgt = tgt if is_full else f"{tgt}（版本变化，无完整版本）"
         line = (f"· Rule ID {r.get('Rule ID范围',''):15}（{r.get('规则条数','')} 条）  {tag}  "
-                f"{r.get('设备类型代码',''):18} {r.get('源版本','')} → {r.get('目标版本','')}  "
+                f"{r.get('设备类型代码',''):18} {r.get('源版本','')} → {tgt}  "
                 f"[{r.get('升级类型','')}]  owner={owner}  {r.get('部署时间','')}{extra}")
         print(color(line, "dim") if is_void else line)
 
