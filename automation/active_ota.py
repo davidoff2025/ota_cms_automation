@@ -1507,7 +1507,7 @@ active_ota —— CMS OTA 规则。collect / online 可单独用，publish 把�
                    collect + online + dass init 合并执行，4 个检查点（--no-dass 则只前 3 个）：
                    ①导入上传成功 ②得到 Rule ID（数量==Excel行数，回写并回读一致）③全部上线成功
                    ④DASS init 填报完成（上线全部成功后才跑；填写后仍需你在终端人工核对、输入 approve 才提交）。
-                   任一检查点失败：红色醒目提醒（原因+下一步）、后续步骤不执行、退出码 11/12/13。
+                   任一检查点失败：红色醒目提醒（原因+下一步）、后续步骤不执行、退出码 11/12/13/14。
                    Excel 已含 Rule ID（说明导入过）时拒绝重复导入。【写线上数据：导入+上线/替换】
   --probe-online   连 CMS，只读 dump「规则上下线编排」视图的选择器，不做任何写操作。【只读/安全】
   --selftest       纯逻辑自测（名称/备注拼接、冲突号解析、mac组判定、汇总），不连浏览器。【离线/安全】
@@ -1540,6 +1540,21 @@ active_ota —— CMS OTA 规则。collect / online 可单独用，publish 把�
 CP_NAMES = {1: "导入上传成功", 2: "得到 Rule ID", 3: "上线成功", 4: "DASS init 填报完成"}
 # 退出码：检查点 n 失败 → 10+n；前置检查不通过 → 2。
 EXIT_CP_FAIL = {1: 11, 2: 12, 3: 13, 4: 14}
+
+
+def _print_deploy_summary(excel: str, final: list[dict] | None = None) -> None:
+    """上线完成后打印部署信息汇总（与 dass 更新后的汇总同一张表，目标版本为『目标完整版本』）。
+
+    final 给定时只在至少有一条 online 时打印；读不到 Excel 或没有 Rule ID 列时静默跳过。
+    """
+    if final is not None and not any(r.get("status") == STATUS_ONLINE for r in final):
+        return
+    try:
+        from .summary import print_summary
+        print("")
+        print_summary(excel)
+    except Exception as e:
+        print(color(f"（部署汇总显示跳过：{e}）", "dim"))
 
 
 def format_checkpoint_report(cps: list[dict]) -> str:
@@ -1697,6 +1712,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
     cps[2].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
     print(color(f"✓ 检查点3 通过：{len(final)} 条 Rule ID 全部上线。", "green"))
     if not with_dass:
+        _print_deploy_summary(excel)
         return finish(0)
 
     # —— 检查点4：DASS init 填报 ——
@@ -1843,6 +1859,7 @@ def main() -> int:
                 # 阶段3：状态汇总。
                 final = read_final_status(page, rule_ids, results)
                 print("\n" + summarize(final))
+                _print_deploy_summary(excel, final)
 
                 if config.HEADED:
                     print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")

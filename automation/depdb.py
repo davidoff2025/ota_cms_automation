@@ -189,6 +189,18 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
             deploy_time = datetime.now().strftime("%Y%m%d")
     # 整批设备扩展码集合（去重排序后拼接），作为身份键的一部分。
     ext_set = sorted({r.get("机型扩展码", "").strip() for r in rows if r.get("机型扩展码", "").strip()})
+    # 每条规则自己的明细（供 `deployota update <RuleID>` 直接用，不依赖 Excel 还在不在）。
+    # 失败不影响写库：拿不到就留空，查询时会回退去读来源 Excel。
+    details: list[dict] = []
+    try:
+        from .dass_data import read_updated_excel
+        for d in read_updated_excel(xlsx_path):
+            rid = str(d.get("ruleid", "")).strip()
+            if rid:
+                details.append({k: str(d.get(k, "") or "") for k in
+                                ("ruleid", "方案号", "目标版本", "设备扩展信息", "机型", "源版本", "升级类型", "featurecode")})
+    except Exception:
+        details = []
     return {
         "批次号": f"{device_code}_{rng.replace(' ', '')}_{deploy_time}",
         "部署时间": deploy_time,
@@ -198,7 +210,9 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
         "设备类型代码": device_code,
         "设备类型名称": "",  # Excel 升级规则 sheet 的设备名称列可能为空；范围内不强求
         "源版本": first.get("源版本", ""),
-        "目标版本": first.get("目标版本", ""),
+        # 去重身份键一直用 Excel『目标版本』列（版本变化，如 Q0305_to_Q1104）；汇总显示改成完整版本后，
+        # _read_rows 把它单独放在『版本变化』里。老记录与新记录因此仍能正确去重。
+        "目标版本": first.get("版本变化", "") or first.get("目标版本", ""),
         "升级类型": first.get("升级类型", ""),
         "Rule ID范围": rng,
         "规则条数": len(rids),
@@ -206,6 +220,7 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
         "设备扩展码集合": ",".join(ext_set),
         "作废时间": "",
         "Excel路径": os.path.abspath(xlsx_path),
+        "规则明细": details,
     }
 
 

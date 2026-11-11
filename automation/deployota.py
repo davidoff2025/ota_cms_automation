@@ -8,8 +8,11 @@ run_dass.sh / run_login.sh）与本命令【并存】。
 子命令映射：
   prep    -> automation.prep            生成 Excel → 严格校验 → 上传 S3（上传后 boto3 校验）
   upload  -> automation.active_ota collect   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel
+  offline -> automation.active_offline     按 Rule ID 下线（online 的反向）
   publish -> automation.active_ota publish   upload + online + dass init 合并，4 个检查点
   online  -> automation.active_ota online    在「规则上下线编排」逐条上线 + 冲突处理
+  query   -> automation.rule_info       按 Rule ID 查部署信息（单个/区间/逗号）
+  update  -> automation.dass_update     按 Rule ID 更新 DASS 阶段
   dass    -> automation.dass_fill       DASS 填报/更新（OPTION: init/ota200/.../ota-all，含成功率闸门）
 
 用法：
@@ -35,8 +38,11 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "upload": ("automation.active_ota", ["collect"]),
     "online": ("automation.active_ota", ["online"]),
     "publish": ("automation.active_ota", ["publish"]),
+    "offline": ("automation.active_offline", []),
     "dass":   ("automation.dass_fill",  []),
+    "update": ("automation.dass_update", []),
     "history": ("automation.depdb",     []),
+    "query":  ("automation.rule_info",  []),
     "backfill": ("automation.depdb_backfill", []),
 }
 
@@ -96,8 +102,11 @@ def _usage() -> str:
         "  prep     生成 Excel → 严格校验 → 上传 S3（上传后 boto3 回查确认）",
         "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
         "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
+        "  offline  按 Rule ID 下线（单个/区间/逗号）：只下线确认在线的，其它不动；下线前需输入 yes（--yes 跳过）（CMS）",
         "  publish  upload + online + dass init 一步到位，4 个检查点（导入成功 / 得到 Rule ID / 上线成功 / DASS 填报完成），任一失败醒目提醒（--no-dass 则不含 DASS）",
+        "  update   按 Rule ID 更新 DASS 的 OTA 阶段（ota50/ota200/ota1k/ota5k/ota20k/ota-all；Rule ID 单个/区间/逗号），含成功率闸门",
         "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
+        "  query    按 Rule ID 查部署信息（单个 / 区间 65370-65379 / 逗号 65370,65375，可混用）",
         "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
         "  backfill CMS 部署历史回补（只读抓取 OTA升级模板 → 去重合并入库；默认 dry-run，--commit 才写）",
         "",
@@ -107,9 +116,12 @@ def _usage() -> str:
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
         "  ./deployota upload                    # 用 prep 刚生成的 Excel",
         "  ./deployota online                    # 同上（upload 已把 Rule ID 回写到这份 Excel）",
+        "  ./deployota offline 50000-50005       # 下线这些 Rule ID（先检查在线状态、再确认）",
         "  ./deployota publish                   # upload + online + dass init 一步到位，带检查点",
-        "  ./deployota dass ota200               # 同上",
+        "  ./deployota update ota200 65370-65379 # 按 Rule ID 更新 DASS 阶段（自动从部署库取方案号/目标版本等）",
+        "  ./deployota dass init                 # DASS 插入新行（需要 Excel，默认用 prep 刚生成的）",
         "  ./deployota upload /路径/更新后的.xlsx   # 也可显式指定",
+        "  ./deployota query 65370-65379,65385   # 查这些 Rule ID 属于哪个批次、什么版本变化",
     ]
     return "\n".join(lines)
 

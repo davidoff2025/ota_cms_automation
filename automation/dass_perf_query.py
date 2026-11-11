@@ -299,7 +299,7 @@ def _run_targets(args, targets: list[str]) -> int:
             print("\n======== 导航『安卓升级展示报表』========")
             navigate_to_perf(page)
             page.wait_for_timeout(2500)
-            fr = _report_frame(page)
+            fr = _report_frame(page, "perf")
             if fr is None:
                 print(color("✗ 未找到绩效页 frame，无法查询。", "red"))
                 _shot(page, "perf_query_no_frame")
@@ -341,7 +341,7 @@ def _run_all(args) -> int:
             print("\n======== 导航『安卓升级展示报表』========")
             navigate_to_perf(page)
             page.wait_for_timeout(2500)
-            fr = _report_frame(page)
+            fr = _report_frame(page, "perf")
             if fr is None:
                 print(color("✗ 未找到绩效页 frame，无法查询。", "red"))
                 _shot(page, "perf_query_no_frame")

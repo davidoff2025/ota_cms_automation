@@ -112,15 +112,9 @@ def navigate_to_perf(page) -> None:
     参考 dass_login.navigate_to_fillin，仅最后一级菜单改点绩效叶子。叶子文案在不同
     环境可能是『安卓升级展示报表』或『安卓升级展示绩效』，按候选逐一尝试。
     """
-    # 先展开前两级分组。
-    for text, wait_ms in (("Android New", 1500), ("OTA", 1500)):
-        print(f"\n点击菜单：{text} ...")
-        if _click_menu_in_any_frame(page, text):
-            print(color(f"  ✓ 已点击 {text}", "green"))
-        else:
-            print(color(f"  ⚠ 未找到菜单项：{text}", "yellow"))
-            _dump_visible_menu(page)
-        page.wait_for_timeout(wait_ms)
+    # 先展开前两级分组（状态感知：已展开就不再点，分组点击是展开/折叠切换）。
+    from .dass_login import expand_menu_path
+    expand_menu_path(page, ["Android New", "OTA"], PERF_MENU_LEAF_CANDIDATES)
 
     # 最后一级：绩效报表叶子（按候选逐一尝试，命中即停）。
     clicked = False
@@ -222,8 +216,11 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
     rate_letter = letters.get(PERF_SUCCESS_RATE_HEADER)
     if not rid_letter or not rate_letter:
         return []
+    # 诊断用的两列（缺失时置空，不影响成功率/ruleid 的读取）。
+    stage_letter = letters.get("当前阶段", "")
+    open_letter = letters.get("当前阶段开放时间", "")
     rows = fr.evaluate(
-        """({ridLetter, rateLetter}) => {
+        """({ridLetter, rateLetter, stageLetter, openLetter}) => {
             // 以 ruleid 列为行锚：收集所有 id 形如 '<ridLetter><n>-<x>-<session>' 且 n>=2 的单元格。
             const ridRe = new RegExp('^' + ridLetter + '(\\\\d+)-\\\\d+-');
             const seen = {};
@@ -239,12 +236,32 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
                 // 同行成功率单元格：id 以 '<rateLetter><n>-' 开头。
                 const rc = document.querySelector('[id^="' + rateLetter + n + '-"]');
                 const rate_text = rc ? (rc.innerText || '').trim() : '';
-                res.push({ n: n, ruleid: ruleid, rate_text: rate_text });
+                const oc = openLetter ? document.querySelector('[id^="' + openLetter + n + '-"]') : null;
+                res.push({ n: n, ruleid: ruleid, rate_text: rate_text,
+                           open_text: oc ? (oc.innerText || '').trim() : '' });
             });
             res.sort((a, b) => a.n - b.n);
+            // 『当前阶段』是跨行合并单元格：只在每组首行渲染，其余行沿用上方最近的那个。
+            if (stageLetter) {
+                const stageRe = new RegExp('^' + stageLetter + '(\\\\d+)-\\\\d+-');
+                const stages = [];
+                document.querySelectorAll('[id]').forEach(e => {
+                    const m = (e.id || '').match(stageRe);
+                    if (!m) return;
+                    const k = parseInt(m[1]);
+                    if (k >= 2) stages.push({ k: k, t: (e.innerText || '').trim() });
+                });
+                stages.sort((a, b) => a.k - b.k);
+                res.forEach(r => {
+                    let cur = '';
+                    for (const st of stages) { if (st.k <= r.n) cur = st.t; else break; }
+                    r.stage_text = cur;
+                });
+            }
             return res;
         }""",
-        {"ridLetter": rid_letter, "rateLetter": rate_letter},
+        {"ridLetter": rid_letter, "rateLetter": rate_letter,
+         "stageLetter": stage_letter, "openLetter": open_letter},
     )
     return rows
 
@@ -582,8 +599,70 @@ def query_rates_stage1(
             "rate": parse_percent(rate_text),
             "rate_text": rate_text,
             "raw_ruleid": row.get("ruleid", ""),
+            "stage_text": row.get("stage_text", ""),   # 诊断用：报表里该规则的『当前阶段』
+            "open_text": row.get("open_text", ""),     # 诊断用：『当前阶段开放时间』
         }
     return result
+
+
+def read_report_date(fr) -> str:
+    """读绩效页『日期』过滤框的值（YYYY-MM-DD；该框没有 name，按值的格式找）。读不到返回空串。"""
+    try:
+        return fr.evaluate("""() => {
+            const el = [...document.querySelectorAll('input')]
+                .find(i => /^\\d{4}-\\d{2}-\\d{2}$/.test((i.value || '').trim()));
+            return el ? el.value.trim() : '';
+        }""") or ""
+    except Exception:
+        return ""
+
+
+def format_stage_diagnosis(missing: list[str], seen: dict, want_stage: str, report_date: str = "") -> list[str]:
+    """把『闸门按阶段过滤查不到』的规则，对照『不按阶段查』时报表里的实际情况，生成诊断行（纯逻辑）。
+
+    seen: {norm_ruleid: {"stage_text","open_text","rate_text"}} —— 不带阶段条件时报表里的行。
+    只做说明，不改变闸门放行/中止的判定。
+    """
+    lines: list[str] = []
+    if not missing:
+        return lines
+    in_report = [r for r in missing if r in seen]
+    not_in = [r for r in missing if r not in seen]
+    head = f"\n======== 未找到原因诊断（报表数据日期：{report_date or '未知'}）========"
+    lines.append(color(head, "yellow"))
+    if in_report:
+        lines.append(color(
+            f"  {len(in_report)} 个 Rule ID 在报表里【存在】，但『当前阶段』不是闸门要找的 {want_stage!r}：", "yellow"))
+        for rid in sorted(in_report, key=lambda x: int(x) if x.isdigit() else 0):
+            d = seen[rid]
+            lines.append(f"    Rule ID={rid!r}  报表当前阶段={d.get('stage_text') or '?'!r}  "
+                         f"开放时间={d.get('open_text') or '?'}  成功率={d.get('rate_text') or '?'}")
+        lines.append(color(
+            "  可能原因：展示报表的数据按日期快照、滞后于『安卓升级状态填报』——填报里已是上一阶段，"
+            "报表还停在更早的阶段。此时报表里的成功率属于更早阶段的人群，不能代表上一阶段，"
+            "所以仍按『未找到』中止；等报表同步（日期推进到阶段变更之后）再重试。", "yellow"))
+    if not_in:
+        lines.append(color(
+            f"  {len(not_in)} 个 Rule ID 连不带阶段条件也查不到：{sorted(not_in)}。"
+            "请核对 方案号 / 目标版本 / 设备扩展信息 是否与 DASS 一致。", "yellow"))
+    return lines
+
+
+def _diagnose_missing(fr, page, missing: list[str], excel_by_ruleid: dict, want_stage: str) -> dict:
+    """只读诊断：对未找到的规则，按『方案号+目标版本』（不带阶段）再查一次，打印报表里的实际阶段。
+
+    返回 {norm_ruleid: {stage_text, open_text, rate_text, rate}}（报表里实际查到的行，供逐条明细作参考值）。"""
+    seen: dict[str, dict] = {}
+    groups = sorted({(excel_by_ruleid[r].get("方案号", ""), excel_by_ruleid[r].get("目标版本", "")) for r in missing})
+    print(color("\n  （只读诊断：不带『当前阶段』条件再查一次，看这些规则在报表里是什么情况 ...）", "dim"))
+    for scheme, target in groups:
+        res = query_rates_stage1(fr, page, scheme, target, set(missing), current_stage="")
+        if res:
+            seen.update(res)
+    report_date = read_report_date(fr)
+    for line in format_stage_diagnosis(missing, seen, want_stage, report_date):
+        print(line)
+    return seen
 
 
 def check_success_rate(fr, page, records, option: str) -> bool:
@@ -676,6 +755,18 @@ def check_success_rate(fr, page, records, option: str) -> bool:
 
     _shot(page, "perf_queried")
 
+    # ———— 诊断（只读，不影响判定）：按阶段查不到的规则，不带阶段条件再看一眼，说明原因 ————
+    not_found = [r for r in sorted(excel_ruleids) if found_rate.get(r, {}).get("stage") == "未找到"]
+    if not_found:
+        try:
+            seen = _diagnose_missing(fr, page, not_found, excel_by_ruleid, PREV_STAGE.get(option, ""))
+            # 把报表里实际查到的数值挂到该规则上，逐条明细里作为『仅供参考』显示（不改变判定）。
+            for rid, d in (seen or {}).items():
+                if rid in found_rate and found_rate[rid].get("stage") == "未找到":
+                    found_rate[rid]["fallback"] = d
+        except Exception as e:
+            print(color(f"  （未找到原因诊断跳过：{e}）", "dim"))
+
     # ———— 判定 + 逐条/汇总打印（B）————
     report, passed = format_gate_report(excel_ruleids, found_rate)
     print(report)
@@ -713,7 +804,13 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
         stage = info.get("stage", "未找到")
         if rate is None:
             if stage == "未找到":
-                rate_desc = color("未找到", "yellow")
+                fb = info.get("fallback")
+                if fb and fb.get("rate_text"):
+                    rate_desc = color(
+                        f"按要求的阶段未找到；报表里该规则：阶段={fb.get('stage_text') or '?'}，"
+                        f"成功率={fb.get('rate_text')}（仅供参考，不算通过）", "yellow")
+                else:
+                    rate_desc = color("未找到", "yellow")
                 not_found_n += 1
             else:
                 rate_desc = color(f"成功率解析失败（原文 {info.get('rate_text', '')!r}）", "red")
@@ -750,6 +847,21 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
 
 
 # —— 不依赖浏览器的纯函数自测（python -m automation.dass_perf --selftest）——
+def _selftest_diag(check) -> None:
+    seen = {"65235": {"stage_text": "OTA200", "open_text": "20261107", "rate_text": "0.00%"}}
+    out = "\n".join(format_stage_diagnosis(["65235", "99999"], seen, "OTA1000", "2026-11-08"))
+    check("诊断：报表阶段与闸门阶段不一致被点出", "OTA200" in out and "OTA1000" in out and "2026-11-08" in out)
+    check("诊断：不带阶段也查不到的单独列出", "99999" in out and "连不带阶段条件也查不到" in out)
+    check("诊断：无缺失时无输出", format_stage_diagnosis([], seen, "OTA1000") == [])
+    rep, passed = format_gate_report({"65235", "65236"}, {
+        "65235": {"rate": None, "stage": "未找到", "rate_text": "",
+                  "fallback": {"stage_text": "OTA200", "rate_text": "38.43%"}},
+        "65236": {"rate": 80.0, "stage": "Stage1", "rate_text": "80.00%"},
+    })
+    check("逐条明细：每个 ID 都显示成功率（含未找到时的报表参考值）",
+          "38.43%" in rep and "仅供参考" in rep and "80.00%" in rep and passed is False)
+
+
 def _selftest() -> int:
     ok = True
 
@@ -758,6 +870,8 @@ def _selftest() -> int:
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
         if not cond:
             ok = False
+
+    _selftest_diag(check)
 
     # parse_percent
     check("50.00% -> 50.0", parse_percent("50.00%") == 50.0)

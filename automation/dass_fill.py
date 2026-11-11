@@ -244,10 +244,29 @@ def _run_query(fr, page, filters: dict) -> tuple[list[dict], dict, str]:
     return rows, letters, session
 
 
-def _report_frame(page):
-    for fr in page.frames:
-        if "entry_report" in (fr.url or ""):
-            return fr
+def _report_frame(page, kind: str = ""):
+    """取报表所在的 iframe。
+
+    kind=""      ：旧行为——第一个 URL 含 entry_report 的 iframe（兜底 <td> 最多的 frame）。
+    kind="fillin"：『安卓升级状态填报』页——有『显示行数』框 input[name='LIMIT'] 的 entry_report iframe。
+    kind="perf"  ：『安卓升级展示报表』页——没有 LIMIT 框的 entry_report iframe。
+
+    ★ 两张报表各开一个标签页、各占一个 entry_report iframe。先后打开过两张报表（例如闸门先看展示报表、
+      再去填报页更新）时，旧行为会选中先打开的那个，导致在错误的报表上查询、填写。按页面特征区分可避免。
+      找不到符合特征的 frame 时返回 None，由调用方报错，不猜。
+    """
+    entry = [fr for fr in page.frames if "entry_report" in (fr.url or "")]
+    if kind in ("fillin", "perf"):
+        def has_limit(fr):
+            try:
+                return fr.locator(LIMIT_INPUT).count() > 0
+            except Exception:
+                return False
+        want = [fr for fr in entry if has_limit(fr) == (kind == "fillin")]
+        # 同类多个时取最后打开的（标签页顺序 = frame 顺序）。
+        return want[-1] if want else None
+    if entry:
+        return entry[0]
     best, best_n = None, -1
     for fr in page.frames:
         try:
@@ -517,8 +536,13 @@ def fill_cell(fr, page, row_n: int, letter: str, session: str, value: str) -> bo
         got = fr.locator(f"#{cell_id}").inner_text().strip()
     except Exception:
         got = "?"
-    ok = got == str(value).strip()
-    print(f"    {'✓' if ok else '✗'} {cell_id} {value!r}" + ("" if ok else f" -> 实际 {got!r}"))
+    # 数字格式单元格显示时会加千分位逗号（'20261110' 显示为 '20,261,110'），底层存的仍是无逗号的值
+    # （见 probe-findings 的 DISPLAY-ONLY 结论），所以比较前两边都去掉分组逗号。
+    ok = _strip_group_separators(got) == _strip_group_separators(str(value).strip())
+    shown = "" if ok else f" -> 实际 {got!r}"
+    if ok and got != str(value).strip():
+        shown = f"（显示为 {got!r}，仅千分位格式）"
+    print(f"    {'✓' if ok else '✗'} {cell_id} {value!r}" + shown)
     return ok
 
 
@@ -696,6 +720,28 @@ def run_update(fr, page, records, option: str) -> dict:
                     "将对每个目标版本分别查询。", "yellow"))
 
     satisfied_ruleids: set[str] = set()
+    stats.update({"not_processed": 0, "already_at_stage": 0, "skipped_later_stage": 0})
+    # ★ DASS 填报页有未提交的编辑时，再点『查询』会弹 confirm『There are uncommitted data! Continue?』；
+    #   不应答就被取消，网格不刷新，后面读到的还是上一次的结果（以前就是这样把剩下的规则全误判成
+    #   『未找到』）。所以：一旦写过单元格，就不再发起新查询，剩下的规则记为『未处理』，提交后再跑一次。
+    state = {"dirty": False, "blocked": False}
+    stage_order = list(STAGE_LABELS.values())
+
+    def _guarded_query(filters: dict):
+        """有未提交编辑时拒绝查询（返回 None）；否则正常查询。"""
+        if state["dirty"]:
+            state["blocked"] = True
+            return None
+        return _run_query(fr, page, filters)
+
+    def _stage_skip_reason(row: dict) -> str:
+        """该行当前阶段已经是目标阶段、或已在目标之后时，返回跳过原因；否则空串。"""
+        cur = str(row.get("当前阶段", "") or "").replace(",", "").strip()
+        if cur == stage_label:
+            return "already"
+        if cur in stage_order and stage_order.index(cur) > stage_order.index(stage_label):
+            return "later"
+        return ""
 
     def _write_row(row_n: int, letters: dict, session: str, tag: str, ruleid: str) -> bool:
         """对一行写入本次更新字段；全部 fill_cell 成功才算更新成功。
@@ -705,6 +751,7 @@ def run_update(fr, page, records, option: str) -> dict:
         updates = {"当前阶段": stage_label, "当前阶段时间": stage_time}
         if option == "ota50":
             updates["是否展示"] = "1"
+        state["dirty"] = True  # 一旦动过单元格，网格就有未提交数据
         print(f"\n更新行 {row_n}（{tag}，ruleid={ruleid!r}）：")
         ok_row = True
         for col, val in updates.items():
@@ -724,7 +771,11 @@ def run_update(fr, page, records, option: str) -> dict:
             filters = {"方案号": scheme, "目标版本": target}
             if option != "ota50":
                 filters["当前阶段"] = PREV_STAGE[option]  # 递进选项按上一阶段过滤
-            rows, letters, session = _run_query(fr, page, filters)
+            got = _guarded_query(filters)
+            if got is None:
+                print(color("  ⚠ 已有未提交的编辑，不能再查询（会丢编辑），本组留到提交后再处理。", "yellow"))
+                continue
+            rows, letters, session = got
 
             if session is None or "方案号" not in letters:
                 print(color("✗ 查询后未读到表头列布局，跳过此次 Stage1 查询。", "red"))
@@ -753,6 +804,12 @@ def run_update(fr, page, records, option: str) -> dict:
 
     # ———— Stage2：对 Stage1 未命中的 ruleid 逐个精选查询 ————
     for rid in sorted(excel_ruleids - satisfied_ruleids):
+        if rid in satisfied_ruleids:  # 已在前面某次精选查询里作为同组规则处理过
+            continue
+        if state["blocked"] or state["dirty"]:
+            state["blocked"] = True
+            stats["not_processed"] += 1
+            continue
         rec = excel_by_ruleid[rid]
         k_scheme = rec.get("方案号", "")
         k_target = rec.get("目标版本", "")
@@ -760,8 +817,7 @@ def run_update(fr, page, records, option: str) -> dict:
         print(f"\n====== Stage2 精选查询：ruleid={rid!r} 方案号={k_scheme!r} "
               f"目标版本={k_target!r} 设备扩展信息={k_ext!r} ======")
         # 精选三字段查询；当前阶段留空（手工改过的阶段不应把行藏起来）。
-        rows, letters, session = _run_query(
-            fr, page,
+        rows, letters, session = _guarded_query(
             {"方案号": k_scheme, "目标版本": k_target, "设备扩展信息": k_ext},
         )
         if session is None or "方案号" not in letters:
@@ -777,7 +833,30 @@ def run_update(fr, page, records, option: str) -> dict:
             stats["truncation_warnings"] += 1
 
         matches = [r for r in rows if norm_ruleid(r.get("ruleid", "")) == rid]
-        if len(matches) == 1:
+        # 同一次精选查询常常把同设备扩展信息的其它目标规则也查出来：一起处理，省掉后面的查询。
+        siblings = [r for r in rows
+                    if norm_ruleid(r.get("ruleid", "")) in excel_ruleids
+                    and norm_ruleid(r.get("ruleid", "")) not in satisfied_ruleids
+                    and norm_ruleid(r.get("ruleid", "")) != rid]
+        for sib in siblings:
+            srid = norm_ruleid(sib.get("ruleid", ""))
+            why = _stage_skip_reason(sib)
+            if why:
+                satisfied_ruleids.add(srid)
+                key = "already_at_stage" if why == "already" else "skipped_later_stage"
+                stats[key] += 1
+                print(f"  · ruleid={srid!r} 当前阶段={sib.get('当前阶段', '')!r}，"
+                      + ("已是目标阶段，跳过。" if why == "already" else "已在目标阶段之后，跳过（不降级）。"))
+            elif _write_row(sib["n"], letters, session, "Stage2", srid):
+                stats["stage2_updated"] += 1
+                satisfied_ruleids.add(srid)
+        if len(matches) == 1 and _stage_skip_reason(matches[0]):
+            why = _stage_skip_reason(matches[0])
+            satisfied_ruleids.add(rid)
+            stats["already_at_stage" if why == "already" else "skipped_later_stage"] += 1
+            print(f"  · ruleid={rid!r} 当前阶段={matches[0].get('当前阶段', '')!r}，"
+                  + ("已是目标阶段，跳过。" if why == "already" else "已在目标阶段之后，跳过（不降级）。"))
+        elif len(matches) == 1:
             if _write_row(matches[0]["n"], letters, session, "Stage2", rid):
                 stats["stage2_updated"] += 1
                 satisfied_ruleids.add(rid)
@@ -790,12 +869,22 @@ def run_update(fr, page, records, option: str) -> dict:
                         f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}", "yellow"))
             stats["skipped_ambiguous"] += 1
 
+    if state["blocked"]:
+        print(color(f"\n⚠ 还有 {stats['not_processed']} 个 Rule ID 未处理：DASS 有未提交的编辑时不能再查询"
+                    "（否则会丢掉已写入的内容）。请先核对并提交本批，再运行同一条命令处理剩下的"
+                    "（已是目标阶段的会自动跳过）。", "yellow"))
     print("\n======== 更新汇总 ========")
     print(f"  Stage-1 批量更新：{stats['stage1_updated']}")
     print(f"  Stage-2 精选回退更新：{stats['stage2_updated']}")
     print(f"  未匹配跳过：{stats['skipped_no_match']}")
     print(f"  歧义跳过：{stats['skipped_ambiguous']}")
     print(f"  候选但不在 Excel（未动）：{stats['candidates_skipped_not_in_excel']}")
+    if stats.get("already_at_stage"):
+        print(f"  已是目标阶段（跳过）：{stats['already_at_stage']}")
+    if stats.get("skipped_later_stage"):
+        print(color(f"  已在目标阶段之后（跳过，不降级）：{stats['skipped_later_stage']}", "yellow"))
+    if stats.get("not_processed"):
+        print(color(f"  未处理（需先提交本批）：{stats['not_processed']}", "yellow"))
     if stats["truncation_warnings"]:
         print(color(f"  ⚠ 结果可能被截断的查询次数：{stats['truncation_warnings']}（已按显示行处理）", "yellow"))
     return stats
@@ -825,6 +914,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
                 "  ./run_dass.sh ota50 \"/路径/文件.xlsx\"    # 更新已存在行\n"
             )
             raise SystemExit(0)
+        if arg == "--strict":
+            continue  # 在 main 里读：关闭『闸门未通过时人工批复』
         if arg in VALID_OPTIONS:
             option = arg
         elif arg.startswith("-"):
@@ -848,6 +939,40 @@ def main() -> int:
     print(f"操作模式：{option}")
     print(f"数据源 Excel：{excel}")
     records = read_updated_excel(excel)  # 文件不存在时抛 FileNotFoundError，快速失败
+    return execute(option, records, excel, allow_gate_override="--strict" not in sys.argv[1:])
+
+
+def _gate_override(allow: bool) -> bool:
+    """成功率闸门未通过时，询问是否『人工批复』继续。只有终端里原样输入 override 才算批复。
+
+    allow=False（--strict）或非交互终端 → 不询问，直接 False（中止，保持原行为）。
+    这是人工兜底：脚本绝不会自动绕过闸门；默认回答（直接回车）就是中止。
+    """
+    if not allow:
+        return False
+    if not sys.stdin.isatty():
+        print(color("（非交互终端，无法人工批复，按闸门结果中止。）", "dim"))
+        return False
+    print(color("\n⚠ 成功率闸门未通过。上面的『逐条明细』列出了每个 Rule ID 的成功率。", "yellow"))
+    print(color("  如果你已评估风险并决定继续，可以人工批复：继续更新 DASS（之后仍需你核对并输入 approve 才提交）。", "yellow"))
+    try:
+        ans = input("  输入 override 并回车 = 人工批复继续；其它任意输入（或直接回车）= 中止：").strip()
+    except EOFError:
+        ans = ""
+    if ans == "override":
+        print(color("⚠ 已人工批复：成功率闸门未通过，仍继续更新 DASS。", "yellow"))
+        return True
+    return False
+
+
+def execute(option: str, records: list[dict], excel: str | None = None,
+            allow_gate_override: bool = True) -> int:
+    """用已经准备好的记录列表执行 DASS 填报/更新（浏览器会话 + 闸门 + 人工批复）。
+
+    记录来源不限：Excel（main）或按 Rule ID 从部署库解析（deployota update，见 dass_update）。
+    excel 仅用于更新后的『部署汇总表』和『写部署库』；为 None 时（按 Rule ID 更新）两者跳过，
+    因为部署记录早在首次部署时就已入库。
+    """
     n = len(records)
     if n == 0:
         print(color("✗ Excel 中没有数据行。", "red"))
@@ -861,6 +986,13 @@ def main() -> int:
         browser = p.chromium.launch(headless=not config.HEADED)
         context = browser.new_context()
         page = context.new_page()
+
+        # update 路径：遇到『有未提交数据，是否继续』的 confirm 一律取消（保住已写入的编辑），并告警。
+        if option != "init":
+            def _on_dialog_update(dialog):
+                print(color(f"  ⚠ [对话框] {dialog.type}: {dialog.message!r} → 取消（保留未提交的编辑）", "yellow"))
+                dialog.dismiss()
+            page.on("dialog", _on_dialog_update)
 
         # 仅 init 路径注册插入行 prompt 的应答；update 路径不插入行、不应答任何 prompt。
         if option == "init":
@@ -886,22 +1018,27 @@ def main() -> int:
                 print("\n======== 升级成功率闸门（run_update 之前）========")
                 navigate_to_perf(page)
                 page.wait_for_timeout(2500)
-                fr_perf = _report_frame(page)
+                fr_perf = _report_frame(page, "perf")
                 if fr_perf is None:
                     print(color("✗ 未找到绩效页 frame，无法校验成功率；安全失败，abort 升级。", "red"))
                     _shot(page, "perf_no_frame")
                     return 2
                 if not check_success_rate(fr_perf, page, records, option):
-                    print(color("\n⛔ 成功率闸门未通过：中止本次升级事务，"
-                                "run_update 未执行，不进入人工提交环节。", "red"))
-                    return 2
-                print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
+                    if not _gate_override(allow_gate_override):
+                        print(color("\n⛔ 成功率闸门未通过：中止本次升级事务，"
+                                    "run_update 未执行，不进入人工提交环节。", "red"))
+                        return 2
+                else:
+                    print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
 
             navigate_to_fillin(page)
             page.wait_for_timeout(2500)
-            fr = _report_frame(page)
+            # 必须选中『安卓升级状态填报』那个 iframe（有『显示行数』框）。闸门刚打开过展示报表时，
+            # 页面上会同时有两张报表的 iframe；选错了就会在展示报表上乱查，最后还打印『更新完成』。
+            fr = _report_frame(page, "fillin")
             if fr is None:
-                print(color("✗ 未找到填报表 frame", "red"))
+                print(color("✗ 没有进入『安卓升级状态填报』页（页面上没有『显示行数』框），终止，未做任何更新。", "red"))
+                _shot(page, "fillin_not_opened")
                 return 1
 
             fill_ok = True  # init 有行没填成功时置 False，最终以退出码 3 告知上层（publish 检查点4 据此判断）
@@ -914,27 +1051,43 @@ def main() -> int:
                 else:
                     print(color("\n⚠ 填写完成（尚未验证、尚未提交）。", "yellow"))
             else:
-                run_update(fr, page, records, option)
+                stats = run_update(fr, page, records, option) or {}
                 _shot(page, "update_done")
-                print(color("\n✅ 更新完成（尚未验证、尚未提交）。", "green"))
+                updated = (stats.get("stage1_updated", 0) + stats.get("stage2_updated", 0)
+                           + stats.get("already_at_stage", 0))
+                total = len({norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))})
+                if updated == 0:
+                    print(color(f"\n✗ 没有更新任何一行（共 {total} 个 Rule ID）。上面的日志里有原因；"
+                                "未进入人工提交环节。", "red"))
+                    return 1
+                if updated < total:
+                    fill_ok = False
+                    print(color(f"\n⚠ 只更新了 {updated}/{total} 个 Rule ID，其余未匹配或有歧义，见上面的日志"
+                                "（尚未验证、尚未提交）。", "yellow"))
+                else:
+                    print(color(f"\n✅ 更新完成：{updated}/{total} 个 Rule ID（尚未验证、尚未提交）。", "green"))
 
             # 更新 DASS 数据后自动显示 OTA 部署汇总（数据取自本次更新用的 Excel）。
             # 仅当该 Excel 含 Rule ID 列时显示；没有则静默跳过（如 init 未回写 Rule ID）。
-            try:
-                from .summary import print_summary
-                print("")
-                print_summary(excel)
-            except Exception as e:
-                print(color(f"（部署汇总显示跳过：{e}）", "dim"))
+            # 按 Rule ID 更新（excel=None）时没有 Excel：汇总与写库都跳过（部署记录已在库里）。
+            if excel:
+                try:
+                    from .summary import print_summary
+                    print("")
+                    print_summary(excel)
+                except Exception as e:
+                    print(color(f"（部署汇总显示跳过：{e}）", "dim"))
 
-            # 并把本次部署写入永久存储（JSONL + CSV，幂等：同键已存在则不重复写）。
-            try:
-                from .depdb import record_deployment_from_excel
-                owner = os.environ.get("OTA_OWNER", "").strip()
-                wrote, msg = record_deployment_from_excel(excel, owner=owner)
-                print(color(("✓ " if wrote else "· ") + msg, "green" if wrote else "dim"))
-            except Exception as e:
-                print(color(f"（部署记录写入跳过：{e}）", "dim"))
+                # 并把本次部署写入永久存储（JSONL + CSV，幂等：同键已存在则不重复写）。
+                try:
+                    from .depdb import record_deployment_from_excel
+                    owner = os.environ.get("OTA_OWNER", "").strip()
+                    wrote, msg = record_deployment_from_excel(excel, owner=owner)
+                    print(color(("✓ " if wrote else "· ") + msg, "green" if wrote else "dim"))
+                except Exception as e:
+                    print(color(f"（部署记录写入跳过：{e}）", "dim"))
+            else:
+                print(color("（按 Rule ID 更新：不重复写部署库，部署记录已在库里）", "dim"))
 
             if config.HEADED:
                 print("\n======== 人工核对环节 ========")

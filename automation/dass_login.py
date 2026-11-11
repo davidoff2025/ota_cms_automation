@@ -116,6 +116,55 @@ def _click_menu_in_any_frame(page, text: str) -> bool:
     return False
 
 
+def menu_item_visible(page, text: str) -> bool:
+    """菜单项（去掉图标字符后文字【恰好等于】text）当前是否可见。用来判断分组是否已经展开。"""
+    for fr in page.frames:
+        try:
+            loc = fr.get_by_text(text, exact=False)
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    raw = (el.inner_text() or "").strip()
+                    cleaned = "".join(ch for ch in raw if ch < "\ue000" or ch > "\uf8ff").strip()
+                    if cleaned == text:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def expand_menu_path(page, groups: list[str], leaf_candidates: list[str]) -> str | None:
+    """按当前菜单状态展开到叶子，返回实际可见的叶子文案（都不可见返回 None）。
+
+    ★ 分组项（Android New / OTA）点一下是【展开/折叠切换】。以前无条件依次点击，菜单已经是展开状态
+      时（例如刚用完另一个报表），再点反而把它折叠，叶子就找不到了。这里改成：只有下一层不可见时
+      才点击当前分组；叶子已经可见就不再动分组。
+    """
+    def visible_leaf():
+        return next((lf for lf in leaf_candidates if menu_item_visible(page, lf)), None)
+
+    leaf = visible_leaf()
+    if leaf:
+        return leaf
+    chain = list(groups)
+    for i, g in enumerate(chain):
+        nxt_visible = (menu_item_visible(page, chain[i + 1]) if i + 1 < len(chain) else bool(visible_leaf()))
+        if nxt_visible:
+            continue
+        print(f"\n点击菜单：{g} ...")
+        if _click_menu_in_any_frame(page, g):
+            print(f"  ✓ 已点击 {g}")
+        else:
+            print(f"  ⚠ 未找到菜单项：{g}")
+            _dump_visible_menu(page)
+        page.wait_for_timeout(1500)
+    return visible_leaf()
+
+
 def _dump_visible_menu(page) -> None:
     print("  未点中。当前可见的菜单/文字项（供校准）：")
     seen = set()
@@ -142,19 +191,16 @@ def navigate_to_fillin(page) -> None:
     """Auto-navigate the 3-level left menu:
     『Android New』(expand) -> 『OTA』(expand) -> 『安卓升级状态填报』(open report).
     """
-    steps = [
-        ("Android New", 1500),   # top-level group — expand
-        ("OTA", 1500),           # sub-group — expand
-        ("安卓升级状态填报", 9000),  # leaf — opens the fill-in report (slow)
-    ]
-    for text, wait_ms in steps:
-        print(f"\n点击菜单：{text} ...")
-        if _click_menu_in_any_frame(page, text):
-            print(f"  ✓ 已点击 {text}")
-        else:
-            print(f"  ⚠ 未找到菜单项：{text}")
-            _dump_visible_menu(page)
-        page.wait_for_timeout(wait_ms)
+    leaf = "安卓升级状态填报"
+    # 状态感知展开：菜单已展开就不再点分组（分组点击是切换，重复点会折叠）。
+    expand_menu_path(page, ["Android New", "OTA"], [leaf])
+    print(f"\n点击菜单：{leaf} ...")
+    if _click_menu_in_any_frame(page, leaf):
+        print(f"  ✓ 已点击 {leaf}")
+    else:
+        print(f"  ⚠ 未找到菜单项：{leaf}")
+        _dump_visible_menu(page)
+    page.wait_for_timeout(9000)  # 填报表打开较慢
 
 
 def inspect_fillin(page) -> None:
