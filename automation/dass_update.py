@@ -22,6 +22,17 @@ OPTION：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all（init 仍用 `./depl
 成功率闸门（ota200 起）会逐个显示每个 Rule ID 的成功率。不达标时默认中止；在交互终端里会问你是否
 『人工批复』继续——只有原样输入 override 才继续（之后仍要你核对并输入 approve 才提交），直接回车就中止。
 加 --strict 则完全不询问、不达标一律中止。
+
+CMS 灰度放开（默认开启，在成功率闸门通过之后、更新 DASS 之前）：
+  在 CMS「整机升级管理 → 在线规则」按设备类型代码 + 批量规则ID 搜出这些规则，看『累计检测数』确认当前处于
+  上一阶段（例如 ota50 要求当前为 5），批量操作类型选『批量灰度』→『配置最大升级检测数』选目标阶段
+  （ota50→50阶段、ota200→200阶段、ota1k→1000阶段、ota5k→5000阶段、ota20k→20000阶段、ota-all→全量）→
+  确定 →（你输入 yes 后）『执行批量操作』→ 回读累计检测数等于目标值。只有在 CMS 放开成功（或本来已是目标
+  阶段）的 Rule ID 才会接着更新 DASS。
+  --yes      跳过 CMS 执行前的 yes 确认
+  --no-cms   不动 CMS，只更新 DASS（旧行为）
+  --dry-run  测试模式：只在 CMS 找规则、核对累计检测数、打开配置窗口选好阶段后取消；
+             不执行批量操作、不做成功率闸门、不更新 DASS，什么都不改
 """
 from __future__ import annotations
 
@@ -106,9 +117,12 @@ def _read_excel_by_rule(path: str) -> dict | None:
         return None
 
 
-def _print_plan(option: str, resolved) -> None:
+def _print_plan(option: str, resolved, dry_run: bool = False) -> None:
     from .dass_fill import STAGE_LABELS
-    print(color(f"—— 将更新 DASS：{len(resolved)} 条 Rule ID → 阶段 {STAGE_LABELS[option]} ——", "bold"))
+    if dry_run:
+        print(color(f"—— 测试模式：{len(resolved)} 条 Rule ID（目标 {STAGE_LABELS[option]}），只在 CMS 走流程，不更新 DASS ——", "bold"))
+    else:
+        print(color(f"—— 将更新 DASS：{len(resolved)} 条 Rule ID → 阶段 {STAGE_LABELS[option]} ——", "bold"))
     print(f"  {'Rule ID':8} {'方案号':20} {'目标版本':14} {'设备扩展信息':18} 来源")
     for rec, src in resolved:
         print(f"  {rec['ruleid']:8} {rec['方案号']:20} {rec['目标版本']:14} {rec['设备扩展信息'] or '-':18} {src}")
@@ -124,10 +138,13 @@ def main() -> int:
 
     skip_missing = "--skip-missing" in argv
     strict = "--strict" in argv
+    no_cms = "--no-cms" in argv
+    dry_run = "--dry-run" in argv
+    assume_yes = "--yes" in argv
     option = None
     specs: list[str] = []
     for a in argv:
-        if a in ("--skip-missing", "--strict"):
+        if a in ("--skip-missing", "--strict", "--no-cms", "--yes", "--dry-run"):
             continue
         if a == "init":
             print(err("init 需要 Excel（要插入新行），请用：./deployota dass init"), file=sys.stderr)
@@ -175,9 +192,33 @@ def main() -> int:
         print(err("没有可更新的 Rule ID。"), file=sys.stderr)
         return 2
 
-    _print_plan(option, resolved)
+    _print_plan(option, resolved, dry_run)
     from .dass_fill import execute
-    return execute(option, [rec for rec, _ in resolved], None, allow_gate_override=not strict)
+    records = [rec for rec, _ in resolved]
+    if dry_run:
+        # 测试模式：只在 CMS 走一遍灰度放开流程（找规则、核对检测数、打开配置窗口后取消），
+        # 不做成功率闸门、不执行批量操作、不更新 DASS。
+        from playwright.sync_api import sync_playwright
+        from .active_offline import device_codes_for
+        from .cms_grey import run_grey_release
+        code_of, _ = device_codes_for([r["ruleid"] for r in records], batches)
+        for r in records:
+            code_of.setdefault(r["ruleid"], r.get("方案号", ""))
+        with sync_playwright() as p:
+            run_grey_release(p, option, code_of, dry_run=True)
+        print(color("（测试模式结束：成功率闸门和 DASS 更新都没有执行）", "dim"))
+        return 0
+    before = None
+    if not no_cms:
+        # CMS 灰度放开：成功率闸门通过之后、更新 DASS 之前执行。设备类型代码取自部署库（与 offline 相同）。
+        from .active_offline import device_codes_for
+        from .cms_grey import run_grey_release
+        code_of, _no_dev = device_codes_for([r["ruleid"] for r in records], batches)
+        for r in records:  # 明细里的方案号就是设备类型代码，部署库查不到时用它兜底
+            code_of.setdefault(r["ruleid"], r.get("方案号", ""))
+        before = lambda p: run_grey_release(p, option, code_of, assume_yes=assume_yes)
+        print(color("（流程：成功率闸门 → CMS 在线规则灰度放开 → DASS 更新阶段；加 --no-cms 只更新 DASS）", "dim"))
+    return execute(option, records, None, allow_gate_override=not strict, before_update=before)
 
 
 def _selftest() -> int:

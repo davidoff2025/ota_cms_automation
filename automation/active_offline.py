@@ -4,27 +4,23 @@
     ./deployota offline 50000                 # 单个
     ./deployota offline 50000-50005           # 区间
     ./deployota offline 50000,50003,50010     # 逗号分隔（可与区间混用、可给多个参数）
-    ./deployota offline 50000-50005 --yes     # 跳过下线前的人工确认
+    ./deployota offline 50000-50005 --yes     # 跳过开始前的确认
     ./deployota offline 50000 --device MT9655AMAndrGTV   # 部署库里查不到设备类型代码时手工指定
 
-流程：
-  1) 从部署库按 Rule ID 取出设备类型代码（--device 可覆盖）；取不到的不操作，列入『查不到设备类型代码』。
-  2) 打开「升级事件 → 规则上下线编排」，按设备类型分组，在『已选规则』区设一次设备类型。
-  3) 检查（只读）：每个 Rule ID 先在『已选规则』（=在线区）按规则ID精确搜索：
-       有这一行且有『下 线』按钮 → 在线，列入待下线；
-       否则去『待选规则』（=离线区）搜：有这一行且有『上 线』按钮 → 已离线，不操作；
-       两区都没有 → 未找到，不操作。
-     搜索前后都核对输入框里确实是目标号（防止填进『设备扩展信息』等其它框）。
-  4) 打印计划，你输入 yes 才开始下线（--yes 跳过）。不在线的 Rule ID 一律不动。
-  5) 逐条下线：重新搜索并锁定唯一目标行 → 点该行『下 线』→ 确认框『确认下线该规则?』出现后，
-     再确认背后搜索结果里仍是目标行，才在确认框里点『确定』（绝不点编排弹窗底部的『确 定』）。
-  6) 回读校验：『已选规则』里搜不到、并且『待选规则』里能搜到，才算下线成功。
+流程（不做单独的状态检查，逐个直接处理）：
+  1) 从部署库按 Rule ID 取设备类型代码（--device 可覆盖）；取不到的不处理。
+  2) 开始前确认一次（--yes 跳过）。
+  3) 打开「升级事件 → 规则上下线编排」，按设备类型分组，在『已选规则』区设一次设备类型。
+  4) 每个 Rule ID：在『已选规则』（在线区）按规则ID精确搜索——
+       搜到且有『下 线』按钮 → 点『下 线』→ 确认框『确认下线该规则?』里点『确定』
+         （点之前确认背后的搜索结果仍是目标行；绝不点编排弹窗底部的『确 定』）→
+         重新搜索，『已选规则』里没有了才算成功；
+       搜不到 → 已经下线或不存在，直接跳过。
+     每次搜索都核对输入框里确实是目标号（防止填进其它框）。
 
-结果分四类：下线成功 / 本来已离线 / 未找到（含查不到设备类型代码）/ 失败（附原因）。
-最后为下线成功的规则按设备类型代码打印『下线信息汇总』（与上线汇总同一张表，红色⛔标识）：
-设备类型代码 / 下线时间 / Rule ID / 升级类型 / 机型信息 / 机型扩展码 / 源版本 / 目标版本（目标完整版本）。
-明细优先取部署库/来源 Excel；取不到时用下线前在 CMS『已选规则』里看到的那一行。
-退出码：0 所有 Rule ID 最终都是离线状态；1 有未找到或失败的；2 参数问题或你取消。
+结果：下线成功 / 跳过（已下线或找不到）/ 查不到设备类型代码 / 失败（附原因），
+再为下线成功的规则打印『下线信息汇总』表。
+退出码：0 没有失败；1 有失败或有查不到设备类型代码的；2 参数问题或你取消。
 """
 from __future__ import annotations
 
@@ -39,9 +35,6 @@ from .active_ota import (
     _click_button_in,
     _detect_ui_error,
     _find_pending_row_by_ruleid,
-    _pending_rule_id_box,
-    _pending_form,
-    _pending_table,
     _search_selected_zone,
     _selected_table,
     _set_device_type_once,
@@ -53,10 +46,6 @@ from .login import _shot, login
 # 每次搜索后等目标行出现的最长时间（毫秒）。
 SEARCH_WAIT_MS = 6000
 
-# 分类结果
-ONLINE = "online"            # 在已选规则区（在线），可下线
-OFFLINE = "already_offline"  # 在待选规则区（离线）
-NOT_FOUND = "not_found"
 
 
 # ======================================================================
@@ -124,25 +113,23 @@ def offline_time_label(times: list[str]) -> str:
     return ts[0] if ts[0][:16] == ts[-1][:16] else f"{ts[0]} ~ {ts[-1]}"
 
 
-def format_offline_summary(success, already, not_found, no_device, failed) -> str:
+def format_offline_summary(success, skipped, no_device, failed) -> str:
     """最终汇总（纯逻辑）。failed = [(rid, 原因), ...]。"""
     def ids(xs):
         return ", ".join(xs) if xs else "-"
     lines = [color("======== offline 下线汇总 ========", "bold"),
              ok(f"下线成功（{len(success)}）：{ids(success)}"),
-             f"  本来已离线（{len(already)}）：{ids(already)}"]
-    if not_found:
-        lines.append(warn(f"两区都没找到（{len(not_found)}）：{ids(not_found)}"))
+             f"  跳过：已下线或找不到（{len(skipped)}）：{ids(skipped)}"]
     if no_device:
-        lines.append(warn(f"部署库查不到设备类型代码、未操作（{len(no_device)}）：{ids(no_device)}"
+        lines.append(warn(f"部署库查不到设备类型代码、未处理（{len(no_device)}）：{ids(no_device)}"
                           "（可用 --device 指定）"))
     if failed:
         lines.append(err(f"失败（{len(failed)}）："))
         for rid, why in failed:
             lines.append(color(f"    {rid}：{why}", "red"))
-    total = len(success) + len(already) + len(not_found) + len(no_device) + len(failed)
-    lines.append(f"  —— 总数：{total}  下线成功：{len(success)}  已离线：{len(already)}  "
-                 f"未找到：{len(not_found) + len(no_device)}  失败：{len(failed)}")
+    total = len(success) + len(skipped) + len(no_device) + len(failed)
+    lines.append(f"  —— 总数：{total}  下线成功：{len(success)}  跳过：{len(skipped)}  "
+                 f"未处理：{len(no_device)}  失败：{len(failed)}")
     return "\n".join(lines)
 
 
@@ -210,44 +197,6 @@ def _search_selected(modal, page, rid: str) -> tuple[int, str]:
     return _wait_row(page, _selected_table(modal), want), ""
 
 
-def _search_pending(modal, page, rid: str) -> tuple[int, str]:
-    """在『待选规则』区搜 rid。返回 (行索引或-1, 问题说明)。"""
-    want = norm_ruleid(rid)
-    try:
-        box = _pending_rule_id_box(modal)
-        box.fill(want)
-        got = (box.input_value() or "").strip()
-    except Exception as e:
-        return -1, f"待选规则区『规则ID』框定位失败：{e}"
-    if got != want:
-        return -1, f"待选规则区『规则ID』框里是 {got!r}，不是 {want!r}（可能填错了框）"
-    if not _click_button_in(_pending_form(modal), page, "搜索", "待选规则-搜索"):
-        return -1, "待选规则区的『搜索』按钮没点中"
-    return _wait_row(page, _pending_table(modal), want), ""
-
-
-def classify(modal, page, rid: str) -> tuple[str, str, dict]:
-    """只读判断一个 Rule ID 在哪个区。返回 (ONLINE/OFFLINE/NOT_FOUND 或 'error', 说明, 在线时该行各列)。"""
-    idx, problem = _search_selected(modal, page, rid)
-    if problem:
-        return "error", problem, {}
-    if idx >= 0:
-        table = _selected_table(modal)
-        row = table.locator("tbody tr").nth(idx)
-        if _row_has_button(row, "下线"):
-            return ONLINE, "在『已选规则』，有『下 线』按钮", _row_cells(table, idx)
-        return "error", "在『已选规则』找到这一行，但没有『下 线』按钮", {}
-    idx, problem = _search_pending(modal, page, rid)
-    if problem:
-        return "error", problem, {}
-    if idx >= 0:
-        row = _pending_table(modal).locator("tbody tr").nth(idx)
-        if _row_has_button(row, "上线"):
-            return OFFLINE, "在『待选规则』，有『上 线』按钮", {}
-        return "error", "在『待选规则』找到这一行，但没有『上 线』按钮", {}
-    return NOT_FOUND, "两区按规则ID都搜不到", {}
-
-
 def _confirm_offline(page, modal, rid: str) -> tuple[bool, str]:
     """在『确认下线该规则?』确认框里点『确定』。点之前确认背后的搜索结果仍是目标行。"""
     waited = 0
@@ -271,20 +220,34 @@ def _confirm_offline(page, modal, rid: str) -> tuple[bool, str]:
     return False, "没定位到确认框本身的作用域；为避免误点编排弹窗底部的『确 定』，未点击"
 
 
-def offline_one(modal, page, rid: str) -> tuple[bool, str]:
-    """下线一个已确认在线的 Rule ID，并回读校验。返回 (成功, 失败原因)。"""
+def _verify_gone(modal, page, rid: str, timeout_ms: int = SEARCH_WAIT_MS) -> tuple[bool, str]:
+    """重新在『已选规则』搜 rid，等它不在表里。返回 (已不在线, 问题说明)。"""
+    want = norm_ruleid(rid)
+    if not _search_selected_zone(modal, page, want):
+        return False, "回读时已选规则区的『搜索』按钮没点中"
+    waited = 0
+    while waited <= timeout_ms:
+        page.wait_for_timeout(250)
+        waited += 250
+        if _find_pending_row_by_ruleid(_selected_table(modal), want) < 0:
+            return True, ""
+    return False, "点了确定，但『已选规则』里仍能搜到（未下线）"
+
+
+def offline_one(modal, page, rid: str) -> tuple[str, str, dict]:
+    """处理一个 Rule ID。返回 (结果, 说明, 下线前该行各列)；结果 = 'done' | 'skipped' | 'failed'。"""
     idx, problem = _search_selected(modal, page, rid)
     if problem:
-        return False, problem
+        return "failed", problem, {}
     if idx < 0:
-        # 检查后状态变了（比如别人刚下线了）：再看一眼待选区。
-        pidx, _ = _search_pending(modal, page, rid)
-        return (True, "") if pidx >= 0 else (False, "重新搜索时『已选规则』里已经没有这一行，待选区也没有")
-    row = _selected_table(modal).locator("tbody tr").nth(idx)
+        return "skipped", "已选规则里搜不到（已下线或不存在）", {}
+    table = _selected_table(modal)
+    cells = _row_cells(table, idx)
+    row = table.locator("tbody tr").nth(idx)
     if not _row_has_button(row, "下线"):
-        return False, "目标行没有『下 线』按钮"
+        return "failed", "目标行没有『下 线』按钮", cells
     if not _click_button_in(row, page, "下线", f"下线({rid})"):
-        return False, "点『下 线』失败"
+        return "failed", "点『下 线』失败", cells
     ok_, why = _confirm_offline(page, modal, rid)
     if not ok_:
         _shot(page, f"offline_confirm_fail_{rid}")
@@ -292,23 +255,17 @@ def offline_one(modal, page, rid: str) -> tuple[bool, str]:
             page.keyboard.press("Escape")
         except Exception:
             pass
-        return False, why
-    page.wait_for_timeout(1500)
+        return "failed", why, cells
+    page.wait_for_timeout(1200)
     ui = _detect_ui_error(page)
     if ui:
         _shot(page, f"offline_ui_error_{rid}")
-        return False, "CMS 报错：" + " ".join(ui.split())
-    # 回读校验：已选区搜不到 + 待选区搜得到。
-    sidx, problem = _search_selected(modal, page, rid)
-    if problem:
-        return False, f"下线后回读失败：{problem}"
-    if sidx >= 0:
+        return "failed", "CMS 报错：" + " ".join(ui.split()), cells
+    gone, why = _verify_gone(modal, page, rid)
+    if not gone:
         _shot(page, f"offline_still_online_{rid}")
-        return False, "点了确定，但『已选规则』里仍能搜到（未下线）"
-    pidx, problem = _search_pending(modal, page, rid)
-    if problem or pidx < 0:
-        return False, "已从『已选规则』消失，但在『待选规则』里没搜到，状态不确定，请人工核对"
-    return True, ""
+        return "failed", why, cells
+    return "done", "", cells
 
 
 # ======================================================================
@@ -380,23 +337,30 @@ def main() -> int:
         return 2
     ids = list(dict.fromkeys(ids))
 
-    # 1) 设备类型代码
-    if device_override:
-        code_of, no_device = {rid: device_override for rid in ids}, []
-    else:
-        code_of, no_device = device_codes_for(ids, depdb.load_all())
-    groups = group_by_device(code_of)
+    # 1) 设备类型代码：--device > 部署库 > prep Excel；还没找到的登录后去 CMS『在线规则』页查
+    from .device_lookup import from_cms_online_rules, print_sources, resolve_local
+    code_of, src, missing = resolve_local(ids, device_override)
     print(color(f"offline：{len(ids)} 个 Rule ID", "bold"))
-    for dev, rids in groups.items():
-        print(f"  设备类型代码 {dev}：{', '.join(rids)}")
-    if no_device:
-        print(warn(f"部署库查不到设备类型代码，这些不操作：{', '.join(no_device)}（可用 --device 指定）"))
-    if not groups:
-        print(err("没有可处理的 Rule ID。"), file=sys.stderr)
-        print(format_offline_summary([], [], [], no_device, []))
-        return 1
+    print_sources(code_of, src, missing, color, warn)
+    no_device: list[str] = []
 
-    success, already, not_found, failed = [], [], [], []
+    # 开始前确认一次（不做单独的状态检查：在线的直接下线，已下线/找不到的跳过）
+    todo = list(ids)
+    print(color(f"\n将下线 {len(todo)} 个 Rule ID（在线的直接下线，已下线或找不到的跳过）：{', '.join(todo)}", "bold"))
+    print("  （下线会立即影响线上设备。）")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print(err("非交互终端无法确认，已取消。需要无人值守请加 --yes。"), file=sys.stderr)
+            return 2
+        try:
+            go = input("  输入 yes 开始下线，其它任意输入取消：").strip().lower() == "yes"
+        except EOFError:
+            go = False
+        if not go:
+            print("已取消，未下线任何规则。")
+            return 2
+
+    success, skipped, failed = [], [], []
     cms_cells: dict[str, dict] = {}   # 下线前在『已选规则』读到的行（汇总兜底用）
     off_time: dict[str, str] = {}     # 每条的下线时间
     with sync_playwright() as p:
@@ -405,90 +369,55 @@ def main() -> int:
         page = context.new_page()
         try:
             login(page)
+            if missing:
+                found = from_cms_online_rules(page, missing)
+                code_of.update(found)
+                for r in found:
+                    print(f"  {r}：CMS『在线规则』查到设备类型代码 {found[r]}")
+                gone = [r for r in missing if r not in found]
+                if gone:  # 不在『在线规则』里 = 不在线（或不存在），按约定直接跳过
+                    print(f"  跳过（『在线规则』里没有，已下线或不存在）：{', '.join(gone)}")
+                    skipped += gone
+            groups = group_by_device(code_of)
             modal = open_orchestration_modal(page)
-
-            # 2)+3) 只读检查：按设备类型分组设置一次设备类型，再逐个分类。
-            to_offline: list[tuple[str, str]] = []   # (device, rid)
-            print(color("\n—— 检查当前状态（只读）——", "bold"))
             for dev, rids in groups.items():
                 if not _set_device_type_once(page, modal, dev):
-                    for rid in rids:
-                        failed.append((rid, f"设置设备类型 {dev!r} 失败，未检查"))
+                    failed += [(r, f"设置设备类型 {dev!r} 失败，未处理") for r in rids]
                     continue
                 for rid in rids:
-                    st, why, cells = classify(modal, page, rid)
-                    if cells:
-                        cms_cells[rid] = cells
-                    tag = {ONLINE: color("在线", "green"), OFFLINE: "已离线",
-                           NOT_FOUND: color("未找到", "yellow")}.get(st, color("检查失败", "red"))
-                    print(f"  {rid}  {tag}  （{why}）")
-                    if st == ONLINE:
-                        to_offline.append((dev, rid))
-                    elif st == OFFLINE:
-                        already.append(rid)
-                    elif st == NOT_FOUND:
-                        not_found.append(rid)
-                    else:
-                        failed.append((rid, why))
-            _shot(page, "offline_checked")
-
-            # 4) 人工确认
-            if not to_offline:
-                print(warn("\n没有在线的 Rule ID，不做任何下线操作。"))
-            else:
-                print(color(f"\n将下线 {len(to_offline)} 个 Rule ID：{', '.join(r for _, r in to_offline)}", "bold"))
-                print("  （只操作上面列出的、确认在线的 Rule ID；其它一律不动。下线会立即影响线上设备。）")
-                go = assume_yes
-                if not go:
-                    if not sys.stdin.isatty():
-                        print(err("非交互终端无法确认，已取消。需要无人值守请加 --yes。"), file=sys.stderr)
-                        return 2
-                    try:
-                        go = input("  输入 yes 开始下线，其它任意输入取消：").strip().lower() == "yes"
-                    except EOFError:
-                        go = False
-                if not go:
-                    print("已取消，未下线任何规则。")
-                    print("\n" + format_offline_summary(success, already, not_found, no_device, failed))
-                    return 2
-
-                # 5)+6) 逐条下线 + 回读
-                print(color("\n—— 逐条下线 ——", "bold"))
-                cur_dev = None
-                for dev, rid in to_offline:
-                    if dev != cur_dev:
-                        if not _set_device_type_once(page, modal, dev):
-                            failed.append((rid, f"设置设备类型 {dev!r} 失败"))
-                            continue
-                        cur_dev = dev
                     print(f"\n---- 下线 Rule ID={rid} ----")
                     try:
-                        done, why = offline_one(modal, page, rid)
+                        res, why, cells = offline_one(modal, page, rid)
                     except Exception as e:
-                        done, why = False, f"异常：{e}"
-                    if done:
+                        res, why, cells = "failed", f"异常：{e}", {}
+                    if cells:
+                        cms_cells[rid] = cells
+                    if res == "done":
                         off_time[rid] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(ok(f"{rid} 已下线（已选规则里搜不到、待选规则里搜得到）"))
+                        print(ok(f"{rid} 已下线"))
                         success.append(rid)
+                    elif res == "skipped":
+                        print(f"  {rid} 跳过：{why}")
+                        skipped.append(rid)
                     else:
                         print(err(f"{rid} 下线失败：{why}"))
                         failed.append((rid, why))
-                _shot(page, "offline_done")
-
-            print("\n" + format_offline_summary(success, already, not_found, no_device, failed))
-            _print_offline_tables(success, code_of, cms_cells, off_time)
-            if config.HEADED:
-                print("\n浏览器将在 15 秒后关闭（可自行查看页面）...")
-                page.wait_for_timeout(15000)
-            return 0 if not (failed or not_found or no_device) else 1
+            _shot(page, "offline_done")
         except Exception as e:
             print(err(f"运行出错：{e}"))
             _shot(page, "offline_error")
-            print("\n" + format_offline_summary(success, already, not_found, no_device, failed))
-            return 1
+            handled = set(success) | set(skipped) | {r for r, _ in failed}
+            failed += [(r, f"未处理：{e}") for r in todo if r not in handled]
         finally:
+            if config.HEADED:
+                print("\n浏览器将在 15 秒后关闭（可自行查看页面）...")
+                page.wait_for_timeout(15000)
             context.close()
             browser.close()
+
+    print("\n" + format_offline_summary(success, skipped, no_device, failed))
+    _print_offline_tables(success, code_of, cms_cells, off_time)
+    return 0 if not (failed or no_device) else 1
 
 
 def _selftest() -> int:
@@ -510,10 +439,10 @@ def _selftest() -> int:
     check("库里没有的列为 missing", missing == ["59999"])
     g = group_by_device({"50003": "DEV_B", "50002": "DEV_A", "50000": "DEV_A"})
     check("按设备分组且组内升序", g == {"DEV_A": ["50000", "50002"], "DEV_B": ["50003"]})
-    s = format_offline_summary(["50000"], ["50001"], ["50004"], ["59999"], [("50002", "确认框没出现")])
-    check("汇总四类都列出", all(x in s for x in ("下线成功（1）", "本来已离线（1）", "两区都没找到（1）",
+    s = format_offline_summary(["50000"], ["50001", "50004"], ["59999"], [("50002", "确认框没出现")])
+    check("汇总四类都列出", all(x in s for x in ("下线成功（1）", "跳过：已下线或找不到（2）",
                                                "查不到设备类型代码", "50002：确认框没出现")))
-    check("汇总计数", "总数：5" in s and "未找到：2" in s and "失败：1" in s)
+    check("汇总计数", "总数：5" in s and "跳过：2" in s and "未处理：1" in s and "失败：1" in s)
     try:
         _parse_args(["50000", "--device"])
         bad = False

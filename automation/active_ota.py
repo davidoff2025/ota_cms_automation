@@ -1493,6 +1493,7 @@ active_ota —— CMS OTA 规则。collect / online 可单独用，publish 把�
 用法：
   ./run_active_ota.sh collect [EXCEL]      # 导入模板建规则 + 收集本批 Rule ID
   ./run_active_ota.sh online  [EXCEL]      # 从 Excel 读 Rule ID → 逐条上线 + 冲突 + 汇总
+  ./run_active_ota.sh online  50000-50005  # 直接给 Rule ID 上线（单个/区间/逗号；--device 指定设备类型代码）
   ./run_active_ota.sh publish [EXCEL]      # collect + online + dass init 合并，4 个检查点，任一失败醒目提醒
   ./run_active_ota.sh --probe-online       # 只读 dump 编排视图选择器
   ./run_active_ota.sh --selftest           # 纯逻辑自测（不连浏览器）
@@ -1738,6 +1739,133 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
 _SUBCOMMANDS = ("collect", "online", "publish")
 
 
+# Rule ID 规格：65370 / 65370-65379 / 65370,65375（可混用）。用来区分『Rule ID 参数』和『Excel 路径』。
+_RULE_SPEC_RE = re.compile(r"^\d[\d,，\-~\s]*$")
+
+
+def split_rule_args(argv: list[str]) -> tuple[list[str], list[str], str]:
+    """从参数里拿出 Rule ID 规格和 --device。返回 (剩余参数, Rule ID 规格列表, 设备类型代码)。"""
+    rest, specs, device = [], [], ""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--device":
+            if i + 1 >= len(argv):
+                print("✗ --device 后面要跟设备类型代码。")
+                raise SystemExit(2)
+            device = argv[i + 1].strip()
+            i += 2
+            continue
+        if a.startswith("--device="):
+            device = a.split("=", 1)[1].strip()
+        elif _RULE_SPEC_RE.match(a.strip()):
+            specs.append(a)
+        else:
+            rest.append(a)
+        i += 1
+    return rest, specs, device
+
+
+def _print_online_summary_by_ids(online_ids: list[str], code_of: dict) -> None:
+    """按 Rule ID 上线后的部署信息汇总：明细取部署库/来源 Excel（目标版本为目标完整版本）。"""
+    if not online_ids:
+        return
+    from .active_offline import group_by_device
+    from .dass_update import resolve_rules
+    from .summary import render_summary
+    from . import depdb
+    batches = depdb.load_all()
+    resolved, _ = resolve_rules(online_ids, batches)
+    details = {rec["ruleid"]: rec for rec, _src in resolved}
+    today = datetime.now().strftime("%Y%m%d")
+
+    def deploy_date(rid: str) -> str:
+        """部署时间取部署库批次（最新的有效批次）；库里没有才用今天。"""
+        owners = [b for b in batches if str(b.get("状态", depdb.STATUS_ACTIVE)) == depdb.STATUS_ACTIVE
+                  and rid in [x.strip() for x in str(b.get("Rule ID列表", "")).split(",")]]
+        return max((str(b.get("部署时间", "")) for b in owners), default="") or today
+
+    for dev, rids in group_by_device({r: code_of.get(r, "") for r in online_ids}).items():
+        rows = []
+        for rid in rids:
+            d = details.get(rid) or {}
+            rows.append({"Rule ID": rid, "升级类型": d.get("升级类型") or "-", "机型信息": d.get("机型") or "-",
+                         "机型扩展码": d.get("设备扩展信息") or "-", "源版本": d.get("源版本") or "-",
+                         "目标版本": d.get("目标版本") or "-", "部署时间": deploy_date(rid)})
+        print("")
+        print(render_summary(dev, rows, "online"))
+    missing = [r for r in online_ids if r not in details]
+    if missing:
+        print(color(f"  （{', '.join(missing)} 在部署库/来源 Excel 里没有明细，表中只有 Rule ID）", "dim"))
+
+
+def online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
+    """`deployota online 50000-50005`：按 Rule ID 上线。
+
+    设备类型代码取自部署库（--device 可覆盖；查不到的不处理）。按设备类型分组，每组走与 Excel 模式完全相同的
+    run_online（待选区搜索 → 上线 → 确认；冲突时看被冲突规则的 mac 组非空才替换；已上线的自动跳过），
+    组内回读状态，最后打印上线汇总和部署信息汇总表。
+    """
+    from .dass_perf_query import parse_ruleid_spec
+    from .active_offline import device_codes_for, group_by_device
+    from . import depdb
+    ids: list[str] = []
+    try:
+        for s in specs:
+            ids.extend(parse_ruleid_spec(s))
+    except ValueError as e:
+        print(color(f"✗ Rule ID 参数有误：{e}", "red"))
+        return 2
+    ids = list(dict.fromkeys(ids))
+    from .device_lookup import from_cms_online_rules, print_sources, resolve_local
+    code_of, src, missing = resolve_local(ids, device_override)
+    print(color(f"[online] 按 Rule ID 上线：{len(ids)} 个", "bold"))
+    print_sources(code_of, src, missing, color, lambda t: color("⚠ " + t, "yellow"))
+    no_dev: list[str] = []
+
+    final_all: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not config.HEADED)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            login(page)
+            if missing:
+                # 『在线规则』页能查到的说明已经在线（后面 run_online 会自动跳过）；查不到的只能 --device。
+                found = from_cms_online_rules(page, missing)
+                code_of.update(found)
+                for r in found:
+                    print(f"  {r}：CMS『在线规则』查到设备类型代码 {found[r]}（已在线）")
+                no_dev = [r for r in missing if r not in found]
+                if no_dev:
+                    print(color(f"⚠ 哪里都查不到设备类型代码，这些不处理：{', '.join(no_dev)}"
+                                "（还没上线的规则 CMS 侧查不到，请用 --device 指定）", "yellow"))
+            groups = group_by_device(code_of)
+            for dev, rids in groups.items():
+                print(color(f"\n======== 设备类型 {dev}：{len(rids)} 个 Rule ID ========", "bold"))
+                results = run_online(page, rids, dev)
+                # 回读要在切换设备类型之前做：已选区的搜索带着当前设备类型过滤。
+                final_all += read_final_status(page, rids, results)
+        except Exception as e:
+            print(color(f"✗ 运行出错：{e}", "red"))
+            _shot(page, "active_error")
+            done = {r["ruleid"] for r in final_all}
+            final_all += [{"ruleid": r, "status": STATUS_FAILED, "note": f"未处理：{e}"} for r in ids
+                          if r not in done and r not in no_dev]
+        finally:
+            if config.HEADED:
+                print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
+                time.sleep(20)
+            context.close()
+            browser.close()
+    print("\n" + summarize(final_all))
+    _print_online_summary_by_ids([r["ruleid"] for r in final_all if r.get("status") == STATUS_ONLINE], code_of)
+    if no_dev:
+        print(color(f"⚠ 未处理（查不到设备类型代码，可用 --device 指定）：{', '.join(no_dev)}", "yellow"))
+        return 2
+    return summary_exit_code(final_all)
+
+
 def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     """解析子命令 + 可选 Excel 路径。
 
@@ -1779,7 +1907,19 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
 
 
 def main() -> int:
-    mode, excel = _parse_cli(sys.argv[1:])
+    argv, rule_specs, device_override = split_rule_args(sys.argv[1:])
+    mode, excel = _parse_cli(argv)
+    if rule_specs or device_override:
+        if mode != "online":
+            print(color(f"✗ 只有 online 支持直接给 Rule ID（{mode} 请给 Excel）。", "red"))
+            return 2
+        if excel:
+            print(color("✗ Rule ID 和 Excel 不能同时给，二选一。", "red"))
+            return 2
+        if not rule_specs:
+            print(color("✗ 给了 --device 但没有 Rule ID。例：./deployota online 50000-50005", "red"))
+            return 2
+        return online_by_rule_ids(rule_specs, device_override)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not config.HEADED)

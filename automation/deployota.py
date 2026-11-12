@@ -28,6 +28,7 @@ run_dass.sh / run_login.sh）与本命令【并存】。
 """
 from __future__ import annotations
 
+import re
 import runpy
 import sys
 
@@ -62,6 +63,9 @@ def _resolve_excel_args(rest: list[str]) -> list[str] | None:
     """
     import os
     if any(a in ("-h", "--help", "--selftest") for a in rest):
+        return rest
+    # online 直接给 Rule ID（如 50000-50005）时不需要 Excel，原样转发、不注入 prep 的 Excel。
+    if any(re.match(r"^\d[\d,，\-~\s]*$", a.strip()) for a in rest):
         return rest
     base = os.environ.get("OTA_CALLER_CWD") or os.getcwd()
     out, has_excel = [], False
@@ -101,8 +105,8 @@ def _usage() -> str:
         "子命令：",
         "  prep     生成 Excel → 严格校验 → 上传 S3（上传后 boto3 回查确认）",
         "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
-        "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）",
-        "  offline  按 Rule ID 下线（单个/区间/逗号）：只下线确认在线的，其它不动；下线前需输入 yes（--yes 跳过）（CMS）",
+        "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）；可给 Excel，或直接给 Rule ID（50000-50005）",
+        "  offline  按 Rule ID 下线（单个/区间/逗号）：在线的直接下线，已下线或找不到的跳过；开始前确认一次（--yes 跳过）（CMS）",
         "  publish  upload + online + dass init 一步到位，4 个检查点（导入成功 / 得到 Rule ID / 上线成功 / DASS 填报完成），任一失败醒目提醒（--no-dass 则不含 DASS）",
         "  update   按 Rule ID 更新 DASS 的 OTA 阶段（ota50/ota200/ota1k/ota5k/ota20k/ota-all；Rule ID 单个/区间/逗号），含成功率闸门",
         "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
@@ -116,7 +120,8 @@ def _usage() -> str:
         "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
         "  ./deployota upload                    # 用 prep 刚生成的 Excel",
         "  ./deployota online                    # 同上（upload 已把 Rule ID 回写到这份 Excel）",
-        "  ./deployota offline 50000-50005       # 下线这些 Rule ID（先检查在线状态、再确认）",
+        "  ./deployota online 50000-50005        # 直接按 Rule ID 上线",
+        "  ./deployota offline 50000-50005       # 下线这些 Rule ID（已下线/找不到的跳过）",
         "  ./deployota publish                   # upload + online + dass init 一步到位，带检查点",
         "  ./deployota update ota200 65370-65379 # 按 Rule ID 更新 DASS 阶段（自动从部署库取方案号/目标版本等）",
         "  ./deployota dass init                 # DASS 插入新行（需要 Excel，默认用 prep 刚生成的）",

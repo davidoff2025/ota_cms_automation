@@ -966,7 +966,7 @@ def _gate_override(allow: bool) -> bool:
 
 
 def execute(option: str, records: list[dict], excel: str | None = None,
-            allow_gate_override: bool = True) -> int:
+            allow_gate_override: bool = True, before_update=None) -> int:
     """用已经准备好的记录列表执行 DASS 填报/更新（浏览器会话 + 闸门 + 人工批复）。
 
     记录来源不限：Excel（main）或按 Rule ID 从部署库解析（deployota update，见 dass_update）。
@@ -1031,6 +1031,21 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 else:
                     print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
 
+            # ———— 闸门之后、更新 DASS 之前的外部步骤（deployota update 用它在 CMS 做灰度放开）————
+            # 回调收到 playwright 实例 p，返回可以继续更新 DASS 的 Rule ID 集合；None = 中止。
+            if before_update is not None:
+                ok_ids = before_update(p)
+                if ok_ids is None:
+                    print(color("\n⛔ CMS 灰度放开未完成：DASS 不更新。", "red"))
+                    return 4
+                kept = [r for r in records if norm_ruleid(r.get("ruleid", "")) in ok_ids]
+                dropped = sorted({norm_ruleid(r.get("ruleid", "")) for r in records} - set(ok_ids))
+                if dropped:
+                    print(color(f"\n⚠ 这些 Rule ID 在 CMS 没有放开，DASS 也不更新：{', '.join(dropped)}", "yellow"))
+                if not kept:
+                    print(color("\n⛔ 没有在 CMS 放开成功的 Rule ID，DASS 不更新。", "red"))
+                    return 4
+                records = kept
             navigate_to_fillin(page)
             page.wait_for_timeout(2500)
             # 必须选中『安卓升级状态填报』那个 iframe（有『显示行数』框）。闸门刚打开过展示报表时，
