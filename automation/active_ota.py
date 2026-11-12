@@ -1366,6 +1366,10 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> l
             note = p.get("note", "回读未在『已选规则』找到或操作列非『下线』")
             merged.append({"ruleid": rid, "status": STATUS_FAILED, "note": note})
     _shot(page, "active_final_list")
+    online_ids = [r["ruleid"] for r in merged if r.get("status") == STATUS_ONLINE]
+    if online_ids:
+        from .stage_db import record_cms
+        record_cms(online_ids, "在线", "online")
     return merged
 
 
@@ -1487,54 +1491,51 @@ def probe_online(page) -> None:
 # CLI
 # ======================================================================
 
-_HELP_TEXT = """\
-active_ota —— CMS OTA 规则。collect / online 可单独用，publish 把两步合并并设检查点。
+_HELP_COMMON = """\
+Excel：省略时用 prep 最近生成的那份；也可写路径（相对路径按当前目录）。
+退出码：0 成功；1 运行出错；2 参数问题 / 有未上线或冲突中止；publish 检查点失败 11/12/13/14。
+CMS_HEADED=true（默认）开可见浏览器；导入、上线、替换都会改线上数据，不可撤销。"""
 
-用法：
-  ./run_active_ota.sh collect [EXCEL]      # 导入模板建规则 + 收集本批 Rule ID
-  ./run_active_ota.sh online  [EXCEL]      # 从 Excel 读 Rule ID → 逐条上线 + 冲突 + 汇总
-  ./run_active_ota.sh online  50000-50005  # 直接给 Rule ID 上线（单个/区间/逗号；--device 指定设备类型代码）
-  ./run_active_ota.sh publish [EXCEL]      # collect + online + dass init 合并，4 个检查点，任一失败醒目提醒
-  ./run_active_ota.sh --probe-online       # 只读 dump 编排视图选择器
-  ./run_active_ota.sh --selftest           # 纯逻辑自测（不连浏览器）
-  ./.venv/bin/python -m automation.active_ota <同上>
+_HELP_BY_MODE = {
+    "collect": """\
+active_ota collect [EXCEL] —— CMS 导入模板建规则，回收本批 Rule ID 写回 Excel（publish 的第 1-2 步；不再单独作为 deployota 子命令）
 
-子命令 / 模式：
-  collect [EXCEL]  连 CMS：导入模板 → 建规则 → 去「OTA升级模板」按标题精确匹配本批行 →
-                   「查看规则」读『规则ID』列，升序打印本批 Rule ID（数量应 = Excel 去表头行数）。【写线上数据：导入】
-  online  [EXCEL]  连 CMS：从 Excel 的【Rule ID】列读本批 Rule ID → 在「升级事件 → 规则上下线」
-                   编排弹窗逐条上线 + 处理「规则替换」冲突 → 回读状态汇总。【写线上数据：上线/替换】
-  publish [EXCEL] [--no-dass]
-                   collect + online + dass init 合并执行，4 个检查点（--no-dass 则只前 3 个）：
-                   ①导入上传成功 ②得到 Rule ID（数量==Excel行数，回写并回读一致）③全部上线成功
-                   ④DASS init 填报完成（上线全部成功后才跑；填写后仍需你在终端人工核对、输入 approve 才提交）。
-                   任一检查点失败：红色醒目提醒（原因+下一步）、后续步骤不执行、退出码 11/12/13/14。
-                   Excel 已含 Rule ID（说明导入过）时拒绝重复导入。【写线上数据：导入+上线/替换】
-  --probe-online   连 CMS，只读 dump「规则上下线编排」视图的选择器，不做任何写操作。【只读/安全】
-  --selftest       纯逻辑自测（名称/备注拼接、冲突号解析、mac组判定、汇总），不连浏览器。【离线/安全】
-  -h, --help       显示本帮助并退出。
+  1) OTA升级模板 → 导入模板：名称 = 设备类型代码_目标版本末5位（多个目标版本全部带上），备注 = YYYYMMDD_USA_行数
+  2) 在模板列表按名称找到本批 → 查看规则 → 读规则ID（数量应 = Excel 数据行数）
+  3) 把『升级方式 / 升级日期 / Rule ID』三列写回同一个 Excel
+要求：整表只有一个设备类型代码；目标版本可以有多个。之后用 ./deployota online 上线。
+""",
+    "online": """\
+deployota online [EXCEL | Rule ID...] [--device CODE] —— CMS 上线
 
-参数：
-  EXCEL            可选，Excel 路径；省略则取 OTA_V4_OUTPUTS 下最新的 .xlsx。
-                   collect 要求整表单一「设备类型代码」；「目标版本」可有多个（名称带上全部版本末5位）。
-                   online 从表头为【Rule ID】（或 ruleid / RuleID）的列读本批 Rule ID。
+  ./deployota online                      用 prep 最近生成的 Excel 里的 Rule ID 列
+  ./deployota online 路径.xlsx            指定 Excel
+  ./deployota online 50000-50005          直接给 Rule ID（单个 / 区间 / 逗号，可混用）
+  ./deployota online 50000 --device X     找不到设备类型代码时手工指定（一般不需要）
 
-决策要点（D1~D12）：
-  名称 = 设备类型代码 + "_" + 目标版本末5位（例 MT9655AMAndrGTV_Q1015）。
-  备注 = 今天日期YYYYMMDD + "_USA_" + 导入行数（例 20261102_USA_9，行数去表头）。
-  冲突「规则替换」：解析被冲突 Rule ID → 去「已选规则」查其 mac组，非空才点「确定」替换上线，
-         mac组为空则点「取消」中止该条并记录。上线全自动，不加人工确认。
+逐条：已在『已选规则』的跳过 → 『待选规则』按 Rule ID 搜索 → 上 线 → 确认。
+出现『规则替换』冲突：查被冲突规则的 mac 组，非空才替换，为空或读不到则中止该条。
+结束后回读状态，打印上线汇总和部署信息汇总表，并记录 CMS 状态『在线』。
+设备类型代码按 Rule ID 自动找：部署库 → prep Excel → CMS 在线规则页。
+""",
+    "publish": """\
+deployota publish [EXCEL] [--no-dass] —— 一步完成：导入 → Rule ID → 上线 → DASS 场测
 
-退出码：0 全部成功；2 缺子命令/无 Rule ID/存在冲突中止或未上线/publish 前置检查不通过；1 运行出错；
-         publish 检查点失败：11=导入 12=Rule ID 13=上线 14=DASS init。
+  检查点 ① 导入成功  ② 得到 Rule ID（数量 = Excel 行数，回写并读回一致）
+         ③ 全部上线  ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
+  任一检查点失败：红框提醒原因和下一步，后面不再执行。--no-dass 只做前 3 个。
+  Excel 已含 Rule ID（导入过）时拒绝重复导入，只需上线请用 ./deployota online。
+""",
+}
 
-环境：
-  CMS_USERNAME / CMS_PASSWORD   在 config/.env 配置（run_active_ota.sh 会检查）。
-  CMS_HEADED=true（默认）         开可见浏览器窗口，便于盯着写流程。
 
-⚠ 安全提示：collect 会真实导入规则；online 会真实上线/替换线上规则，均不可逆。
-  首次使用建议顺序：先 --selftest，再 --probe-online，再用仅含 1 条的测试 Excel 小批量试跑，确认无误后再整批。
-  所有写按钮（导入确定/上线确定/替换确定）均经二次确认 gate，条件不满足只打印不点。"""
+def _help_text(mode: str | None) -> str:
+    if mode in _HELP_BY_MODE:
+        return _HELP_BY_MODE[mode] + "\n" + _HELP_COMMON
+    return "\n".join(_HELP_BY_MODE.values()) + "\n" + _HELP_COMMON
+
+
+
 
 
 # —— publish：导入(upload) + 上线(online) 合并，三个检查点逐一把关 ——
@@ -1880,7 +1881,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     excel: str | None = None
     for arg in argv:
         if arg in ("-h", "--help"):
-            print(_HELP_TEXT)
+            print(_help_text(mode))
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"

@@ -49,7 +49,7 @@ from ._log import ok as _ok, warn as _warn, err as _err, color as _c
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m automation.prep",
+        prog="deployota prep",
         description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 上传 S3（三步一键）。",
     )
     p.add_argument("--file", dest="file", default=None,

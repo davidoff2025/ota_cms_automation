@@ -49,7 +49,7 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 
 | 用途 | 变量 |
 |---|---|
-| CMS 登录（publish / upload / online / backfill） | `CMS_USERNAME`、`CMS_PASSWORD` |
+| CMS 登录（publish / online / offline / update） | `CMS_USERNAME`、`CMS_PASSWORD` |
 | DASS 登录（dass / publish 的第 4 步） | `DASS_USERNAME`、`DASS_PASSWORD` |
 | 下载 FTP 升级包（prep 真实上传） | `OTA_FTP_USER`（默认 ftpuser）、`OTA_FTP_PASS` |
 | 部署记录的负责人（可选） | `OTA_OWNER` |
@@ -86,7 +86,7 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 要点：
 
 - **不用每步都写 Excel 路径**。`prep` 通过校验后会记下它生成的那份 Excel（`.last_prep.json`），
-  之后 `upload` / `online` / `publish` / `dass` 不带 Excel 参数时自动用它，并打印用的是哪个文件。
+  之后 `online` / `publish` / `dass` 不带 Excel 参数时自动用它，并打印用的是哪个文件。
   想用别的文件就在命令末尾写路径。
 - **第一次建议用只有 1 条数据的测试 Excel 小批量试跑**，确认无误再整批。
 - 第 3 步放量不再需要 Excel：`update` 按 Rule ID 去部署库取方案号、目标版本、设备扩展信息，再去 DASS 更新。
@@ -98,15 +98,13 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 | 命令 | 作用 | 写线上数据？ |
 |---|---|---|
 | `./deployota prep` | 生成 Excel → 严格校验 → FTP 下载 → 上传 S3 | 是（S3，`--no-upload` 则否） |
-| `./deployota publish` | upload + online + dass init，4 个检查点 | 是（CMS 导入/上线，DASS 填报） |
-| `./deployota upload` | 只做 CMS 导入并回收 Rule ID，回写 Excel | 是（CMS 导入） |
+| `./deployota publish` | CMS 导入 + 回收 Rule ID + 上线 + dass init，4 个检查点 | 是（CMS 导入/上线，DASS 填报） |
 | `./deployota online [Rule ID]` | 逐条上线 + 冲突处理 + 汇总（Excel，或直接给 Rule ID） | 是（CMS 上线/替换） |
 | `./deployota offline <Rule ID>` | 按 Rule ID 下线（在线的直接下线，已下线/找不到的跳过） | 是（CMS 下线，需输入 yes） |
 | `./deployota update <OPTION> <Rule ID>` | 按 Rule ID 更新 DASS 的 OTA 阶段，含成功率闸门 | 是（DASS，提交需你输入 approve） |
 | `./deployota dass [OPTION]` | DASS 填报（init 插入新行）；也保留按 Excel 更新的旧用法 | 是（DASS，提交需你输入 approve） |
 | `./deployota query <ID>` | 按 Rule ID 查部署信息（单个 / 区间 / 逗号） | 否 |
 | `./deployota history` | 查看部署历史 | 否 |
-| `./deployota backfill` | 从 CMS 只读回补历史部署记录 | 否（默认 dry-run） |
 
 每个子命令都支持 `--help`：`./deployota <子命令> --help`。
 
@@ -204,12 +202,11 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 - 同一份 Excel 可以含**多个目标版本**，模板名称会带上全部版本的末 5 位，例如 `MT9666AndrWH80E_3.9.2_3.9.4`；
   但**设备类型代码必须只有一个**。
 
-### 4.3 `upload` 与 `online`：分步执行
+### 4.3 `online`：上线
 
-需要分开做（或 `publish` 中途失败后补做）时使用。
+单独上线（或 `publish` 中途失败后补做）时使用。导入建规则只在 `publish` 里做，不再单独提供 `upload`。
 
 ```bash
-./deployota upload      # 导入模板 → 回收 Rule ID → 回写 Excel 的「升级方式 / 升级日期 / Rule ID」三列
 ./deployota online      # 从 Excel 的 Rule ID 列读出 → 逐条上线 → 冲突处理 → 汇总
 ./deployota online 50000-50005               # 直接给 Rule ID 上线（单个 / 区间 / 逗号，可混用）
 ./deployota online 50000 --device MT9655AMAndrGTV   # 部署库里查不到设备类型代码时手工指定
@@ -265,7 +262,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 **设备类型代码怎么找**（online / offline 通用，`--device` 只在特殊情况下需要）：
 
 1. 部署库（优先有效批次）；
-2. prep 最近生成的 Excel——`upload` 已把 Rule ID 回写进去，刚 upload、还没入库的新规则靠这一步；
+2. prep 最近生成的 Excel——`publish` 的导入步骤已把 Rule ID 回写进去，刚导入、还没入库的新规则靠这一步；
 3. CMS「在线规则」页按批量规则ID 查「设备类型」列（只能查到已在线的规则）。
 
 只有「还没上线、又不在部署库和 prep Excel 里」的规则查不到（CMS「待选规则」区不先选设备类型就搜不出来），
@@ -311,6 +308,10 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 只有 CMS 放开成功（或本来已是目标阶段）的 Rule ID 才会接着更新 DASS；CMS 一个都没放开时 DASS 不动（退出码 4）。
 `--yes` 跳过这次确认，`--no-cms` 只更新 DASS（旧行为）。每次最多 20 个 Rule ID 一组。
 
+**DASS 分组提交**：当这批规则大多不在上一阶段、要按设备扩展信息逐组精选时，DASS 有未提交的编辑就不能再查询下一组。
+交互模式下，每组写完会停下来让你在浏览器核对，**输入 `approve` 提交本组并自动继续下一组**；输入其它内容就停止，
+剩下的记为未处理（之后用同一条命令再跑，已到目标阶段的会自动跳过）。已在目标阶段之后的规则不会被改回（不降级）。
+
 **测试模式 `--dry-run`**：只在 CMS 把流程走一遍，什么都不改——找到规则、核对累计检测数、切到批量灰度、
 打开「配置最大升级检测数」选好目标阶段并核对检测数自动填对，然后点「取 消」；不点确定、不点「执行批量操作」，
 也不做成功率闸门、不更新 DASS。正式执行前建议先跑一次：
@@ -335,7 +336,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 
 | 原因 | 说明 |
 |---|---|
-| 部署库里没有 | 先部署入库，或用 `./deployota backfill` 回补 |
+| 部署库里没有 | 需先经 `publish` / `dass init` 入库 |
 | 只在「作废」批次里 | 作废批次不能更新 |
 | 批次没有明细且来源 Excel 不可用 | 例如 CMS 回补来的批次（来源是 `CMS:` 开头）：CMS 只给「X_to_Y」形式的版本，没有 DASS 要的完整目标版本，无法自动查询 |
 
@@ -388,6 +389,23 @@ CMS_HEADED=true ./.venv/bin/python -m automation.dass_perf_query \
 ```
 
 存在低于 50% 的行时返回码为 1（正常，表示这批升级会被闸门拦下）。纯只读。
+
+### 4.4c 灰度阶段记录
+
+每个 Rule ID 有一条灰度阶段时间线，存在 `$OTA_WORKSPACE/OTADATA/rule_stages.jsonl`（只追加的事件日志），
+同时导出 `rule_stages.csv`（每个 Rule ID 一行：当前阶段、场测/50/200/1K/5K/20K/完全开放 各阶段日期、CMS 状态）。
+
+| 事件 | 记录 |
+|---|---|
+| `dass init` 填写完成（含 `publish` 第 4 步） | 阶段 **场测** |
+| `update otaXX` 在 CMS 灰度放开成功（回读累计检测数 = 目标值） | 阶段 50 / 200 / 1K / 5K / 20K / 完全开放 |
+| `update --no-cms` 或 `dass otaXX`（不经 CMS） | 以 DASS 更新成功为准记录阶段 |
+| `online` / `publish` 上线成功 | CMS 状态 **在线** |
+| `offline` 下线成功 | CMS 状态 **已下线**（不改 DASS，也不动阶段时间线） |
+
+规则：只前进不回退；同一阶段只保留第一次的日期（重跑不改日期）；跳档照写并标注。
+`./deployota query <Rule ID>` 的结果里会显示每个 Rule ID 的当前阶段、时间线和 CMS 状态。
+已有的老 Rule ID 没有补历史阶段，从现在开始记录。
 
 ### 4.5 `history`：部署历史
 
@@ -442,28 +460,9 @@ JSONL 为主存，同时导出 CSV。
 注意：`64,700` 这种只有一组三位数字的写法会被当作带千分位逗号的单个号 64700；
 要查两个号请写成 `64700,64701`。
 
-### 4.7 `backfill`：回补 CMS 历史记录（只读）
+### 4.7 旧入口
 
-把 CMS「OTA升级模板」里早期的批次只读抓回部署库，补齐手工 Excel 之前的记录。
-
-```bash
-CMS_HEADED=true ./deployota backfill                          # 默认 dry-run：只预览+统计，不写库
-CMS_HEADED=true ./deployota backfill --commit                 # 真正写库（去重合并）
-./deployota backfill --since 2026-04-01 --owner devinw --limit 5
-```
-
-| 参数 | 说明 |
-|---|---|
-| `--since YYYY-MM-DD` | 回溯截止日期，默认 `2026-04-01`；列表创建时间早于它即停止翻页 |
-| `--owner NAME` | 只处理该创建人的模板，默认 `devinw` |
-| `--commit` / `--dry-run` | 互斥；默认 dry-run，写库必须显式 `--commit` |
-| `--max-pages N` / `--limit N` | 翻页保护上限（默认 100）/ 只抓前 N 个（调试） |
-
-备注含 `VOID`（忽略大小写）的批次落为「作废」。脚本对 CMS 只做登录、翻页、点「查看规则」和读文本，不点任何写按钮。
-
-### 4.8 旧入口
-
-`run_prep.sh`、`run_active_ota.sh`、`run_dass.sh`、`run_login.sh` 仍可用，与 `./deployota` 并存。
+`run_prep.sh`、`run_active_ota.sh`、`run_dass.sh`、`run_login.sh` 仍可用，但**不推荐**，也不再出现在 `./deployota --help` 里；日常请只用 `./deployota`。
 注意：旧入口**没有**「默认用 prep 刚生成的 Excel」这个功能，不带 Excel 时会取 `OTA_V4_OUTPUTS` 目录里最新的 `.xlsx`。
 `active_ota` 还有两个调试选项：`./run_active_ota.sh --probe-online`（只读 dump 编排视图选择器）和 `--selftest`。
 
@@ -512,7 +511,7 @@ CMS_HEADED=true ./deployota backfill --commit                 # 真正写库（�
 |---|---|
 | `prep` | `0` 成功；`1` 生成/校验/上传失败；`2` 参数问题或你取消 |
 | `publish` | `0` 全部通过；`2` 前置检查不通过（未动 CMS）；`11` 导入失败；`12` Rule ID 问题；`13` 上线失败；`14` DASS init 失败 |
-| `upload` / `online` | `0` 全部成功；`1` 运行出错；`2` 无 Rule ID、存在冲突中止或未上线 |
+| `online` | `0` 全部成功；`1` 运行出错；`2` 无 Rule ID、存在冲突中止或未上线 |
 | `dass` | `0` 成功；`1` 出错；`2` 成功率闸门未通过；`3` init 有行没填成功 |
 | `dass_perf_query` | `1` 存在成功率低于 50% 的 Rule ID |
 | `query` | `0` 全部找到；`1` 有未找到的；`2` 参数有误 |
@@ -530,7 +529,7 @@ CMS_HEADED=true ./deployota backfill --commit                 # 真正写库（�
 | `--file` 报找不到文件 | 路径写错（注意文件名里的空格）；路径含空格或中文要加引号 |
 | `--file` 报「临时锁文件」 | `~$xxx.xlsx` 是 Excel 打开时产生的，请指定原文件 |
 | `--file` 报「不支持旧版 Excel」 | `.xls` 请另存为 `.xlsx` |
-| `publish`/`upload` 报「目标版本已经存在」 | CMS 里已有同设备同目标版本的模板。先核对旧模板；已导入过就用 `online`，不要重跑 |
+| `publish` 报「目标版本已经存在」 | CMS 里已有同设备同目标版本的模板。先核对旧模板；已导入过就用 `online`，不要重跑 |
 | `publish` 拒绝「Excel 已含 Rule ID」 | 说明已导入。只需上线用 `./deployota online` |
 | 报「设备类型代码应为单一值」 | 一份 Excel 只能含一个设备类型代码，请拆分文件（目标版本可以有多个） |
 | 检查点② 数量不符 | 到 CMS 核对模板的规则数量；不会自动上线。核对后把 Rule ID 填进 Excel 再用 `online` |
@@ -553,7 +552,6 @@ CMS_HEADED=true ./deployota backfill --commit                 # 真正写库（�
   mac 组等判断只要不确定就保守中止，不猜。
 - `prep` 的 FTP 下载和 S3 上传不可逆，演练先加 `--no-upload`。
 - 升级成功率不达标时自动中止，避免把低成功率批次继续放量。
-- `backfill` 对 CMS 严格只读，默认 dry-run。
 - 每个关键步骤自动截图到 `artifacts/`，便于核对。
 - 请确认自动化内部系统的做法符合公司规范。
 
@@ -596,7 +594,7 @@ ota_cms_automation/
     dass_data.py          # 读取更新后的 Excel → 填报字段
     depdb.py              # 部署库（JSONL + CSV）与 history
     rule_info.py          # 按 Rule ID 查部署信息
-    depdb_backfill.py     # CMS 历史只读回补
+    depdb_backfill.py     # CMS 历史只读回补（维护用，已不在 deployota 菜单里：python -m automation.depdb_backfill）
     summary.py            # dass 更新后的部署汇总表
     _log.py               # 彩色日志
     login.py / dass_login.py / inspect_*.py   # 登录与页面探测

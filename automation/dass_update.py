@@ -1,38 +1,28 @@
-"""deployota update —— 按 Rule ID 更新 DASS 的 OTA 阶段（原来 `dass otaXX <Excel>` 的 Rule ID 版）。
+"""deployota update <OPTION> <Rule ID...> —— 按 Rule ID 放量
 
-用法：
-    ./deployota update ota200 65370                  # 单个 Rule ID
-    ./deployota update ota200 65370-65379            # 区间
-    ./deployota update ota1k  65370,65375,65380      # 逗号分隔（区间可混用）
-    ./deployota update ota50  65370-65372 65380      # 也可给多个参数
+  ./deployota update ota50  65370-65372 65380      Rule ID：单个 / 区间 / 逗号，可混用
+  ./deployota update ota50  65370 --dry-run        测试模式：只在 CMS 走一遍流程，什么都不改
+  ./deployota update ota200 65370-65379 --yes      跳过 CMS 执行前的 yes 确认
 
-OPTION：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all（init 仍用 `./deployota dass init`，它要 Excel）。
+OPTION（只前进）：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
 
-做法：
-  1) 把参数解析成 Rule ID 列表；
-  2) 在部署库（depdb）里找到每个 Rule ID 所属的有效批次，取出它的 方案号(设备类型代码) /
-     完整目标版本 / 设备扩展信息 等：优先用批次里存的『规则明细』；老批次没有明细就去读来源 Excel；
-  3) 打印解析结果，然后交给 dass_fill 现有的更新逻辑（ota200 起先过成功率闸门；
-     Stage1 方案号+目标版本+上一阶段 粗筛，Stage2 加设备扩展信息精选；写当前阶段/当前阶段时间；
-     最后仍由你在终端输入 approve 才提交）。
+流程：
+  1) 按 Rule ID 从部署库取方案号、目标完整版本、设备扩展信息（老批次没明细时读来源 Excel）。
+  2) 成功率闸门（ota200 起）：报表里每个 Rule ID 的成功率都 ≥ 50% 才放行，逐个显示成功率；
+     不达标时在终端原样输入 override 可人工批复继续（--strict 则不询问、直接中止）。
+  3) CMS「在线规则」灰度放开：按设备类型代码 + 批量规则ID 搜索，累计检测数必须是上一阶段的值
+     （ota50 要求 5、ota200 要求 50 …），批量灰度 → 配置最大升级检测数选目标阶段 → 确定 →
+     你输入 yes → 执行批量操作 → 回读累计检测数 = 目标值才算成功，并记录灰度阶段。
+  4) DASS 更新『当前阶段 / 当前阶段时间』（只更新第 3 步成功的）。需要逐组处理时，每组写完会停下，
+     输入 approve 提交本组并继续下一组。最后仍由你核对、输入 approve 提交。
 
-解析不出来的 Rule ID（库里没有 / 只在作废批次里 / 没有明细且 Excel 不在）会逐个列出原因，
-默认整体中止（什么都不改）；加 --skip-missing 则只处理能解析的那些。
-
-成功率闸门（ota200 起）会逐个显示每个 Rule ID 的成功率。不达标时默认中止；在交互终端里会问你是否
-『人工批复』继续——只有原样输入 override 才继续（之后仍要你核对并输入 approve 才提交），直接回车就中止。
-加 --strict 则完全不询问、不达标一律中止。
-
-CMS 灰度放开（默认开启，在成功率闸门通过之后、更新 DASS 之前）：
-  在 CMS「整机升级管理 → 在线规则」按设备类型代码 + 批量规则ID 搜出这些规则，看『累计检测数』确认当前处于
-  上一阶段（例如 ota50 要求当前为 5），批量操作类型选『批量灰度』→『配置最大升级检测数』选目标阶段
-  （ota50→50阶段、ota200→200阶段、ota1k→1000阶段、ota5k→5000阶段、ota20k→20000阶段、ota-all→全量）→
-  确定 →（你输入 yes 后）『执行批量操作』→ 回读累计检测数等于目标值。只有在 CMS 放开成功（或本来已是目标
-  阶段）的 Rule ID 才会接着更新 DASS。
-  --yes      跳过 CMS 执行前的 yes 确认
-  --no-cms   不动 CMS，只更新 DASS（旧行为）
-  --dry-run  测试模式：只在 CMS 找规则、核对累计检测数、打开配置窗口选好阶段后取消；
-             不执行批量操作、不做成功率闸门、不更新 DASS，什么都不改
+选项：
+  --dry-run       测试模式（不做闸门、不执行批量操作、不改 DASS）
+  --yes           跳过 CMS 执行前的确认
+  --no-cms        不动 CMS，只更新 DASS（以 DASS 更新成功记录阶段）
+  --strict        闸门不达标直接中止，不询问人工批复
+  --skip-missing  部署库里解析不出的 Rule ID 跳过，其余照常（默认整体中止）
+退出码：0 成功；1 出错；2 参数问题 / 闸门未通过 / 有解析不出的；4 CMS 一个都没放开。
 """
 from __future__ import annotations
 
@@ -65,7 +55,7 @@ def resolve_rules(rule_ids: list[str], batches: list[dict], read_excel=None):
         owners = [b for b in batches
                   if rid in [x.strip() for x in str(b.get("Rule ID列表", "")).split(",")]]
         if not owners:
-            problems.append((rid, "部署库里没有这个 Rule ID（先部署入库，或用 `./deployota backfill` 回补）"))
+            problems.append((rid, "部署库里没有这个 Rule ID（需先经 publish / dass init 入库）"))
             continue
         active = [b for b in owners if str(b.get("状态", depdb.STATUS_ACTIVE)) == depdb.STATUS_ACTIVE]
         if not active:

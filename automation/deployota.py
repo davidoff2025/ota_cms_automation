@@ -1,30 +1,15 @@
-"""deployota —— OTA 部署统一入口（薄分发壳）。
+"""deployota —— OTA 部署统一入口（薄分发）：把 `deployota <子命令> [参数...]` 原样转发给对应模块。
 
-把分散的各功能模块归到一个命令下，便于记忆与将来编排成工作流。本模块【只做分发】：
-把 `deployota <子命令> [参数...]` 的剩余参数【原样转发】给对应的现有模块执行，
-不重写、不改动任何被转发模块的逻辑/参数/自测。旧入口（run_prep.sh / run_active_ota.sh /
-run_dass.sh / run_login.sh）与本命令【并存】。
-
-子命令映射：
-  prep    -> automation.prep            生成 Excel → 严格校验 → 上传 S3（上传后 boto3 校验）
-  upload  -> automation.active_ota collect   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel
-  offline -> automation.active_offline     按 Rule ID 下线（online 的反向）
-  publish -> automation.active_ota publish   upload + online + dass init 合并，4 个检查点
-  online  -> automation.active_ota online    在「规则上下线编排」逐条上线 + 冲突处理
-  query   -> automation.rule_info       按 Rule ID 查部署信息（单个/区间/逗号）
-  update  -> automation.dass_update     按 Rule ID 更新 DASS 阶段
-  dass    -> automation.dass_fill       DASS 填报/更新（OPTION: init/ota200/.../ota-all，含成功率闸门）
-
-用法：
-  ./deployota <子命令> [该子命令的参数...]
-  ./deployota --help                 列出子命令
-  ./deployota <子命令> --help         查看该子命令自己的帮助（转发给对应模块）
-
-示例：
-  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV
-  ./deployota upload /路径/更新后的.xlsx
-  ./deployota online /路径/更新后的.xlsx
-  ./deployota dass ota200 /路径/更新后的.xlsx
+子命令 -> 模块：
+  prep     -> automation.prep              生成 Excel → 校验 → FTP 下载 → 上传 S3
+  publish  -> automation.active_ota publish  upload + online + dass init，4 个检查点
+  online   -> automation.active_ota online   上线（Excel 或 Rule ID）
+  dass     -> automation.dass_fill         DASS 填报（init）
+  update   -> automation.dass_update       放量：成功率闸门 → CMS 灰度 → DASS 阶段
+  offline  -> automation.active_offline    按 Rule ID 下线
+  query    -> automation.rule_info         按 Rule ID / 月份查部署信息与灰度阶段
+  history  -> automation.depdb             部署历史
+菜单见 _usage()；各子命令的详细帮助：./deployota <子命令> --help。
 """
 from __future__ import annotations
 
@@ -36,7 +21,6 @@ import sys
 # 预置前缀用于把一个模块的两个子命令（active_ota 的 collect/online）拆成两个 deployota 子命令。
 _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "prep":   ("automation.prep",       []),
-    "upload": ("automation.active_ota", ["collect"]),
     "online": ("automation.active_ota", ["online"]),
     "publish": ("automation.active_ota", ["publish"]),
     "offline": ("automation.active_offline", []),
@@ -44,13 +28,12 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "update": ("automation.dass_update", []),
     "history": ("automation.depdb",     []),
     "query":  ("automation.rule_info",  []),
-    "backfill": ("automation.depdb_backfill", []),
 }
 
 _PROG = "deployota"
 
 # 需要 Excel 的子命令：命令行没给 Excel 时，默认用 prep 最近一次生成的那份。
-_EXCEL_SUBCOMMANDS = ("upload", "online", "publish", "dass")
+_EXCEL_SUBCOMMANDS = ("online", "publish", "dass")
 _EXCEL_EXTS = (".xlsx", ".xlsm")
 
 
@@ -95,38 +78,36 @@ def _resolve_excel_args(rest: list[str]) -> list[str] | None:
 
 def _usage() -> str:
     lines = [
-        "deployota —— OTA 部署统一入口（薄分发）。",
+        "deployota —— OTA 部署统一入口",
         "",
-        "用法：",
-        f"  ./{_PROG} <子命令> [该子命令的参数...]",
-        f"  ./{_PROG} --help               列出子命令",
-        f"  ./{_PROG} <子命令> --help       查看该子命令的帮助",
+        "用法：./deployota <子命令> [参数...]      ./deployota <子命令> --help 看详细帮助",
         "",
-        "子命令：",
-        "  prep     生成 Excel → 严格校验 → 上传 S3（上传后 boto3 回查确认）",
-        "  upload   导入 OTA 模板建规则 + 收集 Rule ID 回写 Excel（CMS）",
-        "  online   在「规则上下线编排」逐条上线 + 冲突处理（CMS）；可给 Excel，或直接给 Rule ID（50000-50005）",
-        "  offline  按 Rule ID 下线（单个/区间/逗号）：在线的直接下线，已下线或找不到的跳过；开始前确认一次（--yes 跳过）（CMS）",
-        "  publish  upload + online + dass init 一步到位，4 个检查点（导入成功 / 得到 Rule ID / 上线成功 / DASS 填报完成），任一失败醒目提醒（--no-dass 则不含 DASS）",
-        "  update   按 Rule ID 更新 DASS 的 OTA 阶段（ota50/ota200/ota1k/ota5k/ota20k/ota-all；Rule ID 单个/区间/逗号），含成功率闸门",
-        "  dass     DASS 填报/更新（OPTION: init/ota200/ota1k/ota5k/ota20k/ota-all，含成功率闸门；完成后自动显示汇总并记录部署）",
-        "  query    按 Rule ID 查部署信息（单个 / 区间 65370-65379 / 逗号 65370,65375，可混用）",
-        "  history  查看 OTA 部署历史（--device 过滤 / --limit N / --export 导出 CSV）",
-        "  backfill CMS 部署历史回补（只读抓取 OTA升级模板 → 去重合并入库；默认 dry-run，--commit 才写）",
+        "一次完整部署：",
+        "  ./deployota prep --file 申请模板.xlsx      ① 生成标准 Excel + 升级包上传 S3",
+        "  ./deployota publish                       ② CMS 导入 → Rule ID → 上线 → DASS 场测（4 个检查点）",
+        "  ./deployota update ota50 <Rule ID>        ③ 逐档放量：ota50 → ota200 → ota1k → ota5k → ota20k → ota-all",
         "",
-        "upload / online / publish / dass 不给 Excel 时，默认使用 prep 最近一次生成的那份（记录在 .last_prep.json）。",
+        "准备",
+        "  prep      生成标准 Excel → 严格校验 → FTP 下载 → 上传 S3",
+        "部署",
+        "  publish   CMS 导入建规则 → 回收 Rule ID → 上线 → DASS init，4 个检查点，任一失败醒目提醒",
+        "  dass      DASS 填报：dass init 插入新行（场测）",
+        "上线 / 下线（只动 CMS）",
+        "  online  <Rule ID | Excel>   上线；不给参数 = 用 prep 最近生成的 Excel",
+        "  offline <Rule ID>           下线：在线的直接下线，已下线或找不到的跳过（不改 DASS）",
+        "放量",
+        "  update  <阶段> <Rule ID> [选项]",
+        "          阶段：ota50 | ota200 | ota1k | ota5k | ota20k | ota-all（只前进）",
+        "          流程：成功率闸门（ota200 起）→ CMS 在线规则灰度放开 → DASS 更新阶段",
+        "          选项：--dry-run  测试模式，只在 CMS 走一遍流程、什么都不改",
+        "                --yes      跳过 CMS 执行前的确认",
+        "                --no-cms   不动 CMS，只更新 DASS",
+        "                --strict   闸门不达标直接中止，不询问人工批复",
+        "查询",
+        "  query   <Rule ID | 月份>    所属批次、版本、灰度阶段时间线（如 query 65370-65379、query 2026.04-2026.10）",
+        "  history                     部署历史列表（--device / --owner / --limit / --export）",
         "",
-        "示例：",
-        "  ./deployota prep --file x.txt --device-code MT9655AMAndrGTV",
-        "  ./deployota upload                    # 用 prep 刚生成的 Excel",
-        "  ./deployota online                    # 同上（upload 已把 Rule ID 回写到这份 Excel）",
-        "  ./deployota online 50000-50005        # 直接按 Rule ID 上线",
-        "  ./deployota offline 50000-50005       # 下线这些 Rule ID（已下线/找不到的跳过）",
-        "  ./deployota publish                   # upload + online + dass init 一步到位，带检查点",
-        "  ./deployota update ota200 65370-65379 # 按 Rule ID 更新 DASS 阶段（自动从部署库取方案号/目标版本等）",
-        "  ./deployota dass init                 # DASS 插入新行（需要 Excel，默认用 prep 刚生成的）",
-        "  ./deployota upload /路径/更新后的.xlsx   # 也可显式指定",
-        "  ./deployota query 65370-65379,65385   # 查这些 Rule ID 属于哪个批次、什么版本变化",
+        "Rule ID 写法：65370 / 65370-65379 / 65370,65375 / 混用；设备类型代码按 Rule ID 自动查找（--device 可选）。",
     ]
     return "\n".join(lines)
 

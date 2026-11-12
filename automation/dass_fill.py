@@ -406,24 +406,6 @@ def existing_row_info(fr, letters: dict) -> list[dict]:
     return [r for r in rows if r.get("方案号", "") != ""]
 
 
-def list_toolbar_buttons(fr) -> list[dict]:
-    """列出填报表里可见的按钮（文字 + class），用于定位验证/提交等操作。"""
-    return fr.evaluate(
-        """() => {
-            const out = [];
-            const els = document.querySelectorAll(
-                "button, input[type=button], input[type=submit], .x-button, [class*='fr-btn'], [class*='x-emb']");
-            for (const e of els) {
-                const r = e.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) continue;
-                const txt = (e.innerText || e.value || '').trim();
-                out.push({text: txt, cls: e.className || '', tag: e.tagName.toLowerCase()});
-            }
-            return out;
-        }"""
-    )
-
-
 def _click_button_by_text(fr, page, keywords: list[str], label: str) -> bool:
     """点击文字包含 keywords 之一的可见按钮。成功返回 True。"""
     for kw in keywords:
@@ -471,7 +453,7 @@ def _click_exact_button(fr, page, selector: str, label: str) -> bool:
             if el.is_visible():
                 el.scroll_into_view_if_needed(timeout=2000)
                 el.click()
-                print(f"  ✓ 已点击『{label}』按钮（{selector}）")
+                print(f"  ✓ 已点击『{label}』")
                 page.wait_for_timeout(1500)
                 return True
         except Exception:
@@ -482,16 +464,12 @@ def _click_exact_button(fr, page, selector: str, label: str) -> bool:
 
 def approve_and_submit(fr, page) -> bool:
     """校验 -> 提交（精确 class 定位）。找不到提交按钮时安全返回 False，绝不盲目点击其它按钮。"""
-    btns = list_toolbar_buttons(fr)
-    print("  当前可见按钮：")
-    for b in btns:
-        print(f"    {b['text']!r:14} <{b['tag']} class={b['cls']!r}>")
 
     # 1) 数据校验（Data validation）—— 若按钮不存在/不可见，打印信息后继续尝试提交。
-    _click_exact_button(fr, page, "button.fr-btn-text.x-emb-verify", "数据校验/Data validation")
+    _click_exact_button(fr, page, "button.fr-btn-text.x-emb-verify", "数据校验")
 
     # 2) 提交（Submit）—— 找不到则返回 False，绝不点击 Save/删除行等其它按钮。
-    submitted = _click_exact_button(fr, page, "button.fr-btn-text.x-emb-submit", "提交/Submit")
+    submitted = _click_exact_button(fr, page, "button.fr-btn-text.x-emb-submit", "提交")
     if not submitted:
         print(color("  ✗ 未找到『提交/Submit』按钮，未提交。请手动在页面提交。", "red"))
         return False
@@ -644,7 +622,7 @@ def _header_guard(letters: dict, option: str, phase: str) -> list[str]:
     return [c for c in needed if c not in letters]
 
 
-def run_update(fr, page, records, option: str) -> dict:
+def run_update(fr, page, records, option: str, on_blocked=None) -> dict:
     """update 路径：查询驱动的两阶段『粗筛批量匹配 + 精准回退』更新已存在行。返回统计字典。
 
     不插入行、不应答任何 prompt。本批次的权威标识是 Excel 所有记录的 ruleid 集合。
@@ -727,10 +705,22 @@ def run_update(fr, page, records, option: str) -> dict:
     state = {"dirty": False, "blocked": False}
     stage_order = list(STAGE_LABELS.values())
 
+    later_stage: set[str] = set()  # 已在目标阶段之后（跳过、不降级）的 ruleid —— 不算『到达本阶段』
+
+    def _resolve_dirty() -> bool:
+        """有未提交编辑时：若有 on_blocked 回调（交互模式），让你核对并提交本组，提交成功就能继续查询；
+        否则停下（剩下的记为未处理）。没有未提交编辑直接 True。"""
+        if not state["dirty"]:
+            return True
+        if not state["blocked"] and on_blocked is not None and on_blocked():
+            state["dirty"] = False
+            return True
+        state["blocked"] = True
+        return False
+
     def _guarded_query(filters: dict):
-        """有未提交编辑时拒绝查询（返回 None）；否则正常查询。"""
-        if state["dirty"]:
-            state["blocked"] = True
+        """有未提交编辑且没能提交时拒绝查询（返回 None）；否则正常查询。"""
+        if not _resolve_dirty():
             return None
         return _run_query(fr, page, filters)
 
@@ -795,7 +785,17 @@ def run_update(fr, page, records, option: str) -> dict:
                     print(f"  · 结果行 {row['n']} 的 ruleid={rid!r} 已更新过，跳过。")
                     continue
                 if rid in excel_ruleids:
-                    if _write_row(row["n"], letters, session, "Stage1", rid):
+                    why = _stage_skip_reason(row)
+                    if why:  # ota50 的 Stage1 不带阶段条件，可能查出已到/已过目标阶段的行
+                        satisfied_ruleids.add(rid)
+                        if why == "already":
+                            stats["already_at_stage"] += 1
+                        else:
+                            stats["skipped_later_stage"] += 1
+                            later_stage.add(rid)
+                        print(f"  · ruleid={rid!r} 当前阶段={row.get('当前阶段', '')!r}，"
+                              + ("已是目标阶段，跳过。" if why == "already" else "已在目标阶段之后，跳过（不降级）。"))
+                    elif _write_row(row["n"], letters, session, "Stage1", rid):
                         stats["stage1_updated"] += 1
                         satisfied_ruleids.add(rid)
                 else:
@@ -806,8 +806,7 @@ def run_update(fr, page, records, option: str) -> dict:
     for rid in sorted(excel_ruleids - satisfied_ruleids):
         if rid in satisfied_ruleids:  # 已在前面某次精选查询里作为同组规则处理过
             continue
-        if state["blocked"] or state["dirty"]:
-            state["blocked"] = True
+        if state["blocked"] or not _resolve_dirty():
             stats["not_processed"] += 1
             continue
         rec = excel_by_ruleid[rid]
@@ -845,6 +844,8 @@ def run_update(fr, page, records, option: str) -> dict:
                 satisfied_ruleids.add(srid)
                 key = "already_at_stage" if why == "already" else "skipped_later_stage"
                 stats[key] += 1
+                if why != "already":
+                    later_stage.add(srid)
                 print(f"  · ruleid={srid!r} 当前阶段={sib.get('当前阶段', '')!r}，"
                       + ("已是目标阶段，跳过。" if why == "already" else "已在目标阶段之后，跳过（不降级）。"))
             elif _write_row(sib["n"], letters, session, "Stage2", srid):
@@ -854,6 +855,8 @@ def run_update(fr, page, records, option: str) -> dict:
             why = _stage_skip_reason(matches[0])
             satisfied_ruleids.add(rid)
             stats["already_at_stage" if why == "already" else "skipped_later_stage"] += 1
+            if why != "already":
+                later_stage.add(rid)
             print(f"  · ruleid={rid!r} 当前阶段={matches[0].get('当前阶段', '')!r}，"
                   + ("已是目标阶段，跳过。" if why == "already" else "已在目标阶段之后，跳过（不降级）。"))
         elif len(matches) == 1:
@@ -869,6 +872,8 @@ def run_update(fr, page, records, option: str) -> dict:
                         f"方案号={k_scheme!r} 目标版本={k_target!r} 设备扩展信息={k_ext!r}", "yellow"))
             stats["skipped_ambiguous"] += 1
 
+    # 到达本阶段的 ruleid（写入成功 + 本来就是目标阶段），供阶段记录用；不含『已在之后』的。
+    stats["reached"] = sorted(satisfied_ruleids - later_stage, key=lambda x: int(x) if x.isdigit() else 0)
     if state["blocked"]:
         print(color(f"\n⚠ 还有 {stats['not_processed']} 个 Rule ID 未处理：DASS 有未提交的编辑时不能再查询"
                     "（否则会丢掉已写入的内容）。请先核对并提交本批，再运行同一条命令处理剩下的"
@@ -906,12 +911,14 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     for arg in argv:
         if arg in ("-h", "--help"):
             print(
-                "用法：python -m automation.dass_fill [OPTION] [EXCEL]\n"
-                f"  OPTION 取值：{' / '.join(VALID_OPTIONS)}（默认 init）\n"
-                "  EXCEL  可选 Excel 路径；不给则取 OTA_V4_OUTPUTS 下最新的 .xlsx。\n"
-                "示例：\n"
-                "  ./run_dass.sh \"/路径/文件.xlsx\"          # init，填空\n"
-                "  ./run_dass.sh ota50 \"/路径/文件.xlsx\"    # 更新已存在行\n"
+                "deployota dass init [EXCEL] —— DASS『安卓升级状态填报』插入新行（场测）\n\n"
+                "  ./deployota dass init              用 prep 最近生成的 Excel（需已有 Rule ID 列）\n"
+                "  ./deployota dass init 路径.xlsx    指定 Excel\n\n"
+                "  插入 N 行并逐格填写 → 你在浏览器核对 → 终端输入 approve 才提交。\n"
+                "  填写完成后记录阶段『场测』，并把本批写入部署库。publish 第 4 步就是它。\n\n"
+                "放量（ota50 起）请用 ./deployota update <ota50|ota200|ota1k|ota5k|ota20k|ota-all> <Rule ID>。\n"
+                "（旧用法 dass <otaXX> <Excel> 仍可用，但不经过 CMS 灰度，不推荐。）\n"
+                "退出码：0 成功；1 出错；2 成功率闸门未通过；3 有行没填成功。"
             )
             raise SystemExit(0)
         if arg == "--strict":
@@ -1060,13 +1067,42 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             if option == "init":
                 ok_all = run_init(fr, page, records)
                 fill_ok = bool(ok_all)
+                init_ids = [norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))]
+                if ok_all and init_ids:
+                    from .stage_db import record_stage
+                    record_stage(init_ids, "init", "dass init",
+                                 {norm_ruleid(r.get("ruleid", "")): r.get("方案号", "") for r in records})
+                elif init_ids:
+                    print(color("（有行没填成功，本次不写『场测』阶段记录）", "dim"))
                 _shot(page, "fill_done")
                 if ok_all:
                     print(color("\n✅ 填写完成（尚未验证、尚未提交）。", "green"))
                 else:
                     print(color("\n⚠ 填写完成（尚未验证、尚未提交）。", "yellow"))
             else:
-                stats = run_update(fr, page, records, option) or {}
+                # 交互模式下，一组写完、需要再查询下一组时，先让你核对并提交本组，提交后自动继续。
+                def _approve_group() -> bool:
+                    if not (config.HEADED and sys.stdin.isatty()):
+                        return False
+                    try:
+                        ans = input("\n本组已写入。核对后输入 approve 提交并继续下一组（其它输入 = 停止）：").strip().lower()
+                    except EOFError:
+                        ans = ""
+                    if ans not in ("approve", "提交", "submit", "yes", "y"):
+                        return False
+                    if approve_and_submit(fr, page):
+                        print(color("✓ 本组已提交，继续下一组。", "green"))
+                        page.wait_for_timeout(1500)
+                        return True
+                    print(color("⚠ 本组没能自动提交，停止后续分组。", "yellow"))
+                    return False
+
+                stats = run_update(fr, page, records, option, on_blocked=_approve_group) or {}
+                if before_update is None and stats.get("reached"):
+                    # 不经 CMS（--no-cms / dass otaXX）：以 DASS 更新成功为准记录阶段。
+                    from .stage_db import record_stage
+                    record_stage(stats["reached"], option, f"dass {option}",
+                                 {norm_ruleid(r.get("ruleid", "")): r.get("方案号", "") for r in records})
                 _shot(page, "update_done")
                 updated = (stats.get("stage1_updated", 0) + stats.get("stage2_updated", 0)
                            + stats.get("already_at_stage", 0))
@@ -1105,16 +1141,11 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 print(color("（按 Rule ID 更新：不重复写部署库，部署记录已在库里）", "dim"))
 
             if config.HEADED:
-                print("\n======== 人工核对环节 ========")
-                print("请先在浏览器里逐行检查刚填入/更新的数据是否正确。")
-                print("确认无误后，输入 approve 回车，脚本才会执行『验证 -> 提交』；")
-                print("若发现问题，输入其它任意内容（或直接回车）即取消，不做任何验证/提交。")
                 try:
-                    ans = input("是否批复并提交？[approve/提交 确认，其它取消]：").strip().lower()
+                    ans = input("\n请在浏览器核对后输入 approve 提交（其它输入 = 不提交）：").strip().lower()
                 except EOFError:
                     ans = ""
                 if ans in ("approve", "提交", "submit", "yes", "y"):
-                    print("\n开始批复并提交 ...")
                     ok_submit = approve_and_submit(fr, page)
                     if ok_submit:
                         print(color("\n✅ 记录已提交。可在浏览器确认结果。", "green"))

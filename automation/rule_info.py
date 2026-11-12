@@ -1,26 +1,13 @@
-"""按 Rule ID 查询部署信息（只读，查本地部署库）。
+"""deployota query <Rule ID... | 月份> —— 查部署信息（只读，查本地部署库）
 
-用法：
-    ./deployota query 65370                    # 单个
-    ./deployota query 65370-65379              # 区间（闭区间）
-    ./deployota query 65370,65375,65380        # 逗号分隔
-    ./deployota query 65370-65372,65380        # 区间与逗号可混用
-    ./deployota query 65370 65380-65383        # 也可给多个参数
+  ./deployota query 65370                 单个
+  ./deployota query 65370-65379,65385     区间 / 逗号，可混用
+  ./deployota query 2026.04               一个月：列出所有批次和 Rule ID，统计批次数 / 规则条数
+  ./deployota query 2026.04-2026.10       月份区间（也可写 2026/04、2026年04月）
 
-按月份查（列出这段时间部署的所有批次和 Rule ID，并统计批次数 / 规则条数）：
-    ./deployota query 2026.04                  # 一个月
-    ./deployota query 2026.04-2026.10          # 月份区间（含首尾月，也可写 2026.04~2026.10）
-    ./deployota query 2026/04-2026/10          # 分隔符可用 . / 或 年月（2026年04月）
-
-对每个 Rule ID 找到它所属的部署批次（可能同时落在一个『作废』批次和一个『有效』批次里，都会列出），
-同一批次里的多个 Rule ID 合并成一段显示（如 65370~65379），批次信息只打印一次：
-设备类型代码 / 源版本 → 目标版本 / 升级类型 / 状态 / 部署时间 / Owner / 设备扩展码 / 来源。
-库里没有的 Rule ID 单独列在末尾。
-
-数据来自 depdb（每次 dass 更新后自动入库；历史批次可用 `deployota backfill` 回补）。
-部署库按『批次』存，只记批次第一行的源版本/目标版本；所以当来源 Excel 还在时，会再按行读出
-每个 Rule ID 自己的 机型 / 设备扩展信息 / 源版本 → 目标版本 / 升级类型（逐条明细）。
-来源不是本机 Excel（如 CMS 回补的批次）或文件已不在时，只显示批次信息并给出提示。
+按 Rule ID 查：所属批次（设备类型代码、目标完整版本、升级类型、部署时间、Owner…）、
+每个 Rule ID 自己的机型 / 设备扩展信息 / 版本（来源 Excel 在时），以及灰度阶段时间线和 CMS 状态。
+退出码：0 全部找到；1 有找不到的 / 该时间段没有部署；2 参数有误。
 """
 from __future__ import annotations
 
@@ -245,6 +232,25 @@ def _print_rule_rows(rec: dict, hit_ids: list[str]) -> None:
               f"{r.get('源版本') or '-'} → {r.get('目标版本') or '-'}  [{r.get('升级类型') or '-'}]")
 
 
+_STAGE_STATE: dict | None = None
+
+
+def _print_stage_lines(hit_ids: list[str]) -> None:
+    """每个 Rule ID 的灰度阶段时间线与 CMS 在线状态（来自 rule_stages.jsonl）。"""
+    global _STAGE_STATE
+    from . import stage_db
+    if _STAGE_STATE is None:
+        _STAGE_STATE = stage_db.build_state(stage_db.load_events())
+    print("    灰度阶段：")
+    for rid in sorted(hit_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        st = _STAGE_STATE.get(rid)
+        if not st:
+            print(color(f"      {rid}  （没有阶段记录）", "dim"))
+            continue
+        cms = f"  CMS={st['CMS状态']}（{st['CMS状态时间'][:16]}）" if st["CMS状态"] else ""
+        print(f"      {rid}  当前={st['当前阶段'] or '-'}  {stage_db.timeline(st) or '-'}{cms}")
+
+
 def _print_group(rec: dict, hit_ids: list[str]) -> None:
     void = str(rec.get("状态", depdb.STATUS_ACTIVE)) == depdb.STATUS_VOID
     tag = color("[作废]", "red") if void else color("[有效]", "green")
@@ -270,6 +276,7 @@ def _print_group(rec: dict, hit_ids: list[str]) -> None:
     for k, v in rows:
         print(f"    {k}：{v}")
     _print_rule_rows(rec, hit_ids)
+    _print_stage_lines(hit_ids)
 
 
 def show(spec_args: list[str]) -> int:
@@ -320,7 +327,7 @@ def show_rules(spec_args: list[str]) -> int:
           (("，" + warn(f"未找到 {len(missing)} 个")) if missing else ""))
     if missing:
         print(f"  未找到：{compress_ids(missing)}")
-        print(color("  （部署库只含已入库的批次：dass 更新后自动入库；更早的批次可用 `./deployota backfill` 回补）",
+        print(color("  （部署库只含已入库的批次：publish / dass init 完成后自动入库）",
                     "dim"))
     return 1 if missing else 0
 

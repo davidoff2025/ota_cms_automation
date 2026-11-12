@@ -346,7 +346,10 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
         if not todo:
             print(warn("没有需要在 CMS 放开的 Rule ID。"))
             _print_grey_summary(option, done, already, mismatch, failed)
-            return set(already)
+            if already and not dry_run:
+                from .stage_db import record_stage
+                record_stage(already, option, f"update {option} (CMS)", code_of)
+            return None if dry_run else set(already)
 
         # —— 人工确认（测试模式不问：后面不会写入）——
         print(color(f"\n将在 CMS 把 {len(todo)} 个 Rule ID 灰度放开到 {label}：{', '.join(todo)}", "bold"))
@@ -409,6 +412,10 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
         _print_grey_summary(option, done, already, mismatch, failed, tested if dry_run else None)
         if dry_run:
             return None
+        if done or already:
+            # 阶段记录以 CMS 灰度放开成功（回读累计检测数 = 目标值）为准。
+            from .stage_db import record_stage
+            record_stage(done + already, option, f"update {option} (CMS)", code_of)
         return set(done) | set(already)
     except Exception as e:
         print(err(f"CMS 灰度放开出错：{e}"))

@@ -1,26 +1,15 @@
-"""deployota offline —— 在 CMS「规则上下线编排」里把指定 Rule ID 下线（online 的反向操作）。
+"""deployota offline <Rule ID...> [--yes] [--device CODE] —— 按 Rule ID 下线
 
-用法：
-    ./deployota offline 50000                 # 单个
-    ./deployota offline 50000-50005           # 区间
-    ./deployota offline 50000,50003,50010     # 逗号分隔（可与区间混用、可给多个参数）
-    ./deployota offline 50000-50005 --yes     # 跳过开始前的确认
-    ./deployota offline 50000 --device MT9655AMAndrGTV   # 部署库里查不到设备类型代码时手工指定
+  ./deployota offline 50000-50005          Rule ID：单个 / 区间 / 逗号，可混用
+  ./deployota offline 50000-50005 --yes    跳过开始前的确认
 
-流程（不做单独的状态检查，逐个直接处理）：
-  1) 从部署库按 Rule ID 取设备类型代码（--device 可覆盖）；取不到的不处理。
-  2) 开始前确认一次（--yes 跳过）。
-  3) 打开「升级事件 → 规则上下线编排」，按设备类型分组，在『已选规则』区设一次设备类型。
-  4) 每个 Rule ID：在『已选规则』（在线区）按规则ID精确搜索——
-       搜到且有『下 线』按钮 → 点『下 线』→ 确认框『确认下线该规则?』里点『确定』
-         （点之前确认背后的搜索结果仍是目标行；绝不点编排弹窗底部的『确 定』）→
-         重新搜索，『已选规则』里没有了才算成功；
-       搜不到 → 已经下线或不存在，直接跳过。
-     每次搜索都核对输入框里确实是目标号（防止填进其它框）。
-
-结果：下线成功 / 跳过（已下线或找不到）/ 查不到设备类型代码 / 失败（附原因），
-再为下线成功的规则打印『下线信息汇总』表。
-退出码：0 没有失败；1 有失败或有查不到设备类型代码的；2 参数问题或你取消。
+  开始前确认一次（--yes 跳过）→ 每个 Rule ID 在「规则上下线编排」的『已选规则』里搜：
+    在线 → 下 线 → 在确认框『确认下线该规则?』里点确定 → 重新搜索，已选规则里没有了才算成功；
+    搜不到（已下线或不存在）→ 直接跳过。
+  只动 CMS：不改 DASS，也不改灰度阶段记录（只记 CMS 状态『已下线』）。
+  结束打印汇总（成功 / 跳过 / 失败）和红色⛔『下线信息汇总』表。
+  设备类型代码按 Rule ID 自动找：部署库 → prep Excel → CMS 在线规则页（--device 可选）。
+退出码：0 没有失败；1 有失败；2 参数问题或你取消。
 """
 from __future__ import annotations
 
@@ -417,6 +406,11 @@ def main() -> int:
 
     print("\n" + format_offline_summary(success, skipped, no_device, failed))
     _print_offline_tables(success, code_of, cms_cells, off_time)
+    if success:
+        # 只记 CMS 在线状态；下线不改 DASS，也不动阶段时间线。
+        from .stage_db import record_cms
+        for rid in success:
+            record_cms([rid], "已下线", "offline", code_of, off_time.get(rid))
     return 0 if not (failed or no_device) else 1
 
 
