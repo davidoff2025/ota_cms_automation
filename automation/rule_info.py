@@ -247,8 +247,11 @@ def _print_stage_lines(hit_ids: list[str]) -> None:
         if not st:
             print(color(f"      {rid}  （没有阶段记录）", "dim"))
             continue
-        cms = f"  CMS={st['CMS状态']}（{st['CMS状态时间'][:16]}）" if st["CMS状态"] else ""
+        note = f"，{st['CMS备注']}" if st.get("CMS备注") else ""
+        cms = f"  CMS={st['CMS状态']}（{st['CMS状态时间'][:16]}{note}）" if st["CMS状态"] else ""
         print(f"      {rid}  当前={st['当前阶段'] or '-'}  {stage_db.timeline(st) or '-'}{cms}")
+        for line in stage_db.conflict_lines(st):
+            print(color(f"             冲突：{line}", "yellow"))
 
 
 def _print_group(rec: dict, hit_ids: list[str]) -> None:
@@ -281,6 +284,12 @@ def _print_group(rec: dict, hit_ids: list[str]) -> None:
 
 def show(spec_args: list[str]) -> int:
     """入口：月份参数 → 按月份列出；否则按 Rule ID 查。两种不能混用。"""
+    import os
+    home = os.path.expanduser("~")
+    spec_args = ["~" if a in (home, home + "/") else a for a in spec_args]
+    joined = " ".join(spec_args).strip()
+    if is_month_spec(joined):            # 带空格的月份区间：2026.04 ~ 2026.10
+        return show_months([joined])
     months = [x for x in spec_args if is_month_spec(x)]
     if months:
         if len(months) != len(spec_args):
@@ -292,12 +301,10 @@ def show(spec_args: list[str]) -> int:
 
 def show_rules(spec_args: list[str]) -> int:
     """解析 Rule ID 规格 → 查部署库 → 打印。返回 0 全部找到；1 有未找到的；2 参数错误。"""
-    from .dass_perf_query import parse_ruleid_spec  # 复用：区间 / 逗号 / 千分位 解析
-
+    from .dass_perf_query import parse_ruleid_args  # 复用：区间（- ~ ～）/ 逗号 / 空格 / 千分位
     ids: list[str] = []
     try:
-        for spec in spec_args:
-            ids.extend(parse_ruleid_spec(spec))
+        ids = parse_ruleid_args(spec_args)
     except ValueError as e:
         print(err(f"Rule ID 参数有误：{e}"), file=sys.stderr)
         return 2

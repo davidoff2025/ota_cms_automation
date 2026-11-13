@@ -291,12 +291,14 @@ def read_column_layout(fr, debug: bool = False) -> dict:
              "源版本", "目标版本", "当前阶段", "当前阶段时间", "是否展示"]
     result = fr.evaluate(
         """(known) => {
+            const header_key = (s) => (s || '').replace(/\\s+/g, '').replace(/[（(][^（()）]*[）)]$/, '');
             const out = {letters: {}, session: null, dump: []};
             const xts = Array.from(document.querySelectorAll('table.x-table'));
             for (const t of xts) {
                 for (let r = 0; r < Math.min(t.rows.length, 2); r++) {
                     for (const c of t.rows[r].cells) {
-                        const txt = (c.innerText||'').trim();
+                        // 表头可能带换行和括号说明（如 是否展示(取值0、1)）：去掉空白和末尾括号说明再匹配。
+                        const txt = header_key(c.innerText);
                         if (!txt || !known.includes(txt)) continue;
                         // id = <letters><rownum>-0-<session>
                         const m = (c.id||'').match(/^([A-Z]+)\\d+-\\d+-(.+)$/);
@@ -317,6 +319,11 @@ def read_column_layout(fr, debug: bool = False) -> dict:
         for d in result["dump"]:
             print(f"    {d['txt']!r:20} id={d['id']!r}")
     return {"letters": result["letters"], "session": result["session"]}
+
+
+def header_key(text) -> str:
+    """表头文字 → 用于匹配的列名（与 read_column_layout 里的 JS 同一规则）：去空白、去末尾括号说明。"""
+    return re.sub(r"[（(][^（()）]*[）)]$", "", re.sub(r"\s+", "", str(text or "")))
 
 
 def blank_row_numbers(fr, count: int) -> list[int]:
@@ -1021,6 +1028,22 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             # 在『升级 DASS』(run_update) 之前，先去绩效页校验本批每个 Rule ID 的成功率：
             # 全部 >= 50% 才放行；任一 < 50% 或两阶段都查不到 -> abort（不 run_update、
             # 不进入人工提交环节）。ota50 / init 不校验。
+            from . import action_summary as A
+            GATE = "成功率闸门（每个 Rule ID ≥ 50%）"
+            if option not in GATE_OPTIONS:
+                A.step(GATE, A.SKIP, f"{option} 不检查成功率")
+                if option != "init":
+                    # 不过闸门的档位（ota50）也查一下成功率写进总结（只读，失败不影响后续）。
+                    try:
+                        from .dass_perf import lookup_rates_info
+                        navigate_to_perf(page)
+                        page.wait_for_timeout(2500)
+                        _fr = _report_frame(page, "perf")
+                        if _fr is not None:
+                            print("\n（只读查询升级成功率，写进操作总结；不影响是否升级）")
+                            A.set_rates(lookup_rates_info(_fr, page, records))
+                    except Exception as e:
+                        print(color(f"（成功率查询跳过：{e}）", "dim"))
             if option in GATE_OPTIONS:
                 print("\n======== 升级成功率闸门（run_update 之前）========")
                 navigate_to_perf(page)
@@ -1029,14 +1052,18 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 if fr_perf is None:
                     print(color("✗ 未找到绩效页 frame，无法校验成功率；安全失败，abort 升级。", "red"))
                     _shot(page, "perf_no_frame")
+                    A.step(GATE, A.FAIL, "打不开安卓升级展示报表，无法校验，已中止")
                     return 2
                 if not check_success_rate(fr_perf, page, records, option):
                     if not _gate_override(allow_gate_override):
                         print(color("\n⛔ 成功率闸门未通过：中止本次升级事务，"
                                     "run_update 未执行，不进入人工提交环节。", "red"))
+                        A.step(GATE, A.FAIL, "有 Rule ID 成功率 < 50% 或查不到，已中止（CMS、DASS 都没动）")
                         return 2
+                    A.step(GATE, A.WARN, "未达标，你已人工批复（override）继续")
                 else:
                     print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
+                    A.step(GATE, A.OK, "全部 ≥ 50%，放行")
 
             # ———— 闸门之后、更新 DASS 之前的外部步骤（deployota update 用它在 CMS 做灰度放开）————
             # 回调收到 playwright 实例 p，返回可以继续更新 DASS 的 Rule ID 集合；None = 中止。
@@ -1044,6 +1071,7 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 ok_ids = before_update(p)
                 if ok_ids is None:
                     print(color("\n⛔ CMS 灰度放开未完成：DASS 不更新。", "red"))
+                    A.step(f"DASS 更新到 {STAGE_LABELS.get(option, option)}", A.SKIP, "CMS 没有放开，DASS 未更新")
                     return 4
                 kept = [r for r in records if norm_ruleid(r.get("ruleid", "")) in ok_ids]
                 dropped = sorted({norm_ruleid(r.get("ruleid", "")) for r in records} - set(ok_ids))
@@ -1051,6 +1079,7 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     print(color(f"\n⚠ 这些 Rule ID 在 CMS 没有放开，DASS 也不更新：{', '.join(dropped)}", "yellow"))
                 if not kept:
                     print(color("\n⛔ 没有在 CMS 放开成功的 Rule ID，DASS 不更新。", "red"))
+                    A.step(f"DASS 更新到 {STAGE_LABELS.get(option, option)}", A.SKIP, "CMS 没有放开成功的 Rule ID，DASS 未更新")
                     return 4
                 records = kept
             navigate_to_fillin(page)
@@ -1081,6 +1110,8 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     print(color("\n⚠ 填写完成（尚未验证、尚未提交）。", "yellow"))
             else:
                 # 交互模式下，一组写完、需要再查询下一组时，先让你核对并提交本组，提交后自动继续。
+                group_submits: list[int] = []
+
                 def _approve_group() -> bool:
                     if not (config.HEADED and sys.stdin.isatty()):
                         return False
@@ -1091,13 +1122,30 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     if ans not in ("approve", "提交", "submit", "yes", "y"):
                         return False
                     if approve_and_submit(fr, page):
+                        group_submits.append(1)
                         print(color("✓ 本组已提交，继续下一组。", "green"))
                         page.wait_for_timeout(1500)
                         return True
                     print(color("⚠ 本组没能自动提交，停止后续分组。", "yellow"))
                     return False
 
+                A.set_option(option)
                 stats = run_update(fr, page, records, option, on_blocked=_approve_group) or {}
+                A.set_approved(stats.get("reached", []))
+                DASS_STEP = f"DASS 更新到 {STAGE_LABELS[option]}"
+                _w = stats.get("stage1_updated", 0) + stats.get("stage2_updated", 0)
+                _parts = [f"写入 {_w} 个"]
+                for _k, _lab in (("already_at_stage", "本来已是目标阶段"), ("skipped_later_stage", "已在目标之后未动"),
+                                 ("skipped_no_match", "没匹配到"), ("skipped_ambiguous", "匹配歧义"),
+                                 ("not_processed", "未处理")):
+                    if stats.get(_k):
+                        _parts.append(f"{_lab} {stats[_k]} 个")
+                _n_total = len({norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))})
+                _n_ok = _w + stats.get("already_at_stage", 0)
+                A.step(DASS_STEP, A.OK if _n_ok == _n_total else (A.WARN if _n_ok else A.FAIL),
+                       f"{'，'.join(_parts)}（共 {_n_total} 个）")
+                if group_submits:
+                    A.step("DASS 分组提交", A.OK, f"中途已提交 {len(group_submits)} 组")
                 if before_update is None and stats.get("reached"):
                     # 不经 CMS（--no-cms / dass otaXX）：以 DASS 更新成功为准记录阶段。
                     from .stage_db import record_stage
@@ -1147,6 +1195,9 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     ans = ""
                 if ans in ("approve", "提交", "submit", "yes", "y"):
                     ok_submit = approve_and_submit(fr, page)
+                    A.step("DASS 提交", A.OK if ok_submit else A.FAIL,
+                           "已提交" if ok_submit else "没找到提交按钮，未提交，请在浏览器手动提交")
+                    A.set_submitted(bool(ok_submit))
                     if ok_submit:
                         print(color("\n✅ 记录已提交。可在浏览器确认结果。", "green"))
                     else:
@@ -1157,16 +1208,20 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                         time.sleep(60)
                 else:
                     print("已取消提交（未做任何批复/提交操作）。")
+                    A.step("DASS 提交", A.WARN, "你没有输入 approve，DASS 未提交（页面关闭后填写的内容会丢失）")
                     try:
                         input("按回车关闭浏览器 ... ")
                     except EOFError:
                         time.sleep(30)
             else:
                 print("非可见模式（HEADED=0），不进行交互提交；请人工核对后提交。")
+                A.step("DASS 提交", A.WARN, "无头模式不提交（CMS_HEADED=false），DASS 未提交")
             return 0 if fill_ok else 3
         except Exception as e:
             print(color(f"✗ 出错：{e}", "red"))
             _shot(page, "fill_error")
+            from . import action_summary as A
+            A.step("运行", A.FAIL, f"出错：{e}")
             return 1
         finally:
             context.close()
@@ -1183,6 +1238,10 @@ def _selftest() -> int:
         if not cond:
             ok = False
 
+    # —— 表头匹配：去空白、去末尾括号说明 ——
+    check("表头『是否展示\\n(取值0、1)』→ 是否展示", header_key("是否展示\n(取值0、1)") == "是否展示")
+    check("表头全角括号也能去掉", header_key("是否展示（取值0、1）") == "是否展示")
+    check("普通表头不变", header_key(" 当前阶段时间 ") == "当前阶段时间" and header_key("ruleid") == "ruleid")
     # —— C：init 明细行格式 ——
     rec = {"ruleid": "65204", "方案号": "MT9655AndrGTVLas", "目标版本": "0100UQ1015"}
     written = {"方案号": "MT9655AndrGTVLas", "ruleid": "65204", "目标版本": "0100UQ1015",

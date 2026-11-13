@@ -13,14 +13,15 @@
 
 流程（每个设备类型代码一组，每组最多 CHUNK 个 Rule ID）：
   1) 选设备类型 → 批量规则ID 填这组 Rule ID → 搜索；核对结果行恰好是这些 Rule ID。
-  2) 看『累计检测数』判断当前阶段：等于上一阶段的检测数（ota50 → 5）才放开；
-     已等于目标（ota50 → 50）记为『已是目标阶段』；其它值（跳档、更高）不动并列出。
+  2) 看『阶段名称』判断当前阶段（主依据），『累计检测数』交叉核对（累计值：测试5 → 50阶段55 → 200阶段255 →
+     1000阶段1255 → 5000阶段6255 → 20000阶段26255 → 全量-1）：处于上一阶段才放开；已是目标阶段的记『已是目标阶段』；
+     其它（跳档、更高）不动并列出。阶段名称对、检测数对不上时照常处理并提示。
   3) 只用可放开的 Rule ID 重新搜索，再核对一遍结果行。
   4) 批量操作类型选『批量灰度』（并回读确认不是批量暂停）→『配置最大升级检测数』→ 当前阶段选目标阶段 →
-     核对累计检测数已自动变成目标值 → 点弹窗『确 定』。
+     核对弹窗里的检测数已自动变成该阶段的值（50/200/1000/5000/20000/-1）→ 点弹窗『确 定』。
   5) 你输入 yes（或 --yes）后，再次确认批量操作类型仍是『批量灰度』，点『执行批量操作』；
      若弹确认框则在确认框里点确定。
-  6) 回读：重新搜索，『累计检测数』都等于目标值才算成功。
+  6) 回读：重新搜索，阶段名称变成目标阶段（或累计检测数等于目标累计值）才算成功。
 """
 from __future__ import annotations
 
@@ -32,23 +33,26 @@ from . import config
 from ._log import color, err, ok, warn
 from .login import _shot, login
 
-# 档位 -> (弹窗『当前阶段』选项原文, 目标累计检测数, 上一阶段累计检测数)
+# 档位 -> 阶段信息（2026-11-13 实测在线规则页：累计检测数是累计值，测试5 → 55 → 255 → 1255 → 6255 → 26255）
+#   label   ：配置弹窗『当前阶段』选项原文；step：选它后弹窗自动填的检测数（本阶段增量）
+#   name    ：列表『阶段名称』；total：列表『累计检测数』（累计值）
+#   prev_*  ：上一阶段在列表里的名称 / 累计检测数
 CMS_STAGE = {
-    "ota50":   ("50阶段(50)",       50,    5),
-    "ota200":  ("200阶段(200)",     200,   50),
-    "ota1k":   ("1000阶段(1000)",   1000,  200),
-    "ota5k":   ("5000阶段(5000)",   5000,  1000),
-    "ota20k":  ("20000阶段(20000)", 20000, 5000),
-    "ota-all": ("全量(-1)",         -1,    20000),
+    "ota50":   {"label": "50阶段(50)",       "step": 50,    "name": "50阶段",    "total": 55,
+                "prev_name": "测试阶段",  "prev_total": 5},
+    "ota200":  {"label": "200阶段(200)",     "step": 200,   "name": "200阶段",   "total": 255,
+                "prev_name": "50阶段",    "prev_total": 55},
+    "ota1k":   {"label": "1000阶段(1000)",   "step": 1000,  "name": "1000阶段",  "total": 1255,
+                "prev_name": "200阶段",   "prev_total": 255},
+    "ota5k":   {"label": "5000阶段(5000)",   "step": 5000,  "name": "5000阶段",  "total": 6255,
+                "prev_name": "1000阶段",  "prev_total": 1255},
+    "ota20k":  {"label": "20000阶段(20000)", "step": 20000, "name": "20000阶段", "total": 26255,
+                "prev_name": "5000阶段",  "prev_total": 6255},
+    "ota-all": {"label": "全量(-1)",         "step": -1,    "name": "全量",      "total": -1,
+                "prev_name": "20000阶段", "prev_total": 26255},
 }
 CHUNK = 20          # 每次最多处理的 Rule ID 数（列表一页 20 行，保证搜索结果一屏核对完）
 BATCH_TYPE = "批量灰度"
-
-
-# ======================================================================
-# 纯逻辑（--selftest）
-# ======================================================================
-
 def parse_count(text) -> int | None:
     """『累计检测数』单元格 → int（去千分位逗号；『全量』/-1 → -1；读不出 → None）。"""
     t = str(text or "").replace(",", "").replace("，", "").strip()
@@ -57,23 +61,47 @@ def parse_count(text) -> int | None:
     return int(t) if re.fullmatch(r"\d+", t) else None
 
 
-def classify_counts(rows: list[dict], option: str) -> dict:
-    """按累计检测数分类。rows: [{'规则ID','累计检测数'}...]。
+def _norm_name(text) -> str:
+    return "".join(str(text or "").split())
 
-    返回 {'eligible': [...], 'already': [...], 'mismatch': [(rid, 当前值文本)...]}。
-    eligible = 当前恰好处于上一阶段（可以放开）；already = 已是目标阶段；mismatch = 其它值（不动）。
+
+def at_stage(row: dict, name: str, total: int) -> tuple[bool, str]:
+    """这一行是否处于指定阶段。返回 (是否, 提示)。
+
+    阶段名称是主依据：名称对就算（检测数对不上时给提示）；名称为空或看不出时退回用累计检测数判断。
     """
-    _label, target, prev = CMS_STAGE[option]
-    out = {"eligible": [], "already": [], "mismatch": []}
+    n = _norm_name(row.get("阶段名称"))
+    c = parse_count(row.get("累计检测数"))
+    if n:
+        if n == name or (name == "全量" and "全量" in n):
+            hint = "" if c == total else f"阶段名称是{name}，但累计检测数={row.get('累计检测数', '')}（通常为 {total}）"
+            return True, hint
+        return False, ""
+    return c == total, ""
+
+
+def classify_counts(rows: list[dict], option: str) -> dict:
+    """按『阶段名称』（主）+『累计检测数』（辅）分类。rows: [{'规则ID','阶段名称','累计检测数'}...]。
+
+    返回 {'eligible': [...], 'already': [...], 'mismatch': [(rid, 当前情况)...], 'hints': [(rid, 提示)...]}。
+    eligible = 处于上一阶段（可以放开）；already = 已是目标阶段；mismatch = 其它（不动）。
+    """
+    st = CMS_STAGE[option]
+    out = {"eligible": [], "already": [], "mismatch": [], "hints": []}
     for r in rows:
-        rid, raw = str(r.get("规则ID", "")).strip(), r.get("累计检测数", "")
-        c = parse_count(raw)
-        if c == prev:
+        rid = str(r.get("规则ID", "")).strip()
+        ok_prev, h1 = at_stage(r, st["prev_name"], st["prev_total"])
+        ok_tgt, h2 = at_stage(r, st["name"], st["total"])
+        if ok_prev:
             out["eligible"].append(rid)
-        elif c == target:
+            if h1:
+                out["hints"].append((rid, h1))
+        elif ok_tgt:
             out["already"].append(rid)
+            if h2:
+                out["hints"].append((rid, h2))
         else:
-            out["mismatch"].append((rid, str(raw)))
+            out["mismatch"].append((rid, f"{r.get('阶段名称', '') or '?'}/{r.get('累计检测数', '') or '?'}"))
     return out
 
 
@@ -213,7 +241,7 @@ def configure_stage(page, option: str, dry_run: bool = False) -> tuple[bool, str
 
     dry_run=True：走到点『确 定』之前就点『取 消』（只用于验证页面，不写入）。
     """
-    label, target, _prev = CMS_STAGE[option]
+    label, target = CMS_STAGE[option]["label"], CMS_STAGE[option]["step"]
     page.get_by_role("button", name=re.compile("配置最大升级检测数")).first.click()
     m = page.locator(".ant-modal", has_text="最大升级检测数配置").last
     try:
@@ -303,9 +331,13 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
     返回 None（测试模式不进入后续 DASS 更新）。
     """
     from .active_offline import group_by_device
-    label, target, prev = CMS_STAGE[option]
+    st = CMS_STAGE[option]
+    label = st["label"]
+    from . import action_summary as A
+    CMS_STEP = f"CMS 灰度放开到 {st['name']}"
     mode = "【测试模式：不执行批量操作，CMS 不做任何修改】" if dry_run else ""
-    print(color(f"\n======== CMS 灰度放开：{option} → {label}（累计检测数 {prev} → {target}）{mode}========", "bold"))
+    print(color(f"\n======== CMS 灰度放开：{option}：{st['prev_name']}（累计 {st['prev_total']}）→ {st['name']}"
+                f"（累计 {st['total']}）{mode}========", "bold"))
     tested: list[str] = []
     done, already, mismatch, failed = [], [], [], []
     browser = p.chromium.launch(headless=not config.HEADED)
@@ -333,19 +365,23 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
                 for r in rows:
                     print(f"  {r['规则ID']}  {dev}  阶段={r.get('阶段名称', '')}  累计检测数={r.get('累计检测数', '')}")
                 c = classify_counts(rows, option)
+                for rid_, h in c["hints"]:
+                    print(warn(f"  {rid_}：{h}"))
                 already += c["already"]
                 mismatch += c["mismatch"]
                 if c["eligible"]:
                     plan.append((dev, c["eligible"]))
         if already:
-            print(f"  已是目标阶段（累计检测数={target}），不再放开：{', '.join(already)}")
+            print(f"  已是目标阶段（{st['name']}），不再放开：{', '.join(already)}")
         if mismatch:
-            print(warn("累计检测数不是上一阶段的值，不动：" + "，".join(f"{r}={v}" for r, v in mismatch)
-                       + f"（{option} 要求当前为 {prev}）"))
+            print(warn("不在上一阶段，不动：" + "，".join(f"{r}={v}" for r, v in mismatch)
+                       + f"（{option} 要求当前为 {st['prev_name']}，累计 {st['prev_total']}）"))
         todo = [r for _, ids in plan for r in ids]
         if not todo:
             print(warn("没有需要在 CMS 放开的 Rule ID。"))
             _print_grey_summary(option, done, already, mismatch, failed)
+            A.step(CMS_STEP, A.OK if already and not (mismatch or failed) else (A.WARN if already else A.FAIL),
+                   _cms_detail(st, [], already, mismatch, failed) + ("（测试模式）" if dry_run else ""))
             if already and not dry_run:
                 from .stage_db import record_stage
                 record_stage(already, option, f"update {option} (CMS)", code_of)
@@ -357,6 +393,7 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
         if not go:
             if not sys.stdin.isatty():
                 print(err("非交互终端无法确认，已取消（需要无人值守请加 --yes）。"))
+                A.step(CMS_STEP, A.FAIL, "非交互终端无法确认，已取消，CMS 未修改（可加 --yes）")
                 return None
             try:
                 go = input("  输入 yes 执行，其它任意输入取消：").strip().lower() == "yes"
@@ -364,6 +401,7 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
                 go = False
         if not go:
             print("已取消，CMS 未做任何修改。")
+            A.step(CMS_STEP, A.FAIL, "你取消了，CMS 未修改")
             return None
 
         # —— 执行 ——
@@ -384,7 +422,7 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
                 if ok_cfg:
                     tested += ids
                     print(ok(f"测试通过（未执行）：{dev} {', '.join(ids)} —— 搜索、批量灰度、"
-                             f"配置窗口选 {label}、检测数自动为 {target} 均正常；已在配置窗口点『取 消』"))
+                             f"配置窗口选 {label}、检测数自动为 {st['step']} 均正常；已在配置窗口点『取 消』"))
                     _shot(page, "grey_dryrun")
                 else:
                     _shot(page, "grey_dryrun_fail")
@@ -403,22 +441,32 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
             page.wait_for_timeout(1500)
             after = {r["规则ID"]: r for r in search_ids(page, ids)}
             for r in ids:
-                c = parse_count(after.get(r, {}).get("累计检测数"))
-                if c == target:
+                row = after.get(r, {})
+                reached, _ = at_stage(row, st["name"], st["total"])
+                if reached or parse_count(row.get("累计检测数")) == st["total"]:
                     done.append(r)
                 else:
-                    failed.append((r, f"执行后累计检测数={after.get(r, {}).get('累计检测数', '?')}，不是 {target}"))
+                    failed.append((r, f"执行后 阶段名称={row.get('阶段名称', '?')}、累计检测数={row.get('累计检测数', '?')}，"
+                                      f"不是 {st['name']}（累计 {st['total']}）"))
             _shot(page, "grey_done")
         _print_grey_summary(option, done, already, mismatch, failed, tested if dry_run else None)
         if dry_run:
+            A.step(CMS_STEP, A.OK if tested and not failed else (A.WARN if tested else A.FAIL),
+                   f"测试模式：可以放开 {len(tested)} 个，流程走通、未执行"
+                   + (f"；已是目标 {len(already)} 个" if already else "")
+                   + (f"；不在上一阶段 {len(mismatch)} 个" if mismatch else "")
+                   + (f"；失败 {len(failed)} 个" if failed else ""))
             return None
+        A.step(CMS_STEP, A.OK if (done or already) and not (mismatch or failed) else (A.WARN if (done or already) else A.FAIL),
+               _cms_detail(st, done, already, mismatch, failed))
         if done or already:
-            # 阶段记录以 CMS 灰度放开成功（回读累计检测数 = 目标值）为准。
+            # 阶段记录以 CMS 灰度放开成功（回读阶段名称 = 目标阶段）为准。
             from .stage_db import record_stage
             record_stage(done + already, option, f"update {option} (CMS)", code_of)
         return set(done) | set(already)
     except Exception as e:
         print(err(f"CMS 灰度放开出错：{e}"))
+        A.step(CMS_STEP, A.FAIL, f"出错：{e}" + (f"（出错前已放开 {len(done)} 个）" if done else ""))
         _shot(page, "grey_error")
         _print_grey_summary(option, done, already, mismatch, failed)
         return None
@@ -427,8 +475,21 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
         browser.close()
 
 
+def _cms_detail(st, done, already, mismatch, failed) -> str:
+    parts = []
+    if done:
+        parts.append(f"放开 {len(done)} 个（{st['prev_name']} → {st['name']}）")
+    if already:
+        parts.append(f"本来已是 {st['name']} {len(already)} 个")
+    if mismatch:
+        parts.append(f"不在上一阶段未动 {len(mismatch)} 个")
+    if failed:
+        parts.append(f"失败 {len(failed)} 个")
+    return "，".join(parts) or "没有可处理的 Rule ID"
+
+
 def _print_grey_summary(option, done, already, mismatch, failed, tested=None) -> None:
-    label, target, _ = CMS_STAGE[option]
+    label = CMS_STAGE[option]["label"]
     if tested is not None:
         print(color(f"\n—— CMS 灰度放开【测试模式】汇总（{label}）——", "bold"))
         print(ok(f"可以放开、流程已走通但未执行（{len(tested)}）：{', '.join(tested) or '-'}"))
@@ -455,14 +516,25 @@ def _selftest() -> int:
 
     check("检测数解析", parse_count("5") == 5 and parse_count("1,000") == 1000
           and parse_count("全量") == -1 and parse_count("-1") == -1 and parse_count("") is None)
-    rows = [{"规则ID": "1", "累计检测数": "5"}, {"规则ID": "2", "累计检测数": "50"},
-            {"规则ID": "3", "累计检测数": "200"}, {"规则ID": "4", "累计检测数": ""}]
+    rows = [{"规则ID": "1", "阶段名称": "测试阶段", "累计检测数": "5"},
+            {"规则ID": "2", "阶段名称": "50阶段", "累计检测数": "55"},
+            {"规则ID": "3", "阶段名称": "200阶段", "累计检测数": "255"},
+            {"规则ID": "4", "阶段名称": "", "累计检测数": ""}]
     c = classify_counts(rows, "ota50")
-    check("ota50：5 可放开、50 已是目标、其它不动",
+    check("ota50：测试阶段可放开、50阶段(55) 已是目标、其它不动",
           c["eligible"] == ["1"] and c["already"] == ["2"] and [r for r, _ in c["mismatch"]] == ["3", "4"])
-    c2 = classify_counts([{"规则ID": "9", "累计检测数": "20,000"}, {"规则ID": "8", "累计检测数": "-1"}], "ota-all")
-    check("ota-all：20000 可放开、-1 已是全量", c2["eligible"] == ["9"] and c2["already"] == ["8"])
-    check("跳档不放开（ota1k 但当前 5）", classify_counts([{"规则ID": "7", "累计检测数": "5"}], "ota1k")["eligible"] == [])
+    real = [("ota200", "50阶段", "55"), ("ota1k", "200阶段", "255"), ("ota5k", "1000阶段", "1255"),
+            ("ota20k", "5000阶段", "6255"), ("ota-all", "20000阶段", "26,255")]
+    check("各档：上一阶段的名称+累计值都判为可放开",
+          all(classify_counts([{"规则ID": "x", "阶段名称": n, "累计检测数": v}], o)["eligible"] == ["x"] for o, n, v in real))
+    check("回读：65345 实测 50阶段/55 判为已到 ota50", at_stage({"阶段名称": "50阶段", "累计检测数": "55"}, "50阶段", 55)[0])
+    check("回读：5000阶段/6255、20000阶段/26255", at_stage({"阶段名称": "5000阶段", "累计检测数": "6255"}, "5000阶段", 6255)[0]
+          and at_stage({"阶段名称": "20000阶段", "累计检测数": "26,255"}, "20000阶段", 26255)[0])
+    h = classify_counts([{"规则ID": "y", "阶段名称": "50阶段", "累计检测数": "60"}], "ota200")
+    check("名称对、检测数不符：照常放开并提示", h["eligible"] == ["y"] and h["hints"])
+    check("没有阶段名称时退回用累计检测数", classify_counts([{"规则ID": "z", "累计检测数": "255"}], "ota1k")["eligible"] == ["z"])
+    check("跳档不放开（ota1k 但当前测试阶段）",
+          classify_counts([{"规则ID": "7", "阶段名称": "测试阶段", "累计检测数": "5"}], "ota1k")["eligible"] == [])
     check("档位映射完整", set(CMS_STAGE) == {"ota50", "ota200", "ota1k", "ota5k", "ota20k", "ota-all"})
     check("分块", [len(x) for x in chunks(list(range(45)))] == [20, 20, 5])
     check("搜索结果核对", _check_exact([{"规则ID": "1"}], ["1"]) == ""

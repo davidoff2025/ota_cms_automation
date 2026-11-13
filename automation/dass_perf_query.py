@@ -49,6 +49,32 @@ from .dass_perf import (
 
 # 区间段：两端为纯数字、中间一个连字符（允许两侧空白）。
 _RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
+# 区间连接符：半角 - ~，全角 ～ －，波浪 〜，en/em dash – —。统一归一成 '-'。
+_RANGE_SEPS = "~～〜－–—"
+
+
+def _normalize_spec(text: str) -> str:
+    """统一区间连接符为 '-'，去掉连接符两侧的空格（'65229 ~ 65231' → '65229-65231'）。"""
+    t = str(text or "")
+    for ch in _RANGE_SEPS:
+        t = t.replace(ch, "-")
+    return re.sub(r"\s*-\s*", "-", t).strip()
+
+
+def parse_ruleid_args(args: list[str]) -> list[str]:
+    """把命令行上的 Rule ID 参数（可能被 shell 按空格拆成多段）解析成去重保序的 Rule ID 列表。
+
+    支持：65148-65154 / 65229~65231 / 65229 ~ 65231 / 65229～65231 / 逗号 / 空格分隔，可混用。
+    · shell 会把单独的 ~ 展开成家目录（'65229 ~ 65231' 到程序里是 65229、/Users/xxx、65231），这里还原成 ~。
+    · 参数先用空格拼回一行，再统一连接符，所以 '65148 - 65154' 这类被拆开的写法也能还原。
+    · 归一后剩下的空格当作列表分隔（同逗号）。
+    """
+    import os
+    home = os.path.expanduser("~")
+    toks = ["~" if a in (home, home + "/") else a for a in args]
+    line = _normalize_spec(" ".join(toks))
+    line = re.sub(r"\s+", ",", line)
+    return parse_ruleid_spec(line)
 
 # 千分位分组的单个数字：首组 1~3 位，其后每组恰为逗号(半/全角)+3 位，至少含一个逗号。
 # 命中即说明整段是一个带千分位逗号的单个数字（如 65,142 / 1,234,567），逗号为千分位
@@ -71,6 +97,7 @@ def parse_ruleid_spec(spec: str) -> list[str]:
       - 结果去重但保留首次出现顺序。
     空规格（无任何有效段）-> raise ValueError。
     """
+    spec = _normalize_spec(spec)
     out: list[str] = []
     seen: set[str] = set()
 
@@ -98,11 +125,10 @@ def parse_ruleid_spec(spec: str) -> list[str]:
             for v in range(a, b + 1):
                 _add(str(v))
             continue
-        rid = norm_ruleid(seg)
-        if not rid:
-            print(color(f"⚠ 跳过无法解析为 Rule ID 的片段：{seg.strip()!r}", "yellow"))
-            continue
-        _add(rid)
+        if not re.fullmatch(r"\s*\d+\s*", seg):
+            # 以前会把非数字字符直接删掉再拼起来（'65229~65231' → '6522965231'），这里改成报错，不猜。
+            raise ValueError(f"看不懂的 Rule ID 片段：{seg.strip()!r}（写法：65370 / 65370-65379 / 65370~65379 / 逗号分隔）")
+        _add(norm_ruleid(seg))
 
     if not out:
         raise ValueError("未解析到任何有效的 Rule ID。")
@@ -157,11 +183,10 @@ def _collect_targets(ruleid_args: list[str]) -> list[str]:
     """把多个位置参数合并解析为去重保序的目标 Rule ID 列表。"""
     seen: set[str] = set()
     targets: list[str] = []
-    for spec in ruleid_args:
-        for rid in parse_ruleid_spec(spec):
-            if rid not in seen:
-                seen.add(rid)
-                targets.append(rid)
+    for rid in parse_ruleid_args(ruleid_args):
+        if rid not in seen:
+            seen.add(rid)
+            targets.append(rid)
     return targets
 
 
@@ -381,6 +406,23 @@ def _selftest() -> int:
             ok = False
 
     # 区间展开：65142-65154 -> 13 个连续
+    import os as _os
+    want = [str(i) for i in range(65148, 65155)] + ["65229", "65230", "65231"]
+    home = _os.path.expanduser("~")
+    for label, args in (("65148-65154 65229~65231", ["65148-65154", "65229~65231"]),
+                        ("全角 ～", ["65148-65154", "65229～65231"]),
+                        ("空格 + shell 展开的 ~", ["65148-65154", "65229", home, "65231"]),
+                        ("被拆开的 - ", ["65148", "-", "65154", "65229", "~", "65231"]),
+                        ("引号里带空格", ["65148 - 65154", "65229 ~ 65231"]),
+                        ("逗号 + 空格", ["65148-65154, 65229 ~65231"]),
+                        ("en dash", ["65148–65154,65229—65231"])):
+        check(f"同等解析：{label}", parse_ruleid_args(args) == want)
+    bad = False
+    try:
+        parse_ruleid_spec("65229x65231")
+    except ValueError:
+        bad = True
+    check("无法识别的片段报错（不再拼成一个大数）", bad)
     r = parse_ruleid_spec("65142-65154")
     check("65142-65154 展开为 13 个", len(r) == 13)
     check("区间首项=65142", r[0] == "65142")

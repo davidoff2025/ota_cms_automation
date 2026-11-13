@@ -292,7 +292,7 @@ def _parse_args(argv: list[str]):
             i += 1
         elif a.startswith("--device="):
             device = a.split("=", 1)[1].strip()
-        elif a.startswith("-") and not a[1:2].isdigit():
+        elif a.startswith("-") and a not in ("-", "--") and not a[1:2].isdigit():
             raise ValueError(f"未知参数：{a!r}")
         else:
             specs.append(a)
@@ -316,11 +316,10 @@ def main() -> int:
         print(err("缺少 Rule ID。例：./deployota offline 50000-50005"), file=sys.stderr)
         return 2
 
-    from .dass_perf_query import parse_ruleid_spec
+    from .dass_perf_query import parse_ruleid_args
     ids: list[str] = []
     try:
-        for s in specs:
-            ids.extend(parse_ruleid_spec(s))
+        ids = parse_ruleid_args(specs)
     except ValueError as e:
         print(err(f"Rule ID 参数有误：{e}"), file=sys.stderr)
         return 2
@@ -406,11 +405,23 @@ def main() -> int:
 
     print("\n" + format_offline_summary(success, skipped, no_device, failed))
     _print_offline_tables(success, code_of, cms_cells, off_time)
+    from . import action_summary as A
+    A.start("offline", ids)
+    parts = [f"下线 {len(success)} 个" + (f"（{', '.join(success[:10])}{' …' if len(success) > 10 else ''}）" if success else "")]
+    if skipped:
+        parts.append(f"跳过 {len(skipped)} 个（已下线或找不到）")
+    if failed:
+        parts.append(f"失败 {len(failed)} 个（{', '.join(r for r, _ in failed[:8])}）")
+    A.step("CMS 下线", A.FAIL if failed and not success else (A.WARN if failed else A.OK), "，".join(parts))
+    if success:
+        A.step("CMS 状态记录", A.OK, f"{len(success)} 个记为『已下线』（灰度阶段不变）")
+    A.step("DASS", A.SKIP, "下线只动 CMS，不改 DASS")
     if success:
         # 只记 CMS 在线状态；下线不改 DASS，也不动阶段时间线。
         from .stage_db import record_cms
         for rid in success:
             record_cms([rid], "已下线", "offline", code_of, off_time.get(rid))
+    A.finish()
     return 0 if not (failed or no_device) else 1
 
 

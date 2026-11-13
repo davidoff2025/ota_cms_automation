@@ -48,7 +48,7 @@ def _resolve_excel_args(rest: list[str]) -> list[str] | None:
     if any(a in ("-h", "--help", "--selftest") for a in rest):
         return rest
     # online 直接给 Rule ID（如 50000-50005）时不需要 Excel，原样转发、不注入 prep 的 Excel。
-    if any(re.match(r"^\d[\d,，\-~\s]*$", a.strip()) for a in rest):
+    if any(re.match(r"^[\d,，\-~～〜－–—\s]*\d[\d,，\-~～〜－–—\s]*$", a.strip()) for a in rest):
         return rest
     base = os.environ.get("OTA_CALLER_CWD") or os.getcwd()
     out, has_excel = [], False

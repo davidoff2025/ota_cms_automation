@@ -9,6 +9,10 @@
       - 只前进不回退：已在更后阶段的不写；同一阶段只保留第一次的时间（重跑不会改日期）；跳档照写并标注。
   · CMS 在线状态：在线 / 已下线（+时间）。`online` / `publish` 上线成功记『在线』，`offline` 下线成功记『已下线』。
       下线只改在线状态，不动阶段时间线（offline 不改 DASS，也不该改阶段日期）。
+  · 规则冲突（online / publish 上线时出现『规则替换』）：在新、旧两个 Rule ID 上各记一条——
+      新规则：被冲突的 Rule ID、结果（已替换 / 冲突中止）、旧规则 mac 组；
+      旧规则：被哪个 Rule ID 替换；替换成功且回读确认旧规则已不在线时，CMS 状态记为『已下线（被替换）』。
+    另导出 rule_conflicts.csv（每次冲突一行）。
 
 用法（查看）：
     ./deployota query 65370            # Rule ID 查询结果里带当前阶段与时间线
@@ -29,7 +33,11 @@ OPTION_STAGE = {"init": "场测", "ota50": "50", "ota200": "200", "ota1k": "1K",
                 "ota5k": "5K", "ota20k": "20K", "ota-all": "完全开放"}
 JSONL_NAME = "rule_stages.jsonl"
 CSV_NAME = "rule_stages.csv"
-CSV_FIELDS = ["Rule ID", "设备类型代码", "当前阶段"] + STAGES + ["CMS状态", "CMS状态时间"]
+CSV_FIELDS = ["Rule ID", "设备类型代码", "当前阶段"] + STAGES + ["CMS状态", "CMS状态时间", "CMS备注"]
+CONFLICT_CSV = "rule_conflicts.csv"
+CONFLICT_FIELDS = ["时间", "设备类型代码", "新Rule ID", "被冲突Rule ID", "结果", "旧规则mac组", "旧规则状态", "来源"]
+RESULT_REPLACED = "已替换"
+RESULT_ABORTED = "冲突中止"
 
 
 def _path(name: str) -> str:
@@ -59,7 +67,8 @@ def build_state(events: list[dict]) -> dict:
         rid = str(e.get("Rule ID", "")).strip()
         if not rid:
             continue
-        s = st.setdefault(rid, {"设备类型代码": "", "阶段": {}, "当前阶段": "", "CMS状态": "", "CMS状态时间": ""})
+        s = st.setdefault(rid, {"设备类型代码": "", "阶段": {}, "当前阶段": "", "CMS状态": "", "CMS状态时间": "",
+                                "CMS备注": "", "冲突": []})
         if e.get("设备类型代码"):
             s["设备类型代码"] = e["设备类型代码"]
         if e.get("类型") == "阶段":
@@ -68,6 +77,9 @@ def build_state(events: list[dict]) -> dict:
                 s["阶段"][stage] = e.get("时间", "")
         elif e.get("类型") == "CMS":
             s["CMS状态"], s["CMS状态时间"] = e.get("状态", ""), e.get("时间", "")
+            s["CMS备注"] = e.get("备注", "")
+        elif e.get("类型") == "冲突":
+            s["冲突"].append(e)
     for s in st.values():
         reached = [x for x in STAGES if x in s["阶段"]]
         s["当前阶段"] = reached[-1] if reached else ""
@@ -129,6 +141,11 @@ def record_stage(ids: list[str], option: str, source: str, code_of: dict | None 
         dev = _device_of(write, code_of, state)
         _append([{"Rule ID": r, "设备类型代码": dev.get(r, ""), "类型": "阶段", "阶段": stage,
                   "时间": t, "来源": source, "跳档": r in jump} for r in write])
+        from . import action_summary as A
+        if write:
+            A.step("灰度阶段记录", A.OK, f"{len(write)} 个 → {stage}" + (f"（跳档 {len(jump)} 个）" if jump else ""))
+        elif ids:
+            A.step("灰度阶段记录", A.SKIP, f"已有 {stage} 或更后的记录，未重复写")
         if not quiet:
             from ._log import color
             if write:
@@ -144,7 +161,7 @@ def record_stage(ids: list[str], option: str, source: str, code_of: dict | None 
 
 
 def record_cms(ids: list[str], status: str, source: str, code_of: dict | None = None,
-               when: str | None = None) -> list[str]:
+               when: str | None = None, note: str = "") -> list[str]:
     """记录 CMS 在线状态（『在线』/『已下线』）。状态没变的不重复写。不影响阶段时间线。"""
     try:
         ids = list(dict.fromkeys(str(x).strip() for x in ids if str(x).strip()))
@@ -153,11 +170,81 @@ def record_cms(ids: list[str], status: str, source: str, code_of: dict | None = 
         t = when or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dev = _device_of(write, code_of, state)
         _append([{"Rule ID": r, "设备类型代码": dev.get(r, ""), "类型": "CMS", "状态": status,
-                  "时间": t, "来源": source} for r in write])
+                  "时间": t, "来源": source, **({"备注": note} if note else {})} for r in write])
         return write
     except Exception as e:
         print(f"（CMS 状态记录写入跳过：{e}）")
         return []
+
+
+def record_conflicts(items: list[dict], source: str, code_of: dict | None = None,
+                     when: str | None = None) -> int:
+    """记录上线时的规则冲突。返回写入的冲突条数。写入失败只提示，不影响主流程。
+
+    items 每项：{"new": 新Rule ID, "old": 被冲突Rule ID, "result": RESULT_REPLACED | RESULT_ABORTED,
+                "mac": 旧规则 mac组 文本（可空）, "old_offline": True/False/None（替换后回读旧规则已不在线?）}
+    在新、旧两个 Rule ID 上各写一条『冲突』事件；替换成功且确认旧规则不在线时，旧规则 CMS 状态记『已下线（被替换）』。
+    """
+    try:
+        items = [i for i in items if str(i.get("new", "")).strip()]
+        if not items:
+            return 0
+        t = when or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        state = build_state(load_events())
+        ids = [i["new"] for i in items] + [i["old"] for i in items if i.get("old")]
+        dev = _device_of(ids, code_of, state)
+        events = []
+        for i in items:
+            new, old, res = str(i["new"]).strip(), str(i.get("old", "") or "").strip(), i["result"]
+            if res == RESULT_REPLACED:
+                old_state = {True: "已下线（被替换）", False: "仍在线（替换后回读仍能搜到）"}.get(i.get("old_offline"), "未核实")
+            else:
+                old_state = "未变（已取消替换）"
+            events.append({"Rule ID": new, "设备类型代码": dev.get(new, ""), "类型": "冲突", "角色": "新规则",
+                           "被冲突Rule ID": old, "结果": res, "旧规则mac组": i.get("mac") or "",
+                           "旧规则状态": old_state, "时间": t, "来源": source})
+            if old:
+                events.append({"Rule ID": old, "设备类型代码": dev.get(old, "") or dev.get(new, ""), "类型": "冲突",
+                               "角色": "被冲突规则", "冲突Rule ID": new,
+                               "结果": "被替换" if res == RESULT_REPLACED else "冲突中止（未替换）",
+                               "旧规则mac组": i.get("mac") or "", "时间": t, "来源": source})
+                if res == RESULT_REPLACED and i.get("old_offline") is True:
+                    events.append({"Rule ID": old, "设备类型代码": dev.get(old, "") or dev.get(new, ""), "类型": "CMS",
+                                   "状态": "已下线（被替换）", "时间": t, "来源": source, "备注": f"被 {new} 替换"})
+        _append(events)
+        export_conflicts_csv()
+        return len(items)
+    except Exception as e:
+        print(f"（冲突记录写入跳过：{e}）")
+        return 0
+
+
+def export_conflicts_csv() -> str:
+    """每次冲突一行（取『新规则』那一侧的事件）。"""
+    p = _path(CONFLICT_CSV)
+    rows = [e for e in load_events() if e.get("类型") == "冲突" and e.get("角色") == "新规则"]
+    with open(p, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CONFLICT_FIELDS)
+        w.writeheader()
+        for e in rows:
+            w.writerow({"时间": e.get("时间", ""), "设备类型代码": e.get("设备类型代码", ""),
+                        "新Rule ID": e.get("Rule ID", ""), "被冲突Rule ID": e.get("被冲突Rule ID", ""),
+                        "结果": e.get("结果", ""), "旧规则mac组": e.get("旧规则mac组", ""),
+                        "旧规则状态": e.get("旧规则状态", ""), "来源": e.get("来源", "")})
+    return p
+
+
+def conflict_lines(s: dict | None) -> list[str]:
+    """一个 Rule ID 的冲突记录，每条一行（供 query 显示）。"""
+    out = []
+    for e in (s or {}).get("冲突", []):
+        if e.get("角色") == "新规则":
+            mac = f"，旧规则 mac组={e['旧规则mac组']}" if e.get("旧规则mac组") else ""
+            out.append(f"{e.get('时间', '')[:16]} 上线时与 {e.get('被冲突Rule ID') or '?'} 冲突 → {e.get('结果', '')}"
+                       f"{mac}（旧规则：{e.get('旧规则状态', '')}）")
+        else:
+            out.append(f"{e.get('时间', '')[:16]} 被 {e.get('冲突Rule ID', '?')} 上线时冲突 → {e.get('结果', '')}")
+    return out
 
 
 def export_csv() -> str:
@@ -169,7 +256,7 @@ def export_csv() -> str:
         for rid in sorted(state, key=lambda x: int(x) if x.isdigit() else 0):
             s = state[rid]
             row = {"Rule ID": rid, "设备类型代码": s["设备类型代码"], "当前阶段": s["当前阶段"],
-                   "CMS状态": s["CMS状态"], "CMS状态时间": s["CMS状态时间"]}
+                   "CMS状态": s["CMS状态"], "CMS状态时间": s["CMS状态时间"], "CMS备注": s.get("CMS备注", "")}
             row.update({k: s["阶段"].get(k, "") for k in STAGES})
             w.writerow(row)
     return p
@@ -212,6 +299,23 @@ def _selftest() -> int:
         check("时间线", timeline(st["1"]) == "场测 2026-11-10 → 50 2026-11-12")
         rows = list(csv.DictReader(open(_path(CSV_NAME), encoding="utf-8-sig")))
         check("CSV 每个 Rule ID 一行带各阶段日期", len(rows) == 3 and rows[0]["50"].startswith("2026-11-12"))
+        n = record_conflicts([
+            {"new": "10", "old": "1", "result": RESULT_REPLACED, "mac": "测试DEV", "old_offline": True},
+            {"new": "11", "old": "2", "result": RESULT_ABORTED, "mac": ""},
+        ], "online", {"10": "DEV", "11": "DEV"}, "2026-11-15 10:00:00")
+        st = build_state(load_events())
+        check("冲突：两条都记录", n == 2)
+        check("冲突：新规则记被冲突号和结果",
+              st["10"]["冲突"][0]["被冲突Rule ID"] == "1" and st["10"]["冲突"][0]["结果"] == RESULT_REPLACED)
+        check("冲突：被替换的旧规则记『被替换』并改 CMS 状态",
+              st["1"]["冲突"][-1]["冲突Rule ID"] == "10" and st["1"]["CMS状态"] == "已下线（被替换）"
+              and st["1"]["CMS备注"] == "被 10 替换" and st["1"]["当前阶段"] == "50")
+        check("冲突：中止时旧规则 CMS 状态不变", st["2"]["CMS状态"] == "" and "未替换" in st["2"]["冲突"][-1]["结果"])
+        crow = list(csv.DictReader(open(_path(CONFLICT_CSV), encoding="utf-8-sig")))
+        check("冲突 CSV 每次冲突一行", len(crow) == 2 and crow[0]["被冲突Rule ID"] == "1"
+              and crow[0]["旧规则状态"] == "已下线（被替换）")
+        check("冲突：query 显示行", "与 1 冲突 → 已替换" in conflict_lines(st["10"])[0]
+              and "被 10 上线时冲突" in conflict_lines(st["1"])[0])
     finally:
         if old is None:
             os.environ.pop("OTA_DEPLOY_DB_DIR", None)

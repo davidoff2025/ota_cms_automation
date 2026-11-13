@@ -144,7 +144,7 @@ def main() -> int:
                 print(err(f"只能指定一个阶段，已有 {option!r} 又遇到 {a!r}。"), file=sys.stderr)
                 return 2
             option = a
-        elif a.startswith("-") and not a[1:2].isdigit():
+        elif a.startswith("-") and a not in ("-", "--") and not a[1:2].isdigit():
             print(err(f"未知参数：{a!r}。用法见 -h。"), file=sys.stderr)
             return 2
         else:
@@ -157,16 +157,25 @@ def main() -> int:
         print(err("缺少 Rule ID。例：./deployota update ota200 65370-65379"), file=sys.stderr)
         return 2
 
-    from .dass_perf_query import parse_ruleid_spec
+    from .dass_perf_query import parse_ruleid_args
     ids: list[str] = []
     try:
-        for s in specs:
-            ids.extend(parse_ruleid_spec(s))
+        ids = parse_ruleid_args(specs)
     except ValueError as e:
         print(err(f"Rule ID 参数有误：{e}"), file=sys.stderr)
         return 2
     ids = list(dict.fromkeys(ids))
 
+    from . import action_summary as A
+    A.start(f"update {option}" + ("（测试模式）" if dry_run else ""), ids)
+    try:
+        return _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run)
+    finally:
+        A.finish()
+
+
+def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
+    from . import action_summary as A
     batches = depdb.load_all()
     resolved, problems = resolve_rules(ids, batches)
     print(color(f"update {option}：查询 {len(ids)} 个 Rule ID，解析到 {len(resolved)} 个。", "bold"))
@@ -176,11 +185,17 @@ def main() -> int:
             print(f"  · {rid}：{why}")
         if not skip_missing:
             print(err("已中止，什么都没改。修正后重跑，或加 --skip-missing 只处理能解析的。"), file=sys.stderr)
+            A.step("从部署库解析 Rule ID", A.FAIL,
+                   f"{len(problems)} 个解析不出（{', '.join(r for r, _ in problems[:8])}），已中止，什么都没改")
             return 2
         print(warn("--skip-missing：跳过这些，继续处理其余的。"))
     if not resolved:
         print(err("没有可更新的 Rule ID。"), file=sys.stderr)
+        A.step("从部署库解析 Rule ID", A.FAIL, "没有可更新的 Rule ID")
         return 2
+    A.step("从部署库解析 Rule ID", A.WARN if problems else A.OK,
+           f"{len(resolved)} 个取到方案号/目标版本/设备扩展信息"
+           + (f"；跳过解析不出的 {len(problems)} 个（--skip-missing）" if problems else ""))
 
     _print_plan(option, resolved, dry_run)
     from .dass_fill import execute
@@ -197,6 +212,8 @@ def main() -> int:
         with sync_playwright() as p:
             run_grey_release(p, option, code_of, dry_run=True)
         print(color("（测试模式结束：成功率闸门和 DASS 更新都没有执行）", "dim"))
+        A.step("成功率闸门", A.SKIP, "测试模式不检查")
+        A.step(f"DASS 更新", A.SKIP, "测试模式不更新 DASS")
         return 0
     before = None
     if not no_cms:
@@ -208,6 +225,8 @@ def main() -> int:
             code_of.setdefault(r["ruleid"], r.get("方案号", ""))
         before = lambda p: run_grey_release(p, option, code_of, assume_yes=assume_yes)
         print(color("（流程：成功率闸门 → CMS 在线规则灰度放开 → DASS 更新阶段；加 --no-cms 只更新 DASS）", "dim"))
+    else:
+        A.step("CMS 灰度放开", A.SKIP, "--no-cms：不动 CMS")
     return execute(option, records, None, allow_gate_override=not strict, before_update=before)
 
 

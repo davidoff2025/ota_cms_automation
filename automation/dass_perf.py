@@ -772,7 +772,40 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     print(report)
     if not passed:
         _shot(page, "perf_gate_abort")
+    # 写进操作总结：每个 Rule ID 的成功率（按上一阶段查到的；查不到时用报表里的参考值并注明）。
+    from . import action_summary as A
+    prev = PREV_STAGE.get(option, "")
+    out = {}
+    for rid, info in found_rate.items():
+        if info.get("rate") is not None:
+            out[rid] = {"text": info.get("rate_text") or f"{info['rate']:.2f}%", "src": f"{prev} 阶段"}
+        elif info.get("fallback", {}).get("rate_text"):
+            fb = info["fallback"]
+            out[rid] = {"text": fb["rate_text"], "src": f"报表阶段 {fb.get('stage_text') or '?'}，仅供参考"}
+        else:
+            out[rid] = {"text": "", "src": ""}
+    A.set_rates(out)
     return passed
+
+
+def lookup_rates_info(fr, page, records) -> dict:
+    """只读查成功率（不判定、不拦截），供 ota50 等不过闸门的档位写进操作总结。
+
+    按 方案号 + 目标版本 查（不带阶段条件）；返回 {rid: {"text", "src"}}。
+    """
+    want: dict[tuple[str, str], set] = {}
+    for rec in records:
+        rid = norm_ruleid(rec.get("ruleid", ""))
+        if rid:
+            want.setdefault((rec.get("方案号", ""), rec.get("目标版本", "")), set()).add(rid)
+    out: dict[str, dict] = {}
+    for (scheme, target), rids in want.items():
+        res = query_rates_stage1(fr, page, scheme, target, rids, current_stage="") or {}
+        for rid in rids:
+            d = res.get(rid)
+            out[rid] = ({"text": d.get("rate_text", ""), "src": f"报表阶段 {d.get('stage_text') or '?'}"}
+                        if d and d.get("rate_text") else {"text": "", "src": ""})
+    return out
 
 
 def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:

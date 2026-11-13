@@ -166,7 +166,12 @@ def summarize(results: list[dict]) -> str:
         st = r.get("status", "")
         if st == STATUS_ONLINE:
             n_online += 1
-            lines.append(f"  [汇总] Rule ID={rid!r}  状态={color('online ✅', 'green')}（已上线）")
+            extra = ""
+            if r.get("conflict_ruleid"):
+                old_st = {True: "旧规则已下线", False: "旧规则仍在线，请核对", None: "旧规则状态未核实"}.get(
+                    r.get("old_offline"), "旧规则状态未核实")
+                extra = f"，与 {r['conflict_ruleid']} 冲突 → 已替换（{old_st}）"
+            lines.append(f"  [汇总] Rule ID={rid!r}  状态={color('online ✅', 'green')}（已上线{extra}）")
         elif st == STATUS_CONFLICT_ABORT:
             n_conflict += 1
             cf = r.get("conflict_ruleid", "")
@@ -1289,6 +1294,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
 
             # 判定原则：查被冲突 Rule ID 的 mac组；非空 → 替换；为空 → 中止该条。
             mac_text = _read_mac_group(page, modal, conflict_rid)
+            res["mac_group"] = mac_text or ""
             if mac_text is None:
                 print(color(f"  ⚠ mac组 读取不确定，保守中止该条。被冲突号={conflict_rid!r}", "yellow"))
                 res["status"] = STATUS_CONFLICT_ABORT
@@ -1320,9 +1326,11 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
             if not _conflict_modal_present(page):
                 print(color("  重新上线后未再出现冲突弹窗，记为 online 候选（阶段3 回读确认）。", "yellow"))
                 res["status"] = STATUS_ONLINE
+                res["replaced"] = None  # 没看到第二次冲突窗，是否替换了旧规则不确定（回读时核实）
             elif _click_replace_confirm(page):
                 page.wait_for_timeout(1500)
                 res["status"] = STATUS_ONLINE
+                res["replaced"] = True
             else:
                 res["note"] = "替换确定 gate 未满足"
             results.append(res)
@@ -1336,7 +1344,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
 
 # —— 阶段3：状态汇总 ——
 
-def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> list[dict]:
+def read_final_status(page, rule_ids: list[str], prior_results: list[dict], device_code: str = "") -> list[dict]:
     """D9/D10：对每个 rule_id 在『已选规则』按规则ID搜，操作列为『下线』= online，否则未上线。
 
     与阶段2 的冲突中止结果合并（冲突中止/失败保留阶段2 判定，不覆盖）。
@@ -1365,11 +1373,40 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict]) -> l
         else:
             note = p.get("note", "回读未在『已选规则』找到或操作列非『下线』")
             merged.append({"ruleid": rid, "status": STATUS_FAILED, "note": note})
+    # —— 冲突记录：新、旧两个 Rule ID 都记；替换成功的再回读核实旧规则已不在『已选规则』——
+    items = []
+    for r in merged:
+        old = r.get("conflict_ruleid", "")
+        if not old and r.get("status") != STATUS_CONFLICT_ABORT:
+            continue
+        if r.get("status") == STATUS_ONLINE and old:
+            gone = None
+            if modal is not None:
+                try:
+                    gone = not _is_online(page, modal, old)
+                except Exception:
+                    gone = None
+            r["old_offline"] = gone
+            items.append({"new": r["ruleid"], "old": old, "result": "已替换", "mac": r.get("mac_group", ""),
+                          "old_offline": gone})
+        elif r.get("status") == STATUS_CONFLICT_ABORT:
+            items.append({"new": r["ruleid"], "old": old, "result": "冲突中止", "mac": r.get("mac_group", "")})
     _shot(page, "active_final_list")
     online_ids = [r["ruleid"] for r in merged if r.get("status") == STATUS_ONLINE]
+    from .stage_db import record_cms, record_conflicts
+    # 冲突的新旧规则同属一个设备类型；publish 时新规则还没入部署库，所以直接用当前设备类型代码。
+    code_of = {x: device_code for i in items for x in (i["new"], i.get("old", "")) if x} if device_code else None
     if online_ids:
-        from .stage_db import record_cms
-        record_cms(online_ids, "在线", "online")
+        record_cms(online_ids, "在线", "online", {r: device_code for r in online_ids} if device_code else None)
+    if items:
+        n = record_conflicts(items, "online", code_of)
+        if n:
+            print(color(f"✓ 已记录 {n} 条规则冲突（rule_stages.jsonl / rule_conflicts.csv）：", "green"))
+            for i in items:
+                tail = ""
+                if i["result"] == "已替换":
+                    tail = {True: "，旧规则已下线", False: "，旧规则回读仍在线，请核对", None: "，旧规则状态未核实"}[i.get("old_offline")]
+                print(f"    {i['new']} ↔ {i['old'] or '?'}：{i['result']}{tail}")
     return merged
 
 
@@ -1695,7 +1732,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
     print(color("\n▶ 检查点3：逐条上线（online）", "bold"))
     try:
         results = run_online(page, rule_ids, device_code)
-        final = read_final_status(page, rule_ids, results)
+        final = read_final_status(page, rule_ids, results, device_code)
     except Exception as e:
         return fail(3, f"上线过程出错：{e}", [
             "Rule ID 已在 Excel 里。先到 CMS『规则上下线编排』核对哪些已上线，再用 ./deployota online 重跑（已上线的会自动跳过）。",
@@ -1741,7 +1778,11 @@ _SUBCOMMANDS = ("collect", "online", "publish")
 
 
 # Rule ID 规格：65370 / 65370-65379 / 65370,65375（可混用）。用来区分『Rule ID 参数』和『Excel 路径』。
-_RULE_SPEC_RE = re.compile(r"^\d[\d,，\-~\s]*$")
+_RULE_SPEC_RE = re.compile(r"^[\d,，\-~～〜－–—\s]*\d[\d,，\-~～〜－–—\s]*$|^[\-~～〜－–—]$")
+
+
+import os as _os
+_HOME = _os.path.expanduser("~")
 
 
 def split_rule_args(argv: list[str]) -> tuple[list[str], list[str], str]:
@@ -1759,8 +1800,8 @@ def split_rule_args(argv: list[str]) -> tuple[list[str], list[str], str]:
             continue
         if a.startswith("--device="):
             device = a.split("=", 1)[1].strip()
-        elif _RULE_SPEC_RE.match(a.strip()):
-            specs.append(a)
+        elif _RULE_SPEC_RE.match(a.strip()) or a in (_HOME, _HOME + "/"):
+            specs.append(a)  # 单独的 ~ 被 shell 展开成家目录，也算 Rule ID 区间的一部分
         else:
             rest.append(a)
         i += 1
@@ -1800,24 +1841,61 @@ def _print_online_summary_by_ids(online_ids: list[str], code_of: dict) -> None:
         print(color(f"  （{', '.join(missing)} 在部署库/来源 Excel 里没有明细，表中只有 Rule ID）", "dim"))
 
 
+def online_action_steps(final: list[dict], not_handled: list[str] | None = None) -> None:
+    """把上线结果写进『操作总结』。"""
+    from . import action_summary as A
+    online = [r for r in final if r.get("status") == STATUS_ONLINE]
+    skipped = [r for r in online if "跳过" in str(r.get("note", ""))]
+    replaced = [r for r in online if r.get("conflict_ruleid")]
+    aborted = [r for r in final if r.get("status") == STATUS_CONFLICT_ABORT]
+    failed = [r for r in final if r.get("status") not in (STATUS_ONLINE, STATUS_CONFLICT_ABORT)]
+    parts = [f"上线 {len(online) - len(skipped)} 个"]
+    if skipped:
+        parts.append(f"本来已在线 {len(skipped)} 个")
+    if replaced:
+        parts.append("替换旧规则 " + "、".join(f"{r['ruleid']}→替换{r['conflict_ruleid']}" for r in replaced))
+    if aborted:
+        parts.append("冲突中止 " + "、".join(f"{r['ruleid']}（与 {r.get('conflict_ruleid') or '?'}）" for r in aborted))
+    if failed:
+        parts.append(f"失败 {len(failed)} 个（{', '.join(r['ruleid'] for r in failed[:8])}）")
+    status = A.OK if online and not (aborted or failed) else (A.WARN if online else A.FAIL)
+    A.step("CMS 上线", status, "，".join(parts))
+    if not_handled:
+        A.step("查找设备类型代码", A.WARN, f"{len(not_handled)} 个查不到，未处理：{', '.join(not_handled)}（可用 --device）")
+    if replaced or aborted:
+        A.step("冲突记录", A.OK, f"已记录 {len(replaced) + len(aborted)} 条（rule_conflicts.csv）")
+    A.step("DASS", A.SKIP, "online 只动 CMS；DASS 场测用 ./deployota dass init（publish 会自动做）")
+
+
 def online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
+    from . import action_summary as A
+    A.start("online（按 Rule ID）")
+    try:
+        return _online_by_rule_ids(specs, device_override)
+    finally:
+        A.finish()
+
+
+def _online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
     """`deployota online 50000-50005`：按 Rule ID 上线。
 
     设备类型代码取自部署库（--device 可覆盖；查不到的不处理）。按设备类型分组，每组走与 Excel 模式完全相同的
     run_online（待选区搜索 → 上线 → 确认；冲突时看被冲突规则的 mac 组非空才替换；已上线的自动跳过），
     组内回读状态，最后打印上线汇总和部署信息汇总表。
     """
-    from .dass_perf_query import parse_ruleid_spec
+    from .dass_perf_query import parse_ruleid_args
     from .active_offline import device_codes_for, group_by_device
     from . import depdb
     ids: list[str] = []
     try:
-        for s in specs:
-            ids.extend(parse_ruleid_spec(s))
+        ids = parse_ruleid_args(specs)
     except ValueError as e:
         print(color(f"✗ Rule ID 参数有误：{e}", "red"))
         return 2
     ids = list(dict.fromkeys(ids))
+    from . import action_summary as A
+    if A.CURRENT is not None:
+        A.CURRENT.ids = ids
     from .device_lookup import from_cms_online_rules, print_sources, resolve_local
     code_of, src, missing = resolve_local(ids, device_override)
     print(color(f"[online] 按 Rule ID 上线：{len(ids)} 个", "bold"))
@@ -1846,7 +1924,7 @@ def online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
                 print(color(f"\n======== 设备类型 {dev}：{len(rids)} 个 Rule ID ========", "bold"))
                 results = run_online(page, rids, dev)
                 # 回读要在切换设备类型之前做：已选区的搜索带着当前设备类型过滤。
-                final_all += read_final_status(page, rids, results)
+                final_all += read_final_status(page, rids, results, dev)
         except Exception as e:
             print(color(f"✗ 运行出错：{e}", "red"))
             _shot(page, "active_error")
@@ -1861,6 +1939,7 @@ def online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
             browser.close()
     print("\n" + summarize(final_all))
     _print_online_summary_by_ids([r["ruleid"] for r in final_all if r.get("status") == STATUS_ONLINE], code_of)
+    online_action_steps(final_all, no_dev)
     if no_dev:
         print(color(f"⚠ 未处理（查不到设备类型代码，可用 --device 指定）：{', '.join(no_dev)}", "yellow"))
         return 2
@@ -1969,6 +2048,8 @@ def main() -> int:
 
             # —— 子命令 online：从 Excel『Rule ID』列读本批 Rule ID → 逐条上线 + 冲突 + 汇总 ——
             if mode == "online":
+                from . import action_summary as A
+                A.start(f"online（Excel：{Path(excel).name}）")
                 print(f"[online] 读取 Excel：{excel}")
                 info = read_import_excel(excel)
                 # read_import_excel 已按 RULEID_HEADERS（含『Rule ID』）读该列并 norm_ruleid。
@@ -1998,13 +2079,16 @@ def main() -> int:
                 # 阶段2：逐条上线 + 冲突处理（按 设备类型代码 + Rule ID 搜索）。
                 results = run_online(page, rule_ids, device_code)
                 # 阶段3：状态汇总。
-                final = read_final_status(page, rule_ids, results)
+                final = read_final_status(page, rule_ids, results, device_code)
                 print("\n" + summarize(final))
                 _print_deploy_summary(excel, final)
 
                 if config.HEADED:
                     print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
                     time.sleep(20)
+                online_action_steps(final)
+                A.CURRENT.ids = rule_ids if A.CURRENT is not None else []
+                A.finish()
                 return summary_exit_code(final)
 
             # —— 子命令 publish：导入 + 取 Rule ID + 上线，三个检查点 ——
