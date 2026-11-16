@@ -79,11 +79,12 @@ CMS_HEADED=false ./deployota update ota200 65370-65379 --yes --auto-approve   # 
 ## 二、一次完整部署怎么跑
 
 ```bash
-# 第 1 步：把申请模板变成标准 Excel，并把升级包传到 S3
-./deployota prep --file '/路径/海外安卓OTA申请模板.xlsx'
+# 第 1+2 步一条命令：prep（标准 Excel + MAC 组 + 升级包上 S3）→ CMS 导入 → Rule ID → 上线 → DASS init
+./deployota publish --file '/路径/海外安卓OTA申请模板.xlsx'
 
-# 第 2 步：CMS 导入 + 取 Rule ID + 上线 + DASS init 填报（一条命令，4 个检查点）
-./deployota publish
+# 也可以分开跑：
+#   ./deployota prep --file '/路径/海外安卓OTA申请模板.xlsx'
+#   ./deployota publish
 
 # 第 3 步：之后按放量节奏，逐档更新 DASS——只要给 Rule ID（或区间、逗号分隔）
 ./deployota update ota50  65370-65379
@@ -258,23 +259,32 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
 > ⚠ 真实的 FTP 下载和 S3 上传是不可逆的外部操作（升级包动辄上 GB）。演练请先加 `--no-upload`。
 > MAC 组保存会直接改 CMS，保存前要你输入 `yes`；想先看 CMS 里会填成什么样，用 `--mac-dry-run`。
 
-### 4.2 `publish`：导入 + 上线 + DASS init（带检查点）
+### 4.2 `publish`：（prep +）导入 + 上线 + DASS init（带检查点）
 
 ```bash
-./deployota publish               # 用 prep 刚生成的 Excel
-./deployota publish --no-dass     # 只做前 3 个检查点
+./deployota publish --file '申请模板.xlsx'          # 一条命令从头到尾：⓪ prep → ① ~ ④
+./deployota publish --file 文本.txt --yes --auto-approve   # 再跳过 prep 的 yes 和 DASS 的 approve
+./deployota publish               # 用 prep 刚生成的 Excel，从 ① 开始
+./deployota publish --no-dass     # 只做 ①~③（带 --file 时是 ⓪~③）
 ```
+
+**`--file`（合并 prep）**：先跑完整的 prep 作为检查点 ⓪（生成 → 严格校验 → MAC 组 → 下载 / MD5 核对 → 上传 S3 → 最终检查），
+⓪ 通过后才登录 CMS 做 ①~④。prep 的参数照常可用（`--device-code` / `--device-name` / `--feature-code` / `--mac-group` /
+`--out-dir` / `--yes` / `--force` / `--no-mac` / `--mac-dry-run`），**不能**用 `--no-upload`（升级包不上 S3，导入后设备下载不到）。
+`--file` 和 Excel 路径二选一。单独的 `./deployota prep` 保持不变。
 
 同一个浏览器会话里依次执行，**任何检查点失败就立刻停下，用红色框醒目提醒原因和下一步**，后面的步骤不再执行。
 
 | 检查点 | 判定 | 失败退出码 |
 |---|---|---|
+| ⓪ prep 准备完成（仅 `--file`） | prep 退出码 0（最终检查全部通过），并拿到这次生成的 Excel。失败时 CMS 和 DASS 都没动，修好后重跑同一条命令 | 10 |
 | ① 导入上传成功 | 导入向导走完且无页面报错，模板在「OTA升级模板」列表里找到 | 11 |
 | ② 得到 Rule ID | 回收到的 Rule ID 数量 == Excel 数据行数；回写 Excel 后读回一致 | 12 |
 | ③ 上线成功 | 全部 Rule ID 回读为已上线，没有失败或冲突中止 | 13 |
 | ④ DASS init 填报完成 | 上线全部成功后，用同一份 Excel 跑 `dass init`；退出码 0 才算通过 | 14 |
 
-结束时总会打印一份「检查点报告」，每项显示 ✓ / ✗ / 未执行。
+结束时总会打印一份「检查点报告」，每项显示 ✓ / ✗ / 未执行。导入前的检查不通过（Excel 没数据、已含 Rule ID、
+设备类型 / 目标版本不唯一）和登录 CMS 出错也会红框报警，写明原因和下一步（退出码 2 / 1）。
 
 要点：
 
@@ -609,7 +619,7 @@ JSONL 为主存，同时导出 CSV。
 | 命令 | 退出码 |
 |---|---|
 | `prep` | `0` 成功；`1` 生成/校验/上传失败；`2` 参数问题或你取消 |
-| `publish` | `0` 全部通过；`2` 前置检查不通过（未动 CMS）；`11` 导入失败；`12` Rule ID 问题；`13` 上线失败；`14` DASS init 失败 |
+| `publish` | `0` 全部通过；`1` 运行出错（如登录 CMS 失败）；`2` 前置检查不通过（未动 CMS）；`10` prep 失败（`--file`）；`11` 导入失败；`12` Rule ID 问题；`13` 上线失败；`14` DASS init 失败 |
 | `online` | `0` 全部成功；`1` 运行出错；`2` 无 Rule ID、存在冲突中止或未上线 |
 | `dass` | `0` 成功；`1` 出错；`2` 成功率闸门未通过；`3` init 有行没填成功 |
 | `dass_perf_query` | `1` 存在成功率低于 50% 的 Rule ID |

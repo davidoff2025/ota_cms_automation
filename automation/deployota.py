@@ -2,7 +2,7 @@
 
 子命令 -> 模块：
   prep     -> automation.prep              生成 Excel → 校验 → MAC 组 → FTP 下载 → 上传 S3
-  publish  -> automation.active_ota publish  upload + online + dass init，4 个检查点
+  publish  -> automation.active_ota publish  [--file → 先 prep] + upload + online + dass init，检查点 ⓪~④
   online   -> automation.active_ota online   上线（Excel 或 Rule ID）
   dass     -> automation.dass_fill         DASS 填报（init）
   update   -> automation.dass_update       放量：成功率闸门 → CMS 灰度 → DASS 阶段
@@ -47,6 +47,9 @@ def _resolve_excel_args(rest: list[str]) -> list[str] | None:
     import os
     if any(a in ("-h", "--help", "--selftest") for a in rest):
         return rest
+    # publish --file 原始输入：先跑 prep 生成 Excel，不注入旧的；相对路径由 prep 按 OTA_CALLER_CWD 解析。
+    if any(a.split("=", 1)[0] == "--file" for a in rest):
+        return rest
     # online 直接给 Rule ID（如 50000-50005）时不需要 Excel，原样转发、不注入 prep 的 Excel。
     if any(re.match(r"^[\d,，\-~～〜－–—\s]*\d[\d,，\-~～〜－–—\s]*$", a.strip()) for a in rest):
         return rest
@@ -82,15 +85,18 @@ def _usage() -> str:
         "",
         "用法：./deployota <子命令> [参数...]      ./deployota <子命令> --help 看详细帮助",
         "",
-        "一次完整部署：",
-        "  ./deployota prep --file 申请模板.xlsx      ① 生成标准 Excel + 升级包上传 S3",
-        "  ./deployota publish                       ② CMS 导入 → Rule ID → 上线 → DASS 场测（4 个检查点）",
-        "  ./deployota update ota50 <Rule ID>        ③ 逐档放量：ota50 → ota200 → ota1k → ota5k → ota20k → ota-all",
+        "一次完整部署（一条命令）：",
+        "  ./deployota publish --file 申请模板.xlsx  ⓪ prep → ① 导入 → ② Rule ID → ③ 上线 → ④ DASS 场测",
+        "  ./deployota update ota50 <Rule ID>        逐档放量：ota50 → ota200 → ota1k → ota5k → ota20k → ota-all",
+        "或分两步：",
+        "  ./deployota prep --file 申请模板.xlsx      生成标准 Excel + MAC 组 + 升级包上传 S3",
+        "  ./deployota publish                       用 prep 刚生成的 Excel 从 ① 开始",
         "",
         "准备",
         "  prep      生成标准 Excel → 严格校验 → 场测 MAC 进『测试+设备类型代码』MAC 组 → FTP 下载 → 上传 S3",
         "部署",
-        "  publish   CMS 导入建规则 → 回收 Rule ID → 上线 → DASS init，4 个检查点，任一失败醒目提醒",
+        "  publish   [--file 原始输入 = 先跑 prep] CMS 导入建规则 → 回收 Rule ID → 上线 → DASS init，"
+        "任一检查点失败醒目提醒",
         "  dass      DASS 填报：dass init 插入新行（场测）",
         "上线 / 下线（只动 CMS）",
         "  online  <Rule ID | Excel>   上线；不给参数 = 用 prep 最近生成的 Excel",

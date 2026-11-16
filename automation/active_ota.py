@@ -40,6 +40,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -1530,7 +1531,7 @@ def probe_online(page) -> None:
 
 _HELP_COMMON = """\
 Excel：省略时用 prep 最近生成的那份；也可写路径（相对路径按当前目录）。
-退出码：0 成功；1 运行出错；2 参数问题 / 有未上线或冲突中止；publish 检查点失败 11/12/13/14。
+退出码：0 成功；1 运行出错；2 参数问题 / 有未上线或冲突中止；publish 检查点失败 10（prep）/11/12/13/14。
 CMS_HEADED=true（默认）开可见浏览器；导入、上线、替换都会改线上数据，不可撤销。"""
 
 _HELP_BY_MODE = {
@@ -1557,6 +1558,13 @@ deployota online [EXCEL | Rule ID...] [--device CODE] —— CMS 上线
 """,
     "publish": """\
 deployota publish [EXCEL] [--no-dass] [--auto-approve] —— 一步完成：导入 → Rule ID → 上线 → DASS 场测
+deployota publish --file 原始输入 [prep 参数] [--no-dass] [--auto-approve] —— 连 prep 一起，从头到尾一次完成
+
+  --file：先跑 prep 作为检查点 ⓪（生成 → 严格校验 → MAC 组 → 下载 / MD5 → 上传 S3 → 最终检查），
+          通过后才登录 CMS 继续 ①~④。prep 参数照常可用：--device-code / --device-name / --feature-code /
+          --mac-group / --out-dir / --yes / --force / --no-mac / --mac-dry-run（不能用 --no-upload）。
+          ⓪ 失败退出码 10，CMS 和 DASS 都不会动。
+  不带 --file：用 prep 最近生成的 Excel（或命令里给的 Excel），从 ① 开始。
 
   检查点 ① 导入成功  ② 得到 Rule ID（数量 = Excel 行数，回写并读回一致）
          ③ 全部上线  ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
@@ -1577,9 +1585,86 @@ def _help_text(mode: str | None) -> str:
 
 
 # —— publish：导入(upload) + 上线(online) 合并，三个检查点逐一把关 ——
-CP_NAMES = {1: "导入上传成功", 2: "得到 Rule ID", 3: "上线成功", 4: "DASS init 填报完成"}
+CP_NAMES = {0: "prep 准备完成", 1: "导入上传成功", 2: "得到 Rule ID", 3: "上线成功", 4: "DASS init 填报完成"}
 # 退出码：检查点 n 失败 → 10+n；前置检查不通过 → 2。
-EXIT_CP_FAIL = {1: 11, 2: 12, 3: 13, 4: 14}
+EXIT_CP_FAIL = {0: 10, 1: 11, 2: 12, 3: 13, 4: 14}
+
+# publish --file：先跑 prep。这些参数原样转给 prep（其余留给 publish）。
+PREP_VALUE_FLAGS = ("--file", "--device-code", "--device-name", "--feature-code", "--mac-group", "--out-dir")
+PREP_BOOL_FLAGS = ("--yes", "-y", "--force", "--no-mac", "--mac-dry-run", "--no-upload")
+
+
+def split_prep_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    """把 argv 拆成 (给 prep 的参数, 留给 publish 的参数)。支持 '--file x' 和 '--file=x' 两种写法（纯逻辑）。"""
+    prep, rest = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        key = a.split("=", 1)[0]
+        if key in PREP_VALUE_FLAGS:
+            if "=" in a:
+                prep.append(a)
+            elif i + 1 < len(argv):
+                prep += [a, argv[i + 1]]
+                i += 1
+            else:
+                prep.append(a)          # 缺值：交给 prep 自己报错
+        elif a in PREP_BOOL_FLAGS:
+            prep.append(a)
+        else:
+            rest.append(a)
+        i += 1
+    return prep, rest
+
+
+def _run_prep(prep_args: list[str]) -> int:
+    """子进程跑 prep（继承终端：MAC 组 yes 确认、映射表确认等照常交互；也继承 OTA_CALLER_CWD，相对路径照常）。"""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    sys.stdout.flush()
+    sys.stderr.flush()
+    return subprocess.run([sys.executable, "-m", "automation.prep", *prep_args], cwd=str(root)).returncode
+
+
+def publish_prep_stage(prep_args: list[str]) -> tuple[str | None, dict, int]:
+    """检查点0：跑 prep，拿到它生成并通过最终检查的 Excel。
+
+    返回 (excel 或 None, 检查点0 记录, 失败时的退出码)。失败时已红框报警并打印检查点报告。
+    """
+    print(color("\n▶ 检查点0：prep（生成 Excel → 严格校验 → MAC 组 → 下载 / MD5 核对 / 上传 S3 → 最终检查）", "bold"))
+    cp0 = {"n": 0, "status": "skip", "detail": ""}
+    rest = [{"n": n, "status": "skip", "detail": "前一步未通过，未执行"} for n in (1, 2, 3, 4)]
+
+    def fail(reason: str, hints: list[str]):
+        cp0.update(status="fail", detail=reason)
+        _cp_alert(0, reason, hints + ["CMS 规则和 DASS 都还没动；修好后重跑同一条 publish 命令"
+                                      "（已生成的 Excel 会复用，S3 上已有的升级包会跳过）。"])
+        print("\n" + format_checkpoint_report([cp0] + rest))
+        return None, cp0, EXIT_CP_FAIL[0]
+
+    if "--no-upload" in prep_args:
+        return fail("publish 不能和 --no-upload 一起用（升级包不上传 S3，导入后设备下载不到）。",
+                    ["只想演练 prep：./deployota prep --file … --no-upload"])
+    if not any(a.split("=", 1)[0] == "--file" for a in prep_args):
+        return fail("缺少 --file。", ["例：./deployota publish --file 文本.txt"])
+    t0 = time.time()
+    try:
+        rc = _run_prep(prep_args)
+    except Exception as e:
+        return fail(f"无法启动 prep：{e}", [])
+    if rc != 0:
+        why = {1: "生成 / 校验 / MAC 组 / 下载 / MD5 / 上传 S3 / 最终检查中有一步失败",
+               2: "参数问题，或你在确认时取消了"}.get(rc, "异常退出")
+        return fail(f"prep 未完成（退出码 {rc}：{why}）。", ["看上面 prep 输出里红色的 ✗ / 红框，那里写了具体原因。"])
+    from . import last_prep
+    rec = last_prep.load() or {}
+    excel = rec.get("excel", "")
+    if not excel or not os.path.isfile(excel) or os.path.getmtime(last_prep.STATE_FILE) < t0 - 1:
+        return fail("prep 显示成功，但没有找到这次生成的 Excel 记录（.last_prep.json）。",
+                    ["单独跑 ./deployota prep --file … 看最后的『prep 全部完成』那一行。"])
+    cp0.update(status="pass", detail=Path(excel).name)
+    print(color(f"✓ 检查点0 通过：prep 完成，使用 {excel}", "green"))
+    return excel, cp0, 0
 
 
 def _print_deploy_summary(excel: str, final: list[dict] | None = None) -> None:
@@ -1617,10 +1702,14 @@ def format_checkpoint_report(cps: list[dict]) -> str:
         else:
             lines.append(color(f"  - {title}：未执行", "yellow") + (f"（{detail}）" if detail else ""))
     if first_fail is None and all(c["status"] == "pass" for c in cps):
-        done = "已导入、拿到 Rule ID、全部上线成功" + ("、DASS init 已填报" if len(cps) >= 4 else "")
+        has0 = any(c["n"] == 0 for c in cps)
+        has4 = any(c["n"] == 4 for c in cps)
+        done = (("prep 完成（升级包已上 S3）、" if has0 else "") + "已导入、拿到 Rule ID、全部上线成功"
+                + ("、DASS init 已填报" if has4 else ""))
         lines.append(color(f"  ★ 全部检查点通过：{done}。", "green"))
     else:
-        lines.append(color(f"  ✗ 发布未完成：卡在检查点{first_fail or '?'}（{CP_NAMES.get(first_fail, '')}）。"
+        ff = "?" if first_fail is None else first_fail
+        lines.append(color(f"  ✗ 发布未完成：卡在检查点{ff}（{CP_NAMES.get(first_fail, '')}）。"
                            "请按上面的提示处理，处理前不要直接重跑。", "red"))
     return "\n".join(lines)
 
@@ -1643,7 +1732,7 @@ def _run_dass_init(excel: str) -> int:
     return subprocess.run([sys.executable, "-m", "automation.dass_fill", "init", excel], cwd=str(root)).returncode
 
 
-def run_publish(page, excel: str, with_dass: bool = True) -> int:
+def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None = None) -> int:
     """导入(upload) + 上线(online) + DASS init 合并执行，四个检查点（with_dass=False 则只前三个）：
       1) 导入上传成功   —— 导入向导走完且无 UI 错误，模板在『OTA升级模板』列表里找到；
       2) 得到 Rule ID   —— 回收到的 Rule ID 数 == Excel 数据行数，并成功回写、回读一致；
@@ -1655,6 +1744,9 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
     """
     steps = (1, 2, 3, 4) if with_dass else (1, 2, 3)
     cps = [{"n": n, "status": "skip", "detail": "前一步未通过，未执行"} for n in steps]
+    if prep_cp:                      # publish --file：检查点0 prep 已通过，放进同一份报告
+        cps.insert(0, dict(prep_cp))
+    idx = {c["n"]: i for i, c in enumerate(cps)}
 
     def finish(code: int) -> int:
         print("\n" + format_checkpoint_report(cps))
@@ -1664,28 +1756,32 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
         return code
 
     def fail(n: int, reason: str, hints: list[str], shot: str | None = None) -> int:
-        cps[n - 1].update(status="fail", detail=reason)
+        cps[idx[n]].update(status="fail", detail=reason)
         _cp_alert(n, reason, hints)
         if shot:
             _shot(page, shot)
         return finish(EXIT_CP_FAIL[n])
 
+    def pre_fail(reason: str, hints: list[str]) -> int:
+        """导入前的检查不通过（未动 CMS）：同样红框报警 + 检查点报告，退出码 2。"""
+        cps[idx[1]].update(status="fail", detail="导入前检查未通过：" + reason)
+        _cp_alert(1, "导入前检查未通过（未动 CMS）：" + reason, hints)
+        return finish(2)
+
     # —— 前置检查（不动 CMS）——
     info = read_import_excel(excel)
     count = info["count"]
     if count == 0:
-        print(color("✗ [publish] 导入 Excel 没有数据行，终止（未动 CMS）。", "red"))
-        return 2
+        return pre_fail("导入 Excel 没有数据行。", [f"检查 Excel：{excel}"])
     if any(info.get("rule_ids", [])):
-        print(color("✗ [publish] 这份 Excel 已经含有 Rule ID，说明之前已导入过；再导入会触发 CMS "
-                    "『目标版本已经存在』。终止（未动 CMS）。", "red"))
-        print(color("  只需要上线请用：./deployota online   需要重新导入请先确认 CMS 上的旧模板已处理。", "red"))
-        return 2
+        return pre_fail("这份 Excel 已经含有 Rule ID，说明之前已导入过；再导入会触发 CMS『目标版本已经存在』。", [
+            "只需要上线请用：./deployota online",
+            "需要重新导入：先确认 CMS 上的旧模板已处理，再用不含 Rule ID 的新 Excel（prep 加 --force 重新生成）。",
+        ])
     try:
         device_code, target_versions = validate_import_target(info["device_codes"], info["target_versions"])
     except ValueError as e:
-        print(color(f"✗ [publish] {e}（未动 CMS）", "red"))
-        return 2
+        return pre_fail(str(e), [f"检查 Excel：{excel}"])
     name = build_rule_name(device_code, target_versions)
     print(f"[publish] Excel：{excel}\n[publish] 设备类型代码={device_code!r}  模板名称={name!r}  数据行数={count}")
 
@@ -1699,7 +1795,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
             "已创建就不要直接重跑（会报『目标版本已经存在』）：先处理掉旧模板，或手工取 Rule ID 填回 Excel 后用 ./deployota online。",
             "未创建：按上面的错误原文修正 Excel 后重跑 ./deployota publish。",
         ], "publish_cp1_fail")
-    cps[0].update(status="pass", detail=f"模板 {name!r} 已导入（备注 {remark!r}）")
+    cps[idx[1]].update(status="pass", detail=f"模板 {name!r} 已导入（备注 {remark!r}）")
     print(color(f"✓ 检查点1 通过：模板 {name!r} 已导入。", "green"))
 
     # —— 检查点2：得到 Rule ID ——
@@ -1726,7 +1822,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
         return fail(2, f"回写后回读 Excel 的 Rule ID 与回收结果不一致：写入 {rule_ids}，读回 {back}。", [
             "请打开 Excel 核对『Rule ID』列后再用 ./deployota online。",
         ], "publish_cp2_fail")
-    cps[1].update(status="pass", detail=f"{len(rule_ids)} 个（{rule_ids[0]}~{rule_ids[-1]}），已回写 Excel {n_written} 行并回读一致")
+    cps[idx[2]].update(status="pass", detail=f"{len(rule_ids)} 个（{rule_ids[0]}~{rule_ids[-1]}），已回写 Excel {n_written} 行并回读一致")
     print(color(f"✓ 检查点2 通过：{len(rule_ids)} 个 Rule ID，已回写 Excel。", "green"))
 
     # —— 检查点3：上线成功 ——
@@ -1749,7 +1845,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
             "未上线的 Rule ID 见上方汇总；冲突中止 = 被冲突规则的 mac 组为空或无法确认，需人工处理。",
             "处理完后用 ./deployota online 重跑（已上线的会自动跳过）。",
         ], "publish_cp3_fail")
-    cps[2].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
+    cps[idx[3]].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
     print(color(f"✓ 检查点3 通过：{len(final)} 条 Rule ID 全部上线。", "green"))
     if not with_dass:
         _print_deploy_summary(excel)
@@ -1770,7 +1866,7 @@ def run_publish(page, excel: str, with_dass: bool = True) -> int:
     if rc != 0:
         return fail(4, f"DASS init 异常退出（退出码 {rc}）。", [
             "见上方 dass 日志里的错误原文与 artifacts/ 里的截图。", redo])
-    cps[3].update(status="pass", detail=f"{len(final)} 条已填入 DASS（提交与否以你在终端的 approve 为准）")
+    cps[idx[4]].update(status="pass", detail=f"{len(final)} 条已填入 DASS（提交与否以你在终端的 approve 为准）")
     print(color("✓ 检查点4 通过：DASS init 已填写完成。", "green"))
     return finish(0)
 
@@ -1988,8 +2084,24 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
 
 
 def main() -> int:
-    argv, rule_specs, device_override = split_rule_args(sys.argv[1:])
+    raw = sys.argv[1:]
+    prep_args: list[str] = []
+    if "publish" in raw and not any(a in ("-h", "--help") for a in raw):
+        prep_args, raw = split_prep_args(raw)
+    argv, rule_specs, device_override = split_rule_args(raw)
     mode, excel = _parse_cli(argv)
+    prep_cp = None
+    if prep_args:
+        # —— publish --file：检查点0 先跑 prep（生成 → 校验 → MAC 组 → 上传 S3 → 最终检查），通过才登录 CMS ——
+        if excel:
+            print(color("✗ publish 给了 --file（原始输入）又给了 Excel，二选一。", "red"))
+            return 2
+        if "--auto-approve" in sys.argv[1:]:
+            from .dass_fill import enable_auto_approve
+            enable_auto_approve()
+        excel, prep_cp, rc = publish_prep_stage(prep_args)
+        if not excel:
+            return rc
     if rule_specs or device_override:
         if mode != "online":
             print(color(f"✗ 只有 online 支持直接给 Rule ID（{mode} 请给 Excel）。", "red"))
@@ -2097,13 +2209,19 @@ def main() -> int:
                 if "--auto-approve" in sys.argv[1:]:   # 子进程 dass init 继承这个环境变量
                     from .dass_fill import enable_auto_approve
                     enable_auto_approve()
-                return run_publish(page, excel, with_dass="--no-dass" not in sys.argv[1:])
+                return run_publish(page, excel, with_dass="--no-dass" not in sys.argv[1:], prep_cp=prep_cp)
 
             print(color(f"✗ 未知模式：{mode!r}", "red"))
             return 2
         except Exception as e:
             print(color(f"✗ 运行出错：{e}", "red"))
             _shot(page, "active_error")
+            if mode == "publish":
+                hints = ["见上面的错误原文和 artifacts/*active_error.png 截图；先到 CMS『OTA升级模板』核对是否已导入。"]
+                if prep_cp:
+                    hints.append(f"prep 已完成（升级包已在 S3）。没导入的话直接重跑 ./deployota publish {excel}"
+                                 "（不要再带 --file，免得重新 prep）。")
+                _cp_alert(1, f"publish 运行出错（登录 CMS 或导入过程中）：{e}", hints)
             return 1
         finally:
             context.close()
@@ -2164,6 +2282,24 @@ def _selftest() -> int:
         raised_empty = True
     check("D3 空设备类型代码报错（大小!=1）", raised_empty)
 
+    # —— publish --file：prep 参数拆分 / 检查点0 报告 ——
+    pa, ra = split_prep_args(["publish", "--file", "a.txt", "--no-dass", "--yes", "--device-code=X",
+                              "--auto-approve", "--mac-dry-run"])
+    check("prep 参数拆分", pa == ["--file", "a.txt", "--yes", "--device-code=X", "--mac-dry-run"]
+          and ra == ["publish", "--no-dass", "--auto-approve"])
+    check("prep 参数拆分：Excel 路径跟在 --file 后也归 prep",
+          split_prep_args(["publish", "--file", "申请.xlsx"]) == (["--file", "申请.xlsx"], ["publish"]))
+    r0 = format_checkpoint_report([{"n": 0, "status": "fail", "detail": "MAC"}]
+                                  + [{"n": n, "status": "skip"} for n in (1, 2, 3, 4)])
+    check("检查点0 失败：报告点出检查点0、后面未执行", "卡在检查点0" in r0 and "检查点1 导入上传成功：未执行" in r0)
+    r0ok = format_checkpoint_report([{"n": n, "status": "pass"} for n in (0, 1, 2, 3)])
+    check("检查点0~3 全过（--no-dass）：含 prep、不含 DASS", "prep 完成" in r0ok and "DASS" not in r0ok.splitlines()[-1])
+    import contextlib as _cl
+    import io as _io
+    with _cl.redirect_stdout(_io.StringIO()):
+        e1, _cp, rc1 = publish_prep_stage(["--file", "a.txt", "--no-upload"])
+        e2, _cp2, rc2 = publish_prep_stage(["--yes"])
+    check("publish 带 --no-upload / 缺 --file → 检查点0 失败（不跑 prep）", e1 is None and rc1 == 10 and e2 is None and rc2 == 10)
     # —— publish：检查点报告 ——
     rep_ok = format_checkpoint_report([{"n": n, "status": "pass", "detail": "x"} for n in (1, 2, 3)])
     check("publish 全通过含『全部检查点通过』", "全部检查点通过" in rep_ok and "✗" not in rep_ok)
@@ -2171,7 +2307,7 @@ def _selftest() -> int:
         {"n": 1, "status": "pass"}, {"n": 2, "status": "fail", "detail": "数量不符"}, {"n": 3, "status": "skip"}])
     check("publish 失败报告点出检查点2且后续未执行",
           "卡在检查点2" in rep_bad and "检查点3 上线成功：未执行" in rep_bad and "数量不符" in rep_bad)
-    check("publish 退出码 11/12/13/14", EXIT_CP_FAIL == {1: 11, 2: 12, 3: 13, 4: 14})
+    check("publish 退出码 10/11/12/13/14", EXIT_CP_FAIL == {0: 10, 1: 11, 2: 12, 3: 13, 4: 14})
     check("publish 四项全通过文案含 DASS",
           "DASS init 已填报" in format_checkpoint_report([{"n": n, "status": "pass"} for n in (1, 2, 3, 4)]))
     # —— D7：冲突号解析 ——
