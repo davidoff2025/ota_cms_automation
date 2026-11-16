@@ -52,7 +52,7 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 | CMS 登录（publish / online / offline / update） | `CMS_USERNAME`、`CMS_PASSWORD` |
 | DASS 登录（dass / publish 的第 4 步） | `DASS_USERNAME`、`DASS_PASSWORD` |
 | 下载 FTP 升级包（prep 真实上传） | `OTA_FTP_USER`（默认 ftpuser）、`OTA_FTP_PASS` |
-| 部署记录的负责人（可选） | `OTA_OWNER` |
+| 部署汇总邮件（可选） | `OTA_SMTP_HOST`、`OTA_SMTP_PORT`、`OTA_SMTP_USER`、`OTA_SMTP_PASS`、`OTA_MAIL_TO`（默认 devinw@hisense.com） |
 
 - 凭据只从 `config/.env` 读取，该文件已在 `.gitignore`，不会被提交。
 - AWS 区域和密钥不写在 `.env`，走 boto3 默认链（`~/.aws`、实例角色或环境变量）。
@@ -161,7 +161,7 @@ CMS_HEADED=false ./deployota update ota200 65370-65379 --yes --auto-approve   # 
 ./deployota update ota200 65370,65375       # 按 Rule ID 更新
 ./deployota query 65370-65379,65385         # 查这些 Rule ID 属于哪个批次
 ./deployota history --device MT9655 --limit 50
-./deployota history --owner devinw --export
+./deployota history --originator 张三 --export
 ```
 
 ---
@@ -194,6 +194,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 | `--no-upload` | 只生成+校验，打印 S3 计划和 ftp zip 清单，不碰 FTP/S3 |
 | `--yes`, `-y` | 设备信息与映射表不一致时自动继续（非交互场景用） |
 | `--force` | 强制重新生成并全量重传（默认复用相同内容的已有 Excel、跳过 S3 上已存在的同大小文件） |
+| `--originator 姓名` | 发起人（谁提的这次 OTA 请求）。不给时终端询问，回车跳过。显示在 dass init 后的部署汇总和邮件里，并写入部署库 |
 | `--no-mac` | 跳过场测 MAC 组检查 |
 | `--mac-dry-run` | MAC 组测试模式：在 CMS 里填好后点「取消」，不保存（截图 `artifacts/*_mac_before_save.png`） |
 
@@ -294,6 +295,20 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
   这时只需上线就用 `./deployota online`。
 - **失败后不要直接重跑**：每个失败提示里都写了该怎么处理。例如检查点①失败时模板可能已在 CMS 建好，
   先去核对；检查点④失败时 CMS 已完成，单独跑 `./deployota dass init` 即可。
+- **部署汇总 + 邮件**：`dass init` 填写后打印部署汇总（含**发起人**，来自 prep 的 `--originator` 或询问）。
+  **部署最后一步**生成 HTML 汇总存到 Excel 旁边（`<Excel 名>.summary.html`）并发邮件：
+  - **什么时候**：`publish` —— 全部执行完、打印检查点报告**之后**（规则已在 CMS 上线才发；DASS 子进程里不再单独发）；
+    单独跑 `dass init` —— DASS 提交之后。
+  - **收件人**：终端弹出输入框，**把所有人的地址一次粘贴进来**（可直接从 Outlook 复制，一行或多行都行），
+    粘贴完再按一次回车（空行）结束。例如
+    `康凯(Corki) <kangkai3@hisense.com>; 王涛/Devin Wang <wangtao14@hisense.com>; …`
+    （`;` `,` 换行都能分隔；显示名原样保留；重复地址自动去掉；看不懂的会列出来、不会发）。
+    然后列出认出的收件人让你确认：**回车 = 发送，r = 重新输入，n = 不发**。什么都不输入 = 只发给固定的人。
+    也可以提前写在命令里：`--mail-to "王敏 <wangmin3@hisense.com>; …"`（`publish` / `dass init` 都支持），就不再弹框。
+  - **固定抄送**（每封都有）：发件人自己（`OTA_MAIL_FROM`）+ `OTA_MAIL_TO`（默认 devinw@hisense.com）；已在收件人里的不重复。
+  - 第一次场测部署的邮件写「场测 · OTA 部署已在 CMS 上线」，不写 DASS 状态（DASS 结果看终端的操作总结）。
+  - 邮件服务器在 `config/.env` 里配置（`OTA_SMTP_*`）；没配就只保存 HTML、提示未发送。邮件失败不影响部署结果。
+  发起人也写入部署库，`history` / `query` 显示为「发起人」。
 - 同一份 Excel 可以含**多个目标版本**，模板名称会带上全部版本的末 5 位，例如 `MT9666AndrWH80E_3.9.2_3.9.4`；
   但**设备类型代码必须只有一个**。
 
@@ -522,9 +537,9 @@ CMS_HEADED=true ./.venv/bin/python -m automation.dass_perf_query \
 JSONL 为主存，同时导出 CSV。
 
 ```bash
-./deployota history                       # 最近 20 条（按部署时间）+ 全库统计
+./deployota history                       # 最近 20 条（从最新到最早；同一天 Rule ID 大的在前）+ 全库统计
 ./deployota history --device MT9655       # 按设备类型代码过滤（子串）
-./deployota history --owner devinw        # 按负责人过滤
+./deployota history --originator 张三      # 按发起人过滤
 ./deployota history --rule 65204          # 按 Rule ID 或范围过滤
 ./deployota history --limit 0             # 显示全部
 ./deployota history --export              # 重新导出 CSV 后退出
@@ -552,7 +567,7 @@ JSONL 为主存，同时导出 CSV。
 输出：
 
 - 同一批次里命中的 Rule ID 合并成一段（如 `65370~65373`），批次信息只打印一次：设备类型代码、版本变化、
-  升级类型、状态（有效/作废）、部署时间、Owner、设备扩展码、批次号、来源、入库时间。
+  升级类型、状态（有效/作废）、部署时间、发起人、设备扩展码、批次号、来源、入库时间。
 - 同一个 Rule ID 若落在一个作废批次和一个有效批次里，两个都会列出。
 - **逐条明细**：来源 Excel 还在时，再按行读出每个 Rule ID 自己的机型、设备扩展信息、源版本 → 目标版本、升级类型。
   这很重要：部署库只记批次**第一行**的版本，混有多个目标版本的批次，只看批次信息会不准，以逐条明细为准。
@@ -591,7 +606,7 @@ JSONL 为主存，同时导出 CSV。
 | `CMS_ARTIFACTS_DIR` | 截图和中间产物目录（默认 `artifacts/`） |
 | `OTA_WORKSPACE` | 统一工作目录；prep 默认输出目录、部署库（`OTADATA`）都在这下面 |
 | `OTA_DEPLOY_DB_DIR` | 单独指定部署库目录（可选） |
-| `OTA_OWNER` | 写入部署记录的负责人（可选） |
+| `OTA_SMTP_HOST` / `OTA_SMTP_PORT` / `OTA_SMTP_SECURITY` / `OTA_SMTP_USER` / `OTA_SMTP_PASS` / `OTA_MAIL_FROM` / `OTA_MAIL_TO` | dass init 后发 HTML 部署汇总邮件。不填 `OTA_SMTP_HOST` 就不发，只保存 `<Excel 名>.summary.html`；收件人默认 devinw@hisense.com |
 | `OTA_FTP_USER` / `OTA_FTP_PASS` | prep 下载升级包用的 FTP 账号（用户名默认 `ftpuser`） |
 | `OTA_S3_UPLOAD_BUCKET` | S3 桶（默认 `fam-media-andr`） |
 | `OTA_AWS_PREFIX` | 下载链接前缀（默认 `https://ota-dl.intsmarthub.com`） |
@@ -710,7 +725,8 @@ ota_cms_automation/
     depdb.py              # 部署库（JSONL + CSV）与 history
     rule_info.py          # 按 Rule ID 查部署信息
     depdb_backfill.py     # CMS 历史只读回补（维护用，已不在 deployota 菜单里：python -m automation.depdb_backfill）
-    summary.py            # dass 更新后的部署汇总表
+    summary.py            # dass 更新后的部署汇总表（终端版 + HTML 邮件版，含发起人）
+    mailer.py             # 部署汇总 HTML 邮件（SMTP 设置在 config/.env）
     _log.py               # 彩色日志
     login.py / dass_login.py / inspect_*.py   # 登录与页面探测
   config/                 # .env.example（真实 .env 不入库）

@@ -5,7 +5,7 @@
   ./deployota query 2026.04               一个月：列出所有批次和 Rule ID，统计批次数 / 规则条数
   ./deployota query 2026.04-2026.10       月份区间（也可写 2026/04、2026年04月）
 
-按 Rule ID 查：所属批次（设备类型代码、目标完整版本、升级类型、部署时间、Owner…）、
+按 Rule ID 查：所属批次（设备类型代码、目标完整版本、升级类型、部署时间、发起人…）、
 每个 Rule ID 自己的机型 / 设备扩展信息 / 版本（来源 Excel 在时），以及灰度阶段时间线和 CMS 状态。
 退出码：0 全部找到；1 有找不到的 / 该时间段没有部署；2 参数有误。
 """
@@ -91,7 +91,7 @@ def _batch_line(r: dict) -> str:
     tgt = tgt if is_full else f"{tgt}（版本变化，无完整版本）"
     line = (f"· Rule ID {r.get('Rule ID范围', ''):15}（{r.get('规则条数', '')} 条）  {tag}  "
             f"{r.get('设备类型代码', ''):18} {r.get('源版本', '')} → {tgt}  "
-            f"[{r.get('升级类型', '')}]  owner={r.get('Owner', '') or '-'}  {r.get('部署时间', '')}")
+            f"[{r.get('升级类型', '')}]  发起人={r.get('发起人', '') or '-'}  {r.get('部署时间', '')}")
     return color(line, "dim") if void else line
 
 
@@ -290,7 +290,7 @@ def _print_group(rec: dict, hit_ids: list[str]) -> None:
         ("版本变化(批次首行)", f"{rec.get('源版本', '')} → {rec.get('目标版本', '')}"),
         ("升级类型", rec.get("升级类型", "") or "-"),
         ("部署时间", rec.get("部署时间", "") or "-"),
-        ("Owner", rec.get("Owner", "") or "-"),
+        ("发起人", rec.get("发起人", "") or "-"),
         ("设备扩展码", (", ".join(ext) + f"（{len(ext)} 个）") if ext else "-"),
         ("批次号", rec.get("批次号", "") or "-"),
         ("来源", rec.get("Excel路径", "") or "-"),

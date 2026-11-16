@@ -73,6 +73,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "默认不一致会等待人工确认，无法交互时退出。")
     p.add_argument("--force", dest="force", action="store_true", default=False,
                    help="即使输出目录已存在相同内容的 Excel 也强制重新生成（默认复用已有）。")
+    p.add_argument("--originator", dest="originator", default=None,
+                   help="发起人姓名（这次 OTA 请求是谁提的）。不给时在终端询问，可直接回车跳过；"
+                        "会显示在 dass init 后的部署汇总和邮件里，并写入部署库。")
     p.add_argument("--no-mac", dest="no_mac", action="store_true", default=False,
                    help="跳过 CMS『测试<设备类型代码>』MAC 组检查。")
     p.add_argument("--mac-dry-run", dest="mac_dry_run", action="store_true", default=False,
@@ -150,6 +153,22 @@ def _step_mac_group(args, sj, device_code: str, mac_group: str, raw_text: str = 
         return 0
     _mac_failed_banner(res["group"], res["detail"])
     return 1
+
+
+def _ask_originator(args, output_path: str) -> str:
+    """发起人姓名。--originator 给了就用；否则终端可交互时询问，回车沿用之前记的（复用的 Excel）或留空。"""
+    from . import last_prep
+    if args.originator is not None:
+        return args.originator.strip()
+    old = str(last_prep.load_meta(output_path).get("originator", "")).strip()
+    if not sys.stdin.isatty():
+        return old
+    hint = f"回车沿用『{old}』" if old else "回车跳过"
+    try:
+        got = input(f"发起人姓名 / Originator（{hint}）：").strip()
+    except EOFError:
+        got = ""
+    return got or old
 
 
 def _no_mac_banner(where: str = "") -> None:
@@ -778,6 +797,9 @@ def _main() -> int:
         print(_ok(f"已生成：{output_path}"))
         print(f"  行数：{res.get('row_count')}  提示语数：{res.get('message_count')}")
 
+    # (2b) 发起人 / Originator：--originator 优先；否则在终端询问（回车 = 沿用这份 Excel 之前记的，或留空）。
+    originator = _ask_originator(args, output_path)
+
     # (3) 步骤2 严格校验。
     print(_c("—— 步骤2：严格校验 ——", "bold"))
     problems = _validate_excel(output_path)
@@ -803,6 +825,9 @@ def _main() -> int:
             return _stop(output_path, rc2)
         from . import last_prep
         last_prep.save(output_path)   # 后续 publish / online / dass 不给文件时默认接着用它
+        if originator:
+            last_prep.save_meta(output_path, originator=originator)
+            print(f"  发起人 / Originator：{originator}")
         return 0
 
     # (4) 步骤3 上传（或 --no-upload 计划）。

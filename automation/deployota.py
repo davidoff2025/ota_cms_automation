@@ -111,7 +111,7 @@ def _usage() -> str:
         "                --strict   闸门不达标直接中止，不询问人工批复",
         "查询",
         "  query   <Rule ID | 月份>    所属批次、版本、灰度阶段时间线（如 query 65370-65379、query 2026.04-2026.10）",
-        "  history                     部署历史列表（--device / --owner / --limit / --export）",
+        "  history                     部署历史列表（--device / --originator / --rule / --limit / --export）",
         "",
         "Rule ID 写法：65370 / 65370-65379 / 65370,65375 / 混用；设备类型代码按 Rule ID 自动查找（--device 可选）。",
     ]

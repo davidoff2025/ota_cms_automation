@@ -1570,6 +1570,8 @@ deployota publish --file 原始输入 [prep 参数] [--no-dass] [--auto-approve]
          ③ 全部上线  ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
   任一检查点失败：红框提醒原因和下一步，后面不再执行。--no-dass 只做前 3 个。
   --auto-approve：DASS 全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。
+  --mail-to "王敏 <wangmin3@hisense.com>; …"：部署完的汇总邮件收件人（可直接贴 Outlook 收件人串）；
+          不给就在最后弹出输入框。固定抄送发件人和 devinw@hisense.com。
   Excel 已含 Rule ID（导入过）时拒绝重复导入，只需上线请用 ./deployota online。
 """,
 }
@@ -1590,7 +1592,8 @@ CP_NAMES = {0: "prep 准备完成", 1: "导入上传成功", 2: "得到 Rule ID"
 EXIT_CP_FAIL = {0: 10, 1: 11, 2: 12, 3: 13, 4: 14}
 
 # publish --file：先跑 prep。这些参数原样转给 prep（其余留给 publish）。
-PREP_VALUE_FLAGS = ("--file", "--device-code", "--device-name", "--feature-code", "--mac-group", "--out-dir")
+PREP_VALUE_FLAGS = ("--file", "--device-code", "--device-name", "--feature-code", "--mac-group", "--out-dir",
+                    "--originator")
 PREP_BOOL_FLAGS = ("--yes", "-y", "--force", "--no-mac", "--mac-dry-run", "--no-upload")
 
 
@@ -1726,10 +1729,28 @@ def _cp_alert(n: int, reason: str, hints: list[str]) -> None:
 
 
 def _run_dass_init(excel: str) -> int:
-    """在子进程里跑 `dass_fill init <excel>`（它自己起浏览器；子进程继承终端，人工核对/批复照常交互）。"""
+    """在子进程里跑 `dass_fill init <excel>`（它自己起浏览器；子进程继承终端，人工核对/批复照常交互）。
+    汇总邮件不在子进程里发（OTA_MAIL_DEFER=1），publish 打完检查点报告后统一发。"""
     import subprocess
+    from .dass_fill import MAIL_DEFER_ENV
+    os.environ[MAIL_DEFER_ENV] = "1"
+    sys.stdout.flush()
     root = Path(__file__).resolve().parent.parent
     return subprocess.run([sys.executable, "-m", "automation.dass_fill", "init", excel], cwd=str(root)).returncode
+
+
+def _publish_mail(excel: str, online_ok: bool) -> None:
+    """publish 全部执行完（检查点报告之后）：弹出收件人输入框，一次把部署汇总发给所有人。
+    只有规则已在 CMS 上线（检查点3 通过）才发；否则提示没发。"""
+    if not online_ok:
+        print(color("· 部署汇总邮件：规则没有全部在 CMS 上线，本次不发。", "dim"))
+        return
+    from .dass_fill import _mail_summary
+    from .last_prep import originator_for
+    try:
+        _mail_summary(excel, originator_for(excel))
+    except Exception as e:     # 邮件问题不影响 publish 结果
+        print(color(f"⚠ 部署汇总邮件出错：{e}", "yellow"))
 
 
 def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None = None) -> int:
@@ -1750,6 +1771,7 @@ def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None =
 
     def finish(code: int) -> int:
         print("\n" + format_checkpoint_report(cps))
+        _publish_mail(excel, cps[idx[3]]["status"] == "pass")
         if config.HEADED:
             print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
             time.sleep(20)
@@ -2084,7 +2106,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
 
 
 def main() -> int:
-    raw = sys.argv[1:]
+    from .mailer import pop_mail_to
+    raw = pop_mail_to(sys.argv[1:])     # publish --mail-to "…"：放进环境变量，dass init 子进程继承
     prep_args: list[str] = []
     if "publish" in raw and not any(a in ("-h", "--help") for a in raw):
         prep_args, raw = split_prep_args(raw)

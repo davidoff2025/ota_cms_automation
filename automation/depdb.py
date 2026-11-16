@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from datetime import datetime
 
 JSONL_NAME = "deployments.jsonl"
@@ -22,7 +23,7 @@ CSV_NAME = "deployments.csv"
 FIELDS = [
     "Rule ID范围", "Rule ID列表", "规则条数",
     "设备类型代码", "设备类型名称", "源版本", "目标版本", "目标完整版本", "升级类型",
-    "Owner", "状态", "部署时间", "入库时间", "设备扩展码集合",
+    "发起人", "状态", "部署时间", "入库时间", "设备扩展码集合",
     "作废时间", "批次号", "Excel路径",
 ]
 
@@ -184,11 +185,11 @@ def append_record(rec: dict, force_status: str | None = None) -> tuple[bool, str
     return True, f"已写入部署记录『有效』→ {_jsonl_path()}（并同步导出 CSV）。"
 
 
-def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
+def build_record_from_excel(xlsx_path: str, originator: str = "") -> dict | None:
     """从更新后的 Excel（含 Rule ID）构造一条部署记录；无 Rule ID 列则返回 None。
 
     复用 summary 的读取逻辑，取设备码/版本/升级类型/Rule ID 列表与范围。
-    owner 为本次 OTA 请求发起人（可空）。
+    originator 为本次 OTA 请求的发起人（可空）。
     """
     from .summary import _read_rows, _rule_id_range
     device_code, rows = _read_rows(xlsx_path)
@@ -232,7 +233,7 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
         "部署时间": deploy_time,
         "入库时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "状态": STATUS_ACTIVE,
-        "Owner": str(owner or "").strip(),
+        "发起人": str(originator or "").strip(),
         "设备类型代码": device_code,
         "设备类型名称": "",  # Excel 升级规则 sheet 的设备名称列可能为空；范围内不强求
         "源版本": first.get("源版本", ""),
@@ -252,9 +253,9 @@ def build_record_from_excel(xlsx_path: str, owner: str = "") -> dict | None:
     }
 
 
-def record_deployment_from_excel(xlsx_path: str, owner: str = "") -> tuple[bool, str]:
+def record_deployment_from_excel(xlsx_path: str, originator: str = "") -> tuple[bool, str]:
     """便捷入口：从 Excel 构造记录并（幂等/作废替换）写入。返回 (是否新写入, 说明)。"""
-    rec = build_record_from_excel(xlsx_path, owner=owner)
+    rec = build_record_from_excel(xlsx_path, originator=originator)
     if rec is None:
         return False, "该 Excel 无 Rule ID 数据，未记录部署。"
     return append_record(rec)
@@ -282,25 +283,35 @@ def _rid_in_record(rec: dict, needle: str) -> bool:
     return False
 
 
+def _max_rid(rec: dict) -> int:
+    nums = [int(x) for x in re.findall(r"\d{4,}", _ruleids(rec) + " " + str(rec.get("Rule ID范围", "")))]
+    return max(nums) if nums else 0
+
+
+def sort_newest_first(rows: list[dict]) -> list[dict]:
+    """部署记录按时间从最新到最早：部署时间降序，同一天 Rule ID 大的在前（纯逻辑）。"""
+    return sorted(rows, key=lambda r: (str(r.get("部署时间", "")), _max_rid(r)), reverse=True)
+
+
 def _print_history(limit: int | None, device: str | None,
-                   owner: str | None = None, rule: str | None = None) -> int:
+                   originator: str | None = None, rule: str | None = None) -> int:
     from ._log import ok, warn, color
     rows = load_all()
     if device:
         rows = [r for r in rows if device.lower() in str(r.get("设备类型代码", "")).lower()]
-    if owner:
-        rows = [r for r in rows if owner.lower() in str(r.get("Owner", "")).lower()]
+    if originator:
+        rows = [r for r in rows if originator.lower() in str(r.get("发起人", "")).lower()]
     if rule:
         rows = [r for r in rows if _rid_in_record(r, rule)]
     if not rows:
         print(warn("没有匹配的部署记录。"))
         print(color(f"（存储位置：{_jsonl_path()}）", "dim"))
         return 0
-    # 按『部署时间』升序排序（稳定排序；同日保持写入顺序），这样末尾 = 真正最新的部署。
+    # 按时间从最新到最早排序：先比『部署时间』（只到日期），同一天再比 Rule ID（后导入的号大）。
     # 注意：不能依赖文件写入顺序——回填是从新往旧抓的，文件末尾反而是最老的记录。
-    rows = sorted(rows, key=lambda r: str(r.get("部署时间", "")))
+    rows = sort_newest_first(rows)
     all_rows = rows                      # 过滤后的全部记录：总体统计基于它，不受 --limit 影响。
-    shown = rows[-limit:] if limit else rows   # 仅展示列表截取最近 N 条。
+    shown = rows[:limit] if limit else rows    # 仅展示列表截取最近 N 条（最新的在最上面）。
 
     active_n = sum(1 for r in all_rows if str(r.get("状态", STATUS_ACTIVE)) == STATUS_ACTIVE)
     void_n = len(all_rows) - active_n
@@ -311,17 +322,17 @@ def _print_history(limit: int | None, device: str | None,
         is_void = status == STATUS_VOID
         tag = (color("[作废]", "red") if is_void else color("[有效]", "green"))
         extra = f"  作废于 {r.get('作废时间','')}" if is_void else ""
-        owner = r.get("Owner", "") or "-"
+        who = r.get("发起人", "") or "-"
         tgt, is_full = display_target(r)
         tgt = tgt if is_full else f"{tgt}（版本变化，无完整版本）"
         line = (f"· Rule ID {r.get('Rule ID范围',''):15}（{r.get('规则条数','')} 条）  {tag}  "
                 f"{r.get('设备类型代码',''):18} {r.get('源版本','')} → {tgt}  "
-                f"[{r.get('升级类型','')}]  owner={owner}  {r.get('部署时间','')}{extra}")
+                f"[{r.get('升级类型','')}]  发起人={who}  {r.get('部署时间','')}{extra}")
         print(color(line, "dim") if is_void else line)
 
     # —— 总体统计 summary（基于 all_rows：过滤后的全部记录，不受 --limit 截断影响）——
     platforms = sorted({str(r.get("设备类型代码", "")).strip() for r in all_rows if str(r.get("设备类型代码", "")).strip()})
-    owners = sorted({str(r.get("Owner", "")).strip() for r in all_rows if str(r.get("Owner", "")).strip()})
+    originators = sorted({str(r.get("发起人", "")).strip() for r in all_rows if str(r.get("发起人", "")).strip()})
     # 统计去重后的 Rule ID 总数（按『有效』记录的 Rule ID 列表汇总，避免作废/重复重复计数）。
     active_rids = set()
     for r in all_rows:
@@ -329,8 +340,8 @@ def _print_history(limit: int | None, device: str | None,
             active_rids.update(x.strip() for x in str(r.get("Rule ID列表", "")).split(",") if x.strip())
     rid_nums = sorted(int(x) for x in active_rids if x.isdigit())
     rid_span = f"{rid_nums[0]} ~ {rid_nums[-1]}" if rid_nums else "-"
-    # 部署时间跨度（all_rows 已按部署时间升序）。
-    dates = [str(r.get("部署时间", "")) for r in all_rows if str(r.get("部署时间", ""))]
+    # 部署时间跨度（最早 ~ 最新；不依赖 all_rows 的排序方向）。
+    dates = sorted(str(r.get("部署时间", "")) for r in all_rows if str(r.get("部署时间", "")))
     date_span = f"{dates[0]} ~ {dates[-1]}" if dates else "-"
 
     print("")
@@ -341,8 +352,8 @@ def _print_history(limit: int | None, device: str | None,
           f"    部署时间跨度：{date_span}")
     print(f"  有效 Rule ID 总数：{color(str(len(active_rids)), 'green')}"
           f"    范围：{color(rid_span, 'green')}")
-    if owners:
-        print(f"  Owner：{', '.join(owners)}")
+    if originators:
+        print(f"  发起人：{', '.join(originators)}")
     if platforms:
         # 每平台的有效批次数，便于一眼看分布。
         per = {}
@@ -423,6 +434,17 @@ def _selftest() -> int:
         check(len(new_active) == 1 and new_active[0].get("状态") == STATUS_ACTIVE,
               "同身份键新 Rule ID 记录为『有效』")
 
+        # 4) history 显示顺序：最新在前；同一天 Rule ID 大的在前。
+        order = sort_newest_first([
+            {"部署时间": "20261110", "Rule ID范围": "65100 ~ 65101"},
+            {"部署时间": "20261116", "Rule ID范围": "65300 ~ 65302"},
+            {"部署时间": "20261116", "Rule ID范围": "65400 ~ 65401"},
+            {"部署时间": "20261001", "Rule ID列表": "64000"},
+        ])
+        check([r["部署时间"] for r in order] == ["20261116", "20261116", "20261110", "20261001"]
+              and order[0]["Rule ID范围"].startswith("65400"),
+              "history 按时间从最新到最早（同日 Rule ID 大的在前）")
+
         if failures:
             print(f"[selftest] 失败 {len(failures)} 项。")
             return 1
@@ -442,7 +464,7 @@ def main() -> int:
     p = argparse.ArgumentParser(prog="deployota history",
                                 description="查看 OTA 部署历史（JSONL 主存，CSV 可导出）。")
     p.add_argument("--device", default=None, help="按设备类型代码过滤（子串匹配）。")
-    p.add_argument("--owner", default=None, help="按 Owner 过滤（子串匹配）。")
+    p.add_argument("--originator", default=None, help="按发起人过滤（子串匹配）。")
     p.add_argument("--rule", default=None,
                    help="按 Rule ID 或范围过滤（纯数字会判断是否落在某批区间内；也支持范围文本子串）。")
     p.add_argument("--limit", type=int, default=20, help="只显示最近 N 条（默认 20；0 表示全部）。")
@@ -456,7 +478,7 @@ def main() -> int:
         _export_csv()
         print(f"已导出 CSV → {_csv_path()}")
         return 0
-    return _print_history(args.limit or None, args.device, args.owner, args.rule)
+    return _print_history(args.limit or None, args.device, args.originator, args.rule)
 
 
 if __name__ == "__main__":

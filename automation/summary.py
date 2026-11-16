@@ -142,7 +142,8 @@ def _box_table(rows, headers: list[str] | None = None) -> str:
 OFFLINE_HEADERS = ["Rule ID", "升级类型", "机型信息", "机型扩展码", "源版本", "目标版本", "下线时间"]
 
 
-def render_summary(device_code: str, rows: list[dict], kind: str = "online", when: str = "") -> str:
+def render_summary(device_code: str, rows: list[dict], kind: str = "online", when: str = "",
+                   originator: str = "") -> str:
     """渲染一个设备类型的汇总块（带颜色的文本）。kind='online' 上线汇总，'offline' 下线汇总。
 
     下线汇总与上线同一版式，但用红色标题、⛔ 标记、『下线规则总数 / 下线时间』字样和红色提示框，
@@ -169,7 +170,8 @@ def render_summary(device_code: str, rows: list[dict], kind: str = "online", whe
     else:
         out.append(f"  设备类型代码：{color(device_code or '(未知)', 'bold')}"
                    f"    ·    部署规则总数：{color(str(len(rows)), 'bold')} 条"
-                   f"    ·    Rule ID 范围：{color(rng, 'green')}")
+                   f"    ·    Rule ID 范围：{color(rng, 'green')}"
+                   f"    ·    发起人：{color(originator or '-', 'bold')}")
     out.append("")
     out.append(_box_table(rows, headers))
     out.append("")
@@ -186,14 +188,142 @@ def render_summary(device_code: str, rows: list[dict], kind: str = "online", whe
     return "\n".join(out)
 
 
-def print_summary(xlsx_path: str) -> int:
+def print_summary(xlsx_path: str, originator: str = "") -> int:
     device_code, rows = _read_rows(xlsx_path)
     if not rows:
         print(err("未从该 Excel 读到任何含 Rule ID 的数据行。"), file=sys.stderr)
         return 1
-    print(render_summary(device_code, rows, "online"))
+    print(render_summary(device_code, rows, "online", originator=originator))
     print(ok(f"汇总完成（complete）：共 {len(rows)} 条规则。"))
     return 0
+
+
+# ----------------------------------------------------------------------
+# HTML 版（邮件用）：全部内联样式 + 表格布局，Outlook / 网页邮箱 / 手机都能正常显示。
+# ----------------------------------------------------------------------
+
+def _h(s) -> str:
+    import html
+    return html.escape(str(s if s is not None else ""))
+
+
+def render_summary_html(device_code: str, rows: list[dict], originator: str = "", when: str = "",
+                        stage: str = "场测 · OTA 部署已在 CMS 上线") -> str:
+    """部署汇总的 HTML 邮件正文（完整 HTML 文档）。"""
+    from datetime import datetime
+    when = when or datetime.now().strftime("%Y-%m-%d %H:%M")
+    lo, hi = _rule_id_range(rows)
+    rng = lo if lo == hi else f"{lo} ~ {hi}"
+    types = sorted({r.get("升级类型", "") for r in rows if r.get("升级类型", "")})
+    srcs = sorted({r.get("源版本", "") for r in rows if r.get("源版本", "")})
+    tgts = sorted({r.get("目标版本", "") for r in rows if r.get("目标版本", "")})
+    font = "font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif;"
+
+    def card(label, value, accent="#1f2937"):
+        size = 16 if len(str(value)) <= 12 else 13      # 长值（如长设备类型代码）缩小字号，少换行
+        return (f'<td style="padding:6px;width:25%;" valign="top">'
+                f'<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;">'
+                f'<div style="{font}font-size:12px;color:#6b7280;margin-bottom:4px;">{_h(label)}</div>'
+                f'<div style="{font}font-size:{size}px;font-weight:600;color:{accent};word-break:break-all;">'
+                f'{_h(value) or "-"}</div></div></td>')
+
+    def many(vals, unit):
+        # 超过 2 个就只写个数，明细表里有每行的值。
+        return " / ".join(vals) if len(vals) <= 2 else f"{len(vals)} 个（见明细）"
+
+    def badge(text):
+        force = "强制" in text
+        bg, fg = ("#fef2f2", "#b91c1c") if force else ("#ecfdf5", "#047857")
+        return (f'<span style="{font}display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;'
+                f'background:{bg};color:{fg};white-space:nowrap;">{_h(text) or "-"}</span>')
+
+    headers = [disp for disp, _ in _COLS]
+    th = "".join(f'<th align="left" style="{font}font-size:12px;font-weight:600;color:#374151;'
+                 f'background:#f3f4f6;padding:9px 10px;border-bottom:2px solid #e5e7eb;white-space:nowrap;">'
+                 f'{_h(h)}</th>' for h in headers)
+    trs = []
+    for i, r in enumerate(rows):
+        bg = "#ffffff" if i % 2 == 0 else "#fafafa"
+        tds = []
+        for h in headers:
+            v = r.get(h, "")
+            if h == "升级类型":
+                inner = badge(v)
+            elif h == "Rule ID":
+                inner = f'<span style="font-weight:600;color:#1d4ed8;">{_h(v)}</span>'
+            elif h in ("源版本", "目标版本"):
+                inner = f'<span style="font-family:Menlo,Consolas,monospace;">{_h(v)}</span>'
+            else:
+                inner = _h(v)
+            tds.append(f'<td style="{font}font-size:13px;color:#111827;padding:8px 10px;'
+                       f'border-bottom:1px solid #f0f0f0;white-space:nowrap;">{inner}</td>')
+        trs.append(f'<tr style="background:{bg};">{"".join(tds)}</tr>')
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTA 部署汇总 {_h(device_code)} {_h(rng)}</title></head>
+<body style="margin:0;padding:0;background:#eef2f7;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f7;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="760" cellpadding="0" cellspacing="0"
+       style="max-width:760px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;
+              box-shadow:0 2px 8px rgba(15,23,42,0.08);">
+  <tr><td style="background:linear-gradient(135deg,#1e3a8a,#2563eb);background-color:#1e40af;padding:22px 28px;">
+    <div style="{font}font-size:12px;letter-spacing:1px;color:#bfdbfe;text-transform:uppercase;">
+      Hisense Overseas OTA · Deployment Summary</div>
+    <div style="{font}font-size:22px;font-weight:700;color:#ffffff;margin-top:6px;">📦 OTA 部署信息汇总</div>
+    <div style="{font}font-size:13px;color:#dbeafe;margin-top:6px;">
+      {_h(device_code)} &nbsp;·&nbsp; Rule ID {_h(rng)} &nbsp;·&nbsp; {_h(stage)}</div>
+  </td></tr>
+  <tr><td style="padding:18px 22px 4px 22px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+      {card("设备类型代码", device_code)}
+      {card("部署规则总数", f"{len(rows)} 条")}
+      {card("Rule ID 范围", rng, "#1d4ed8")}
+      {card("发起人 / Originator", originator or "-", "#7c3aed")}
+    </tr><tr>
+      {card("升级类型", " / ".join(types))}
+      {card("源版本", many(srcs, "源版本"))}
+      {card("目标版本", many(tgts, "目标版本"), "#047857")}
+      {card("汇总时间", when)}
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:14px 28px 6px 28px;">
+    <div style="{font}font-size:15px;font-weight:600;color:#111827;">规则明细（{len(rows)} 条）</div>
+  </td></tr>
+  <tr><td style="padding:4px 28px 8px 28px;">
+    <div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:8px;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <thead><tr>{th}</tr></thead>
+      <tbody>{"".join(trs)}</tbody>
+    </table></div>
+  </td></tr>
+  <tr><td style="padding:12px 28px 22px 28px;">
+    <div style="{font}background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #f59e0b;border-radius:6px;
+                padding:12px 14px;font-size:13px;color:#92400e;">
+      ⚠ <b>灰度提醒</b>：进行下一阶段灰度发布时，请提供本次的 Rule ID 信息。本次部署 Rule ID 范围：<b>{_h(rng)}</b><br>
+      下一步：<span style="font-family:Menlo,Consolas,monospace;">./deployota update ota50 {_h(rng.replace(' ', ''))}</span>
+    </div>
+  </td></tr>
+  <tr><td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:12px 28px;">
+    <div style="{font}font-size:11px;color:#9ca3af;">此邮件由 deployota 自动生成（数据来自本次部署 Excel）。请勿直接回复。</div>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>"""
+
+
+def build_summary_html(xlsx_path: str, originator: str = "",
+                       stage: str = "场测 · OTA 部署已在 CMS 上线") -> tuple[str, str, str]:
+    """→ (主题, HTML, 纯文本备用)。读不到含 Rule ID 的行时抛 ValueError。"""
+    device_code, rows = _read_rows(xlsx_path)
+    if not rows:
+        raise ValueError("Excel 里没有含 Rule ID 的数据行")
+    lo, hi = _rule_id_range(rows)
+    rng = lo if lo == hi else f"{lo}~{hi}"
+    subject = f"[OTA 部署] {device_code} Rule ID {rng}（{len(rows)} 条）" + (f" · 发起人 {originator}" if originator else "")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", render_summary(device_code, rows, "online", originator=originator))
+    return subject, render_summary_html(device_code, rows, originator=originator, stage=stage), text
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -266,6 +396,15 @@ def _selftest() -> int:
     check("下线汇总有明显下线标识与下线时间",
           "下线信息汇总" in off and "已下线" in off and "下线时间" in off and "2026-11-10 15:30" in off)
     check("升级类型映射自 升级方式", rows[0]["升级类型"] == "强制升级")
+    # —— 发起人 / HTML 邮件版 ——
+    check("文本汇总含发起人", "发起人" in render_summary("DEV", rows, originator="张三")
+          and "张三" in render_summary("DEV", rows, originator="张三"))
+    subj, html_, text_ = build_summary_html(p, originator="张三<x>")
+    check("HTML：完整文档、含发起人（已转义）、Rule ID 范围、每条规则",
+          html_.startswith("<!DOCTYPE html>") and "张三&lt;x&gt;" in html_ and "65345 ~ 65348" in html_
+          and html_.count("55U75SUA") >= 1 and "<script" not in html_)
+    check("邮件主题含设备、Rule ID、发起人", "MT9655AMAndrGTV" in subj and "65345~65348" in subj and "张三" in subj)
+    check("纯文本备用版没有颜色控制符", "\x1b[" not in text_ and "发起人" in text_)
 
     print("\n自测结果：", "全部通过 ✅" if ok_all else "存在失败 ❌")
     return 0 if ok_all else 1

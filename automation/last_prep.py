@@ -47,3 +47,41 @@ def forget(excel_path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+# ----------------------------------------------------------------------
+# Excel 附带信息：<Excel 名>.meta.json（目前只有『发起人 / Originator』）。
+# 不写进 Excel 本身（标准 18 列 Excel 要导入 CMS，多一列可能导入失败）。
+# ----------------------------------------------------------------------
+
+def meta_path(excel_path: str) -> str:
+    base, _ = os.path.splitext(os.path.abspath(excel_path))
+    return base + ".meta.json"
+
+
+def save_meta(excel_path: str, **fields) -> None:
+    """合并写入附带信息（空值不覆盖已有值）。写失败不影响主流程。"""
+    try:
+        data = load_meta(excel_path)
+        data.update({k: str(v).strip() for k, v in fields.items() if str(v or "").strip()})
+        data["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        Path(meta_path(excel_path)).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                                               encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_meta(excel_path: str) -> dict:
+    try:
+        data = json.loads(Path(meta_path(excel_path)).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def originator_for(excel_path: str | None) -> str:
+    """发起人：环境变量 OTA_ORIGINATOR（--originator 传入）优先，其次 Excel 附带信息。"""
+    env = os.environ.get("OTA_ORIGINATOR", "").strip()
+    if env:
+        return env
+    return str(load_meta(excel_path).get("originator", "")).strip() if excel_path else ""

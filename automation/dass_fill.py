@@ -923,6 +923,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
                 "  ./deployota dass init 路径.xlsx    指定 Excel\n\n"
                 "  插入 N 行并逐格填写 → 你在浏览器核对 → 终端输入 approve 才提交。\n"
                 "  --auto-approve：全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。\n"
+                "  --mail-to \"王敏 <wangmin3@hisense.com>; …\"：最后汇总邮件的收件人（不给就弹出输入框）；\n"
+                "                固定抄送发件人和 devinw@hisense.com。\n"
                 "  填写完成后记录阶段『场测』，并把本批写入部署库。publish 第 4 步就是它。\n\n"
                 "放量（ota50 起）请用 ./deployota update <ota50|ota200|ota1k|ota5k|ota20k|ota-all> <Rule ID>。\n"
                 "（旧用法 dass <otaXX> <Excel> 仍可用，但不经过 CMS 灰度，不推荐。）\n"
@@ -942,6 +944,39 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             print(f"✗ 多余参数：{arg!r}。只接受一个 Excel 路径。")
             raise SystemExit(2)
     return option, excel
+
+
+FIRST_DEPLOY_STAGE = "场测 · OTA 部署已在 CMS 上线"
+MAIL_DEFER_ENV = "OTA_MAIL_DEFER"   # publish 设为 1：dass init 子进程不发邮件，由 publish 最后统一发
+
+
+def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok: bool = True) -> None:
+    """部署最后一步（dass init 提交之后）：生成 HTML 部署汇总，存到 Excel 旁边（<Excel 名>.summary.html），
+    问收件人（--mail-to 或终端粘贴 Outlook 收件人串），发给这些人，并固定抄送发件人 + devinw@hisense.com。
+    任何一步失败只提示，不影响部署结果。"""
+    from . import action_summary as A
+    # 第一次场测部署：邮件只说 OTA 已在 CMS 上线，不写 DASS 状态（DASS 结果看终端的操作总结）。
+    stage = FIRST_DEPLOY_STAGE
+    try:
+        from .summary import build_summary_html
+        subject, html, text = build_summary_html(excel, originator=originator, stage=stage)
+        path = os.path.splitext(os.path.abspath(excel))[0] + ".summary.html"
+        Path(path).write_text(html, encoding="utf-8")
+        print(color(f"✓ HTML 部署汇总已保存：{path}", "green"))
+    except Exception as e:
+        print(color(f"⚠ HTML 部署汇总生成失败：{e}", "yellow"))
+        A.step("汇总邮件", A.WARN, f"HTML 生成失败：{e}")
+        return
+    from .mailer import SkipMail, ask_recipients, plan_recipients, send_html
+    try:
+        to, cc = plan_recipients(ask_recipients())
+    except SkipMail:
+        print(color(f"· 汇总邮件：你选择不发送（HTML 已存：{path}）", "dim"))
+        A.step("汇总邮件", A.SKIP, f"你选择不发送（HTML 已存：{path}）")
+        return
+    sent, why = send_html(subject, html, text, to=to, cc=cc)
+    print(color(("✓ 汇总邮件" if sent else "⚠ 汇总邮件") + f"：{why}", "green" if sent else "yellow"))
+    A.step("汇总邮件", A.OK if sent else A.WARN, why + ("" if sent else f"（HTML 已存：{path}）"))
 
 
 AUTO_APPROVE_ENV = "OTA_DASS_AUTO_APPROVE"
@@ -979,7 +1014,8 @@ def _ask_submit(prompt: str, all_ok: bool) -> tuple[bool, str]:
 
 
 def main() -> int:
-    option, excel = _parse_cli(sys.argv[1:])
+    from .mailer import pop_mail_to
+    option, excel = _parse_cli(pop_mail_to(sys.argv[1:]))   # --mail-to "…" 放进环境变量，部署完发汇总用
     if "--auto-approve" in sys.argv[1:]:
         enable_auto_approve()
 
@@ -1202,19 +1238,21 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             # 更新 DASS 数据后自动显示 OTA 部署汇总（数据取自本次更新用的 Excel）。
             # 仅当该 Excel 含 Rule ID 列时显示；没有则静默跳过（如 init 未回写 Rule ID）。
             # 按 Rule ID 更新（excel=None）时没有 Excel：汇总与写库都跳过（部署记录已在库里）。
+            originator = ""
             if excel:
+                from .last_prep import originator_for
+                originator = originator_for(excel)   # prep 时输入的发起人
                 try:
                     from .summary import print_summary
                     print("")
-                    print_summary(excel)
+                    print_summary(excel, originator=originator)
                 except Exception as e:
                     print(color(f"（部署汇总显示跳过：{e}）", "dim"))
 
                 # 并把本次部署写入永久存储（JSONL + CSV，幂等：同键已存在则不重复写）。
                 try:
                     from .depdb import record_deployment_from_excel
-                    owner = os.environ.get("OTA_OWNER", "").strip()
-                    wrote, msg = record_deployment_from_excel(excel, owner=owner)
+                    wrote, msg = record_deployment_from_excel(excel, originator=originator)
                     print(color(("✓ " if wrote else "· ") + msg, "green" if wrote else "dim"))
                 except Exception as e:
                     print(color(f"（部署记录写入跳过：{e}）", "dim"))
@@ -1223,6 +1261,7 @@ def execute(option: str, records: list[dict], excel: str | None = None,
 
             where = "在浏览器核对后" if config.HEADED else "核对上面的日志 / 截图后"
             go, how = _ask_submit(f"\n请{where}输入 approve 提交（其它输入 = 不提交）：", all_ok=fill_ok)
+            submitted = False
             # 可见浏览器 + 人工确认时，提交后留着页面让你看；自动提交 / 后台模式直接关闭。
             linger = config.HEADED and how == "manual" and sys.stdin.isatty()
             if go:
@@ -1231,6 +1270,7 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 A.step("DASS 提交", A.OK if ok_submit else A.FAIL,
                        ("已提交" + note) if ok_submit else "没找到提交按钮，未提交，请在浏览器手动提交")
                 A.set_submitted(bool(ok_submit))
+                submitted = bool(ok_submit)
                 if ok_submit:
                     print(color(f"\n✅ 记录已提交{note}。", "green"))
                     _shot(page, "submitted")
@@ -1242,6 +1282,10 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             else:
                 print("已取消提交（未做任何批复/提交操作）。")
                 A.step("DASS 提交", A.WARN, "你没有输入 approve，DASS 未提交（页面关闭后填写的内容会丢失）")
+            # 部署的最后一步：汇总邮件（问收件人；固定抄送发件人 + devinw）。只在 init（新部署）时发。
+            # publish 调用时（OTA_MAIL_DEFER=1）不在这里发：publish 打完检查点报告后统一问收件人、发一次。
+            if option == "init" and excel and os.environ.get(MAIL_DEFER_ENV) != "1":
+                _mail_summary(excel, originator, submitted=submitted, fill_ok=fill_ok)
             if linger:
                 try:
                     input("\n按回车关闭浏览器 ... ")
