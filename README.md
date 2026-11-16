@@ -52,7 +52,7 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 | CMS 登录（publish / online / offline / update） | `CMS_USERNAME`、`CMS_PASSWORD` |
 | DASS 登录（dass / publish 的第 4 步） | `DASS_USERNAME`、`DASS_PASSWORD` |
 | 下载 FTP 升级包（prep 真实上传） | `OTA_FTP_USER`（默认 ftpuser）、`OTA_FTP_PASS` |
-| 部署汇总邮件（可选） | `OTA_SMTP_HOST`、`OTA_SMTP_PORT`、`OTA_SMTP_USER`、`OTA_SMTP_PASS`、`OTA_MAIL_TO`（默认 devinw@hisense.com） |
+| 部署汇总邮件（可选） | `OTA_SMTP_HOST`、`OTA_SMTP_PORT`、`OTA_SMTP_USER`、`OTA_SMTP_PASS`、`OTA_MAIL_CC` / `OTA_MAIL_BCC`（可选） |
 
 - 凭据只从 `config/.env` 读取，该文件已在 `.gitignore`，不会被提交。
 - AWS 区域和密钥不写在 `.env`，走 boto3 默认链（`~/.aws`、实例角色或环境变量）。
@@ -120,6 +120,7 @@ CMS_HEADED=false ./deployota update ota200 65370-65379 --yes --auto-approve   # 
 | `./deployota dass [OPTION]` | DASS 填报（init 插入新行）；也保留按 Excel 更新的旧用法 | 是（DASS，提交需你输入 approve） |
 | `./deployota query <ID>` | 按 Rule ID 查部署信息（单个 / 区间 / 逗号） | 否 |
 | `./deployota history` | 查看部署历史 | 否 |
+| `./deployota mail <Rule ID>` | 给已部署的批次补发 HTML 汇总邮件：粘贴收件人 → 看草稿 → 输入 `approve` 才发送 | 否（只发邮件） |
 
 每个子命令都支持 `--help`：`./deployota <子命令> --help`。
 
@@ -305,10 +306,15 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
     （`;` `,` 换行都能分隔；显示名原样保留；重复地址自动去掉；看不懂的会列出来、不会发）。
     然后列出认出的收件人让你确认：**回车 = 发送，r = 重新输入，n = 不发**。什么都不输入 = 只发给固定的人。
     也可以提前写在命令里：`--mail-to "王敏 <wangmin3@hisense.com>; …"`（`publish` / `dass init` 都支持），就不再弹框。
-  - **固定抄送**（每封都有）：发件人自己（`OTA_MAIL_FROM`）+ `OTA_MAIL_TO`（默认 devinw@hisense.com）；已在收件人里的不重复。
+  - **收件人（To）**：只有你粘贴的人；粘贴里出现的 devinw@hisense.com 和 sys.datareports@hisense.com 会自动去掉。
+  - **抄送（Cc）**：每封固定且只有 `数据统计报告 <sys.datareports@hisense.com>`（`OTA_MAIL_CC`）。
+  - **密送（Bcc）**：每封固定 `王涛/Devin Wang <devinw@hisense.com>`（`OTA_MAIL_BCC`），其他收件人看不到。
+  - To / Cc 里都不会出现 devinw@hisense.com。
   - 第一次场测部署的邮件写「场测 · OTA 部署已在 CMS 上线」，不写 DASS 状态（DASS 结果看终端的操作总结）。
   - 邮件服务器在 `config/.env` 里配置（`OTA_SMTP_*`）；没配就只保存 HTML、提示未发送。邮件失败不影响部署结果。
   发起人也写入部署库，`history` / `query` 显示为「发起人」。
+- **补发汇总**：`./deployota mail 65391 [--originator 姓名] [--mail-to "…"]` —— 按 Rule ID 找到这批和它的 Excel，
+  打印汇总、生成 HTML，弹出收件人输入框，显示草稿，**输入 `approve` 才发送**。不碰 CMS / DASS / S3。
 - 同一份 Excel 可以含**多个目标版本**，模板名称会带上全部版本的末 5 位，例如 `MT9666AndrWH80E_3.9.2_3.9.4`；
   但**设备类型代码必须只有一个**。
 
@@ -606,7 +612,7 @@ JSONL 为主存，同时导出 CSV。
 | `CMS_ARTIFACTS_DIR` | 截图和中间产物目录（默认 `artifacts/`） |
 | `OTA_WORKSPACE` | 统一工作目录；prep 默认输出目录、部署库（`OTADATA`）都在这下面 |
 | `OTA_DEPLOY_DB_DIR` | 单独指定部署库目录（可选） |
-| `OTA_SMTP_HOST` / `OTA_SMTP_PORT` / `OTA_SMTP_SECURITY` / `OTA_SMTP_USER` / `OTA_SMTP_PASS` / `OTA_MAIL_FROM` / `OTA_MAIL_TO` | dass init 后发 HTML 部署汇总邮件。不填 `OTA_SMTP_HOST` 就不发，只保存 `<Excel 名>.summary.html`；收件人默认 devinw@hisense.com |
+| `OTA_SMTP_HOST` / `OTA_SMTP_PORT` / `OTA_SMTP_SECURITY` / `OTA_SMTP_USER` / `OTA_SMTP_PASS` / `OTA_MAIL_FROM` / `OTA_MAIL_CC` / `OTA_MAIL_BCC` | 部署汇总邮件。不填 `OTA_SMTP_HOST` 就不发，只保存 `<Excel 名>.summary.html`；固定抄送默认 数据统计报告 <sys.datareports@hisense.com>，固定密送默认 devinw@hisense.com |
 | `OTA_FTP_USER` / `OTA_FTP_PASS` | prep 下载升级包用的 FTP 账号（用户名默认 `ftpuser`） |
 | `OTA_S3_UPLOAD_BUCKET` | S3 桶（默认 `fam-media-andr`） |
 | `OTA_AWS_PREFIX` | 下载链接前缀（默认 `https://ota-dl.intsmarthub.com`） |

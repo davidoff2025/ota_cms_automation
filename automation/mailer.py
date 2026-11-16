@@ -7,7 +7,9 @@ config/.env 里需要：
   OTA_SMTP_USER      登录账号（通常是邮箱地址）；服务器不需要登录时留空
   OTA_SMTP_PASS      密码 / 授权码
   OTA_MAIL_FROM      发件人；默认 = OTA_SMTP_USER
-  OTA_MAIL_TO        收件人，逗号分隔；默认 devinw@hisense.com
+  OTA_MAIL_CC        每封固定抄送；默认『数据统计报告 <sys.datareports@hisense.com>』
+  OTA_MAIL_BCC       每封固定密送（其他人看不到）；默认『王涛/Devin Wang <devinw@hisense.com>』
+                     （To / Cc 里出现这些地址会自动去掉）。旧的 OTA_MAIL_TO 已不再使用。
 
 没配 OTA_SMTP_HOST 时不发送，只提示；HTML 文件照样保存，可以手工打开或转发。
 """
@@ -22,7 +24,8 @@ from email.utils import formataddr, formatdate, make_msgid
 
 from . import config  # noqa: F401  加载 config/.env
 
-DEFAULT_TO = "devinw@hisense.com"
+DEFAULT_CC = "数据统计报告 <sys.datareports@hisense.com>"
+DEFAULT_BCC = "王涛/Devin Wang <devinw@hisense.com>"
 RECIPIENTS_ENV = "OTA_MAIL_RECIPIENTS"     # --mail-to 传进来的收件人（publish → dass init 子进程靠它继承）
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -79,11 +82,18 @@ def _fmt(name: str, addr: str) -> str:
     return formataddr((name, addr)) if name else addr
 
 
-def always_cc() -> list[tuple[str, str]]:
-    """每封都抄送：发件人自己 + OTA_MAIL_TO（默认 devinw@hisense.com）。"""
-    s = settings()
-    got, _ = parse_recipients(", ".join(([s["from"]] if s["from"] else []) + s["to"]))
-    return got
+def fixed_cc() -> list[tuple[str, str]]:
+    """每封固定抄送（OTA_MAIL_CC，默认 数据统计报告 <sys.datareports@hisense.com>）。"""
+    return parse_recipients(settings()["cc"])[0]
+
+
+def fixed_bcc() -> list[tuple[str, str]]:
+    """每封固定密送（OTA_MAIL_BCC，默认 王涛/Devin Wang <devinw@hisense.com>）。"""
+    return parse_recipients(settings()["bcc"])[0]
+
+
+def _names(lst) -> str:
+    return "; ".join(f"{n} <{a}>" if n else a for n, a in lst)
 
 
 def ask_recipients() -> list[tuple[str, str]]:
@@ -97,8 +107,8 @@ def ask_recipients() -> list[tuple[str, str]]:
     import sys
     if not sys.stdin.isatty():
         return []
-    cc = "; ".join(a for _, a in always_cc())
-    print(f"\n======== 部署汇总邮件 ========\n固定抄送：{cc}")
+    print(f"\n======== 部署汇总邮件 ========\n固定抄送：{_names(fixed_cc()) or '（无）'}"
+          f"\n固定密送：{_names(fixed_bcc()) or '（无）'}（收件人 / 抄送里出现会自动去掉）")
     while True:
         print("请把所有收件人一次粘贴进来（可直接从 Outlook 复制，一行或多行都行，"
               "如『王敏 <wangmin3@hisense.com>; …』）。\n粘贴完再按一次回车（空行）结束；什么都不输入直接回车 = 只发固定抄送：")
@@ -164,7 +174,7 @@ def settings() -> dict:
     user = g("OTA_SMTP_USER")
     return {"host": g("OTA_SMTP_HOST"), "port": port, "security": sec, "user": user,
             "password": g("OTA_SMTP_PASS"), "from": g("OTA_MAIL_FROM") or user,
-            "to": [x.strip() for x in (g("OTA_MAIL_TO") or DEFAULT_TO).replace(";", ",").split(",") if x.strip()]}
+            "cc": g("OTA_MAIL_CC") or DEFAULT_CC, "bcc": g("OTA_MAIL_BCC") or DEFAULT_BCC}
 
 
 def build_message(subject: str, html: str, text: str, sender: str, to: list[str],
@@ -182,26 +192,60 @@ def build_message(subject: str, html: str, text: str, sender: str, to: list[str]
     return msg
 
 
-def plan_recipients(extra: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """→ (收件人 To, 抄送 Cc)。To = 你输入的人；Cc = 固定抄送（发件人 + devinw）中不在 To 里的。
-    没输入任何人时，固定抄送的人直接当收件人。"""
-    cc = always_cc()
-    if not extra:
-        return cc, []
-    to_set = {a.lower() for _, a in extra}
-    return list(extra), [(n, a) for n, a in cc if a.lower() not in to_set]
+def approve_and_send(subject: str, html: str, text: str, to, cc, bcc=None,
+                     draft_path: str | None = None) -> tuple[bool, str]:
+    """显示草稿（主题 / 收件人 / 抄送 / 密送 / 正文文件），输入 approve 才真的发送；其它输入 = 不发。"""
+    if draft_path:
+        from pathlib import Path
+        Path(draft_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(draft_path).write_text(html, encoding="utf-8")
+    print("\n======== 邮件草稿（还没发送）========")
+    print(f"  发件人：{settings()['from']}")
+    print(f"  主题：{subject}")
+    print(f"  收件人：{'；'.join(f'{n} <{a}>' if n else a for n, a in (to or []))}")
+    print(f"  抄送：{'；'.join(f'{n} <{a}>' if n else a for n, a in (cc or [])) or '（无）'}")
+    print(f"  密送：{'；'.join(f'{n} <{a}>' if n else a for n, a in (bcc or [])) or '（无）'}")
+    if draft_path:
+        print(f"  正文预览：{draft_path}（可以用浏览器打开看）")
+    try:
+        ans = input("输入 approve 真的发送；其它任意输入 = 不发：").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans != "approve":
+        return False, "你没有输入 approve，未发送"
+    return send_html(subject, html, text, to=to, cc=cc, bcc=bcc)
+
+
+def plan_recipients(extra: list[tuple[str, str]]):
+    """→ (收件人 To, 抄送 Cc, 密送 Bcc)。
+
+    To  = 你输入的人，去掉固定抄送 / 固定密送里的地址（例如粘贴里带了 devinw@hisense.com 会被去掉）；
+    Cc  = 固定抄送（默认 数据统计报告 <sys.datareports@hisense.com>）；
+    Bcc = 固定密送（默认 王涛/Devin Wang <devinw@hisense.com>），不出现在邮件头里。
+    没输入任何人时，固定抄送的人当收件人（Cc 为空）。
+    """
+    cc, bcc = fixed_cc(), fixed_bcc()
+    bcc_set = {a.lower() for _, a in bcc}
+    cc = [(n, a) for n, a in cc if a.lower() not in bcc_set]
+    cc_set = {a.lower() for _, a in cc}
+    to = [(n, a) for n, a in extra if a.lower() not in bcc_set | cc_set]
+    if not to:
+        return cc, [], bcc
+    return to, cc, bcc
 
 
 def send_html(subject: str, html: str, text: str = "",
-              to: list[tuple[str, str]] | None = None, cc: list[tuple[str, str]] | None = None) -> tuple[bool, str]:
-    """发送。to/cc 不给 = 发给固定抄送的人。返回 (是否成功, 说明)。失败不抛异常（不影响部署流程）。"""
+              to: list[tuple[str, str]] | None = None, cc: list[tuple[str, str]] | None = None,
+              bcc: list[tuple[str, str]] | None = None) -> tuple[bool, str]:
+    """发送。to 不给 = 按 plan_recipients([])（固定抄送当收件人 + 固定密送）。
+    Bcc 不写进邮件头，只交给服务器投递。返回 (是否成功, 说明)。失败不抛异常（不影响部署流程）。"""
     s = settings()
     if not s["host"]:
         return False, "没配邮件服务器（config/.env 的 OTA_SMTP_HOST），未发送"
     if not s["from"]:
         return False, "没配发件人（OTA_MAIL_FROM 或 OTA_SMTP_USER），未发送"
     if to is None:
-        to, cc = plan_recipients([])
+        to, cc, bcc = plan_recipients([])
     to_s, cc_s = [_fmt(n, a) for n, a in to], [_fmt(n, a) for n, a in (cc or [])]
     if not to_s:
         return False, "没有收件人，未发送"
@@ -219,9 +263,11 @@ def send_html(subject: str, html: str, text: str = "",
                 server.ehlo()
             if s["user"] and s["password"]:
                 server.login(s["user"], s["password"])
-            server.send_message(msg)   # 收件人取自 To + Cc 头
+            rcpts = list(dict.fromkeys(a for _, a in list(to) + list(cc or []) + list(bcc or [])))
+            server.send_message(msg, to_addrs=rcpts)   # Bcc 只在这里交给服务器，不进邮件头
         names = lambda lst: "、".join(n or a for n, a in lst)
-        return True, f"已发送：收件人 {names(to)}" + (f"；抄送 {names(cc)}" if cc else "")
+        return True, (f"已发送：收件人 {names(to)}" + (f"；抄送 {names(cc)}" if cc else "")
+                      + (f"；密送 {names(bcc)}" if bcc else ""))
     except Exception as e:   # 不把密码等写进日志：只给异常类型和服务器返回
         return False, f"发送失败（{s['host']}:{s['port']} {s['security']}）：{type(e).__name__}: {e}"
 
@@ -235,13 +281,14 @@ def _selftest() -> int:
         good = good and bool(cond)
 
     saved = {k: os.environ.pop(k, None) for k in ("OTA_SMTP_HOST", "OTA_SMTP_PORT", "OTA_SMTP_SECURITY",
-                                                   "OTA_MAIL_TO", "OTA_SMTP_USER", "OTA_MAIL_FROM")}
+                                                   "OTA_MAIL_TO", "OTA_SMTP_USER", "OTA_MAIL_FROM",
+                                                   "OTA_MAIL_CC", "OTA_MAIL_BCC")}
     try:
-        check("默认收件人 devinw@hisense.com", settings()["to"] == [DEFAULT_TO])
+        check("默认抄送 数据统计报告 / 默认密送 王涛",
+              fixed_cc() == [("数据统计报告", "sys.datareports@hisense.com")]
+              and fixed_bcc() == [("王涛/Devin Wang", "devinw@hisense.com")])
         os.environ["OTA_SMTP_PORT"] = "465"
         check("465 端口默认 SSL", settings()["security"] == "ssl")
-        os.environ["OTA_MAIL_TO"] = "a@x.com; b@x.com"
-        check("多个收件人（; 或 , 分隔）", settings()["to"] == ["a@x.com", "b@x.com"])
         ok_, why = send_html("s", "<b>x</b>")
         check("没配服务器 → 不发送、给出原因", not ok_ and "OTA_SMTP_HOST" in why)
         m = build_message("主题", "<p>正文</p>", "正文", "ota@x.com", ["devinw@hisense.com"])
@@ -262,17 +309,50 @@ def _selftest() -> int:
         check("坏地址列进看不懂", b2 == ["坏地址 <oops>"])
         check("空输入", parse_recipients("  ") == ([], []))
         os.environ["OTA_MAIL_FROM"] = "sys.datareports@hisense.com"
-        os.environ["OTA_MAIL_TO"] = "devinw@hisense.com"
-        to, cc = plan_recipients(got[:2])
-        check("To = 输入的人；Cc = 发件人 + devinw", [a for _, a in to] == ["kangkai3@hisense.com", "wangmin3@hisense.com"]
-              and [a for _, a in cc] == ["sys.datareports@hisense.com", "devinw@hisense.com"])
-        to2, cc2 = plan_recipients([("", "devinw@hisense.com")])
-        check("输入里已有 devinw → 不重复抄送", [a for _, a in cc2] == ["sys.datareports@hisense.com"])
-        to3, cc3 = plan_recipients([])
-        check("没输入 → 固定的人当收件人", [a for _, a in to3] == ["sys.datareports@hisense.com", "devinw@hisense.com"]
-              and cc3 == [])
+        os.environ["OTA_MAIL_TO"] = "devinw@hisense.com"     # 旧配置：已不再使用，不能影响结果
+        to, cc, bcc = plan_recipients(got[:2])
+        check("To = 输入的人；Cc 只有数据统计报告；Bcc 王涛（devinw）",
+              [a for _, a in to] == ["kangkai3@hisense.com", "wangmin3@hisense.com"]
+              and cc == [("数据统计报告", "sys.datareports@hisense.com")]
+              and bcc == [("王涛/Devin Wang", "devinw@hisense.com")])
+        pasted, _ = parse_recipients("王涛/Devin Wang <devinw@hisense.com>; 王敏 <wangmin3@hisense.com>; "
+                                     "数据统计报告 <sys.datareports@hisense.com>; 王涛/Devin Wang <wangtao14@hisense.com>")
+        to2, cc2, bcc2 = plan_recipients(pasted)
+        check("粘贴里带 devinw / 数据统计报告 → To 里去掉（只在 Bcc / Cc 出现一次）",
+              [a for _, a in to2] == ["wangmin3@hisense.com", "wangtao14@hisense.com"]
+              and [a for _, a in cc2] == ["sys.datareports@hisense.com"]
+              and [a for _, a in bcc2] == ["devinw@hisense.com"])
+        check("To / Cc 都不含 devinw", all(a != "devinw@hisense.com" for _, a in to2 + cc2))
+        to3, cc3, bcc3 = plan_recipients([])
+        check("没输入 → 数据统计报告当收件人，Bcc 照旧",
+              [a for _, a in to3] == ["sys.datareports@hisense.com"] and cc3 == []
+              and [a for _, a in bcc3] == ["devinw@hisense.com"])
         m2 = build_message("s", "<b>x</b>", "x", "sys@x.com", [_fmt(*got[0])], [_fmt(*cc[0])])
-        check("中文显示名编码进 To / Cc 头", "kangkai3@hisense.com" in str(m2["To"]) and "Cc" in m2)
+        check("中文显示名编码进 To / Cc 头；邮件头没有 Bcc",
+              "kangkai3@hisense.com" in str(m2["To"]) and "Cc" in m2 and "Bcc" not in m2)
+        # 真实投递时 Bcc 交给服务器（不进邮件头）：用假的 SMTP 检查
+        sent = {}
+
+        class FakeSMTP:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def ehlo(self): pass
+            def starttls(self, **k): pass
+            def login(self, u, p): pass
+            def send_message(self, msg, to_addrs=None):
+                sent.update(rcpts=to_addrs, headers=dict(msg.items()))
+        real_ssl = smtplib.SMTP_SSL
+        smtplib.SMTP_SSL = FakeSMTP
+        os.environ.update(OTA_SMTP_HOST="fake", OTA_SMTP_PORT="465")
+        try:
+            send_html("s", "<b>x</b>", "x", to=to2, cc=cc2, bcc=bcc2)
+        finally:
+            smtplib.SMTP_SSL = real_ssl
+        check("投递名单含 Bcc；邮件头 To / Cc 不含 devinw、没有 Bcc 头",
+              "devinw@hisense.com" in sent.get("rcpts", []) and "Bcc" not in sent.get("headers", {})
+              and "devinw" not in str(sent.get("headers", {}).get("To", ""))
+              and "devinw" not in str(sent.get("headers", {}).get("Cc", "")))
         check("pop_mail_to 取出参数", pop_mail_to(["init", "--mail-to", "a@x.com", "x.xlsx"]) == ["init", "x.xlsx"]
               and os.environ.get(RECIPIENTS_ENV) == "a@x.com")
         os.environ.pop(RECIPIENTS_ENV, None)

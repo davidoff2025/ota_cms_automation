@@ -969,12 +969,12 @@ def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok:
         return
     from .mailer import SkipMail, ask_recipients, plan_recipients, send_html
     try:
-        to, cc = plan_recipients(ask_recipients())
+        to, cc, bcc = plan_recipients(ask_recipients())
     except SkipMail:
         print(color(f"· 汇总邮件：你选择不发送（HTML 已存：{path}）", "dim"))
         A.step("汇总邮件", A.SKIP, f"你选择不发送（HTML 已存：{path}）")
         return
-    sent, why = send_html(subject, html, text, to=to, cc=cc)
+    sent, why = send_html(subject, html, text, to=to, cc=cc, bcc=bcc)
     print(color(("✓ 汇总邮件" if sent else "⚠ 汇总邮件") + f"：{why}", "green" if sent else "yellow"))
     A.step("汇总邮件", A.OK if sent else A.WARN, why + ("" if sent else f"（HTML 已存：{path}）"))
 

@@ -9,6 +9,7 @@
   offline  -> automation.active_offline    按 Rule ID 下线
   query    -> automation.rule_info         按 Rule ID / 月份查部署信息与灰度阶段
   history  -> automation.depdb             部署历史
+  mail     -> automation.mail_summary      给已部署的批次补发 HTML 汇总邮件（需 approve）
 菜单见 _usage()；各子命令的详细帮助：./deployota <子命令> --help。
 """
 from __future__ import annotations
@@ -28,6 +29,7 @@ _SUBCOMMANDS: dict[str, tuple[str, list[str]]] = {
     "update": ("automation.dass_update", []),
     "history": ("automation.depdb",     []),
     "query":  ("automation.rule_info",  []),
+    "mail":   ("automation.mail_summary", []),
 }
 
 _PROG = "deployota"
@@ -112,6 +114,7 @@ def _usage() -> str:
         "查询",
         "  query   <Rule ID | 月份>    所属批次、版本、灰度阶段时间线（如 query 65370-65379、query 2026.04-2026.10）",
         "  history                     部署历史列表（--device / --originator / --rule / --limit / --export）",
+        "  mail    <Rule ID>           补发部署汇总邮件：粘贴收件人 → 看草稿 → 输入 approve 才发送",
         "",
         "Rule ID 写法：65370 / 65370-65379 / 65370,65375 / 混用；设备类型代码按 Rule ID 自动查找（--device 可选）。",
     ]
