@@ -43,8 +43,21 @@ def open_mac_page(page) -> None:
     print("  ✓ 已打开『MAC组管理』页")
 
 
+def _option_code(text: str) -> str:
+    """下拉候选项 / 已选值文字 → 设备类型代码：'A311D2安卓WE6GE(A311D2AndrWE6GE)' → 'A311D2AndrWE6GE'。
+
+    没有括号时整段就是代码。只取【最后一对】括号里的内容，用于精确比对（不做包含匹配）。
+    """
+    t = " ".join(str(text or "").split())
+    m = re.search(r"[(（]\s*([^()（）]+?)\s*[)）]\s*$", t)
+    return m.group(1) if m else t
+
+
 def _pick_select(page, select, code: str) -> bool:
-    """在一个 antd v3 下拉里输入设备类型代码并选中联想项（候选项文字形如『名称(代码)』）。"""
+    """在一个 antd v3 下拉里输入设备类型代码，并选中代码【完全相等】的那一项（候选项文字形如『名称(代码)』）。
+
+    MT9666Android 不会选到 MT9666AndroidXX；选完再读回已选值，代码不完全相等就算失败。
+    """
     try:
         select.click()
         page.wait_for_timeout(300)
@@ -59,13 +72,16 @@ def _pick_select(page, select, code: str) -> bool:
             page.wait_for_timeout(200)
             if opts.count() and opts.first.is_visible():
                 break
-        for i in range(opts.count()):
-            o = opts.nth(i)
-            if o.is_visible() and code in (o.inner_text() or ""):
-                o.click()
-                page.wait_for_timeout(400)
-                break
-        return code in (select.inner_text() or "")
+        exact = [opts.nth(i) for i in range(opts.count())
+                 if opts.nth(i).is_visible() and _option_code(opts.nth(i).inner_text()) == code]
+        if len(exact) != 1:
+            page.keyboard.press("Escape")
+            return False
+        exact[0].click()
+        page.wait_for_timeout(400)
+        shown = select.locator(".ant-select-selection-selected-value").first
+        shown_text = (shown.get_attribute("title") or shown.inner_text()) if shown.count() else select.inner_text()
+        return _option_code(shown_text) == code
     except Exception:
         return False
 
@@ -76,7 +92,8 @@ def search_group(page, device_code: str) -> tuple[dict | None, str]:
     form_sel = page.locator(".ant-form-item").filter(
         has=page.locator(".ant-form-item-label", has_text="设备类型")).locator(".ant-select").first
     if not _pick_select(page, form_sel, device_code):
-        return None, f"列表页『设备类型』选不上 {device_code!r}（CMS 里可能还没有这个设备类型）"
+        return None, (f"列表页『设备类型』没有代码完全等于 {device_code!r} 的唯一一项"
+                      "（CMS 里可能还没有这个设备类型，或代码大小写/写法不同）")
     box = page.locator("input#groupName").first
     box.fill(name)
     if (box.input_value() or "").strip() != name:
@@ -180,14 +197,35 @@ def ensure_macs(p, device_code: str, macs: list[str], assume_yes: bool = False,
     if not macs:
         res.update(status="ok", detail="没有场测 MAC，不需要处理")
         return res
-    mode = "（只查不改）" if read_only else ("（测试模式：填好后取消，不保存）" if dry_run else "")
-    print(color(f"\n======== MAC 组检查：{name}{mode} ========", "bold"))
-    print(f"  场测 MAC（后 8 位）：{', '.join(macs)}")
     browser = p.chromium.launch(headless=not config.HEADED)
     context = browser.new_context(viewport={"width": 1600, "height": 900})
     page = context.new_page()
     try:
         login(page)
+        return ensure_macs_on_page(page, device_code, macs, assume_yes=assume_yes,
+                                   dry_run=dry_run, read_only=read_only)
+    except Exception as e:
+        _shot(page, "mac_error")
+        res["detail"] = f"出错：{e}"
+        print(err(res["detail"]))
+        return res
+    finally:
+        context.close()
+        browser.close()
+
+
+def ensure_macs_on_page(page, device_code: str, macs: list[str], assume_yes: bool = False,
+                        dry_run: bool = False, read_only: bool = False) -> dict:
+    """同 ensure_macs，但用一个【已登录】的 page（publish 复用自己的浏览器）。做完页面停在 MAC组管理。"""
+    name = group_name(device_code)
+    res = {"status": "failed", "group": name, "missing": [], "detail": ""}
+    if not macs:
+        res.update(status="ok", detail="没有场测 MAC，不需要处理")
+        return res
+    mode = "（只查不改）" if read_only else ("（测试模式：填好后取消，不保存）" if dry_run else "")
+    print(color(f"\n======== MAC 组检查：{name}{mode} ========", "bold"))
+    print(f"  场测 MAC（后 8 位）：{', '.join(macs)}")
+    try:
         open_mac_page(page)
         row, problem = search_group(page, device_code)
         if problem:
@@ -237,7 +275,7 @@ def ensure_macs(p, device_code: str, macs: list[str], assume_yes: bool = False,
                 has=page.locator(".ant-form-item-label", has_text="设备类型")).locator(".ant-select").first
             if not _pick_select(page, sel, device_code):
                 _drawer_btn(drawer, r"取\s*消").click()
-                res["detail"] = f"新建窗口里『设备类型』选不上 {device_code!r}，未保存"
+                res["detail"] = f"新建窗口里『设备类型』没有代码完全等于 {device_code!r} 的唯一一项，未保存"
                 print(err(res["detail"]))
                 return res
             nm = drawer.locator("input#groupName").first
@@ -292,6 +330,24 @@ def ensure_macs(p, device_code: str, macs: list[str], assume_yes: bool = False,
         res["detail"] = f"出错：{e}"
         print(err(res["detail"]))
         return res
-    finally:
-        context.close()
-        browser.close()
+
+
+def _selftest() -> int:
+    good = True
+
+    def check(name, cond):
+        nonlocal good
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+        good = good and bool(cond)
+
+    check("候选项取括号里的代码", _option_code("A311D2安卓WE6GE(A311D2AndrWE6GE)") == "A311D2AndrWE6GE")
+    check("全角括号 / 多余空格", _option_code(" MT9900北美安卓（MT9900AndroNA4K） ") == "MT9900AndroNA4K")
+    check("名称里也有括号时取最后一对", _option_code("X(4K)安卓(MT9666AndrVW25E)") == "MT9666AndrVW25E")
+    check("没有括号 = 整段", _option_code("MT9666Android") == "MT9666Android")
+    check("前缀相同不算相等", _option_code("名(MT9666AndroidXX)") != "MT9666Android")
+    print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
+    return 0 if good else 1
+
+
+if __name__ == "__main__":
+    sys.exit(_selftest() if "--selftest" in sys.argv[1:] else 0)

@@ -80,20 +80,56 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _step_mac_group(args, sj, device_code: str, mac_group: str) -> int:
-    """步骤 2b：场测 MAC 组检查/加入。返回 0 = 继续；非 0 = 退出码（不上传）。"""
-    from .mac_group import group_name, macs_from_rows
+def _step_mac_group(args, sj, device_code: str, mac_group: str, raw_text: str = "",
+                    out: dict | None = None) -> int:
+    """步骤 2b：场测 MAC 组检查/加入。返回 0 = 继续；非 0 = 退出码（不上传）。
+
+    raw_text：整份输入原文（文本输入 = 文本；Excel 输入 = 所有单元格文字），用来找 MAC 列之外写的 MAC。
+    """
+    from .mac_group import group_name, scan_rows, scan_text_macs
     print(_c("—— 步骤2b：场测 MAC 组 ——", "bold"))
     if args.no_mac:
-        print(_warn("已指定 --no-mac：跳过 MAC 组检查。"))
+        _no_mac_banner()
         return 0
     rows = sj.get("rows", []) if isinstance(sj, dict) else []
-    macs = list(macs_from_rows(rows))
+    scanned = scan_rows(rows)
+
+    # 逐行列出全部 MAC（原文 → 后 8 位），看不懂的片段单独标出。
+    print("  逐行场测 MAC（原文 → 后 8 位）：")
+    for r in scanned:
+        tail = ", ".join(r["macs"]) or "（无）"
+        raw = " ".join(r["raw"].split()) or "（空）"
+        line = f"    第{r['row']}行 {r['model'] or '?'}：{raw} → {tail}"
+        print(_err(line + f"  ← 看不懂：{', '.join(r['bad'])}") if r["bad"] else line)
+    macs: list[str] = []
+    for r in scanned:
+        for m in r["macs"]:
+            if m not in macs:
+                macs.append(m)
+    extra = [m for m in scan_text_macs(raw_text) if m not in macs]
+    if extra:
+        print(_warn(f"MAC 列之外还写了 {len(extra)} 个 MAC，一并加入检查：{', '.join(extra)}"))
+        macs += extra
+    print(f"  全部场测 MAC（{len(macs)} 个）：{', '.join(macs) or '（无）'}")
+    if out is not None:
+        out["macs"] = list(macs)
+
+    bad = [r for r in scanned if r["bad"]]
+    if bad:
+        _mac_failed_banner(group_name(device_code), "以下行的 MAC 写法看不懂（要么是完整 12 位 MAC 如 cc:12:28:cd:db:d8，要么是后 8 位如 b7fc8ce6）："
+                           + "；".join(f"第{r['row']}行 {r['model']}『{', '.join(r['bad'])}』" for r in bad))
+        return 1
     if not macs:
-        print(_warn("输入里没有找到场测 MAC 地址，跳过 MAC 组检查。"))
-        return 0
+        _mac_failed_banner(group_name(device_code), "输入里没有找到任何场测 MAC 地址"
+                           "（确实不需要 MAC 组，请加 --no-mac）")
+        return 1
+    without = [r for r in scanned if not r["macs"]]
+    if without and len(without) < len(scanned):
+        print(_warn(f"有 {len(without)} 行没写 MAC（"
+                    + "、".join(f"第{r['row']}行 {r['model']}" for r in without)
+                    + "）：这些机型用上面的 MAC 一起检查，请确认。"))
     if not device_code:
-        print(_err("没有设备类型代码，无法检查 MAC 组（可加 --device-code，或 --no-mac 跳过）。"), file=sys.stderr)
+        _mac_failed_banner("测试<设备类型代码>", "没有设备类型代码，无法检查 MAC 组（可加 --device-code）")
         return 1
     want = group_name(device_code)
     if mac_group and mac_group.strip() != want:
@@ -103,6 +139,8 @@ def _step_mac_group(args, sj, device_code: str, mac_group: str) -> int:
     with sync_playwright() as p:
         res = ensure_macs(p, device_code, macs, assume_yes=args.assume_yes,
                           dry_run=args.mac_dry_run, read_only=args.no_upload)
+    if out is not None:
+        out["res"] = res   # 最终检查直接用这次结果，不再重复登录查 CMS
     st = res["status"]
     if st in ("ok", "added", "created", "tested"):
         print(_ok(f"MAC 组『{res['group']}』：{res['detail']}"))
@@ -110,10 +148,32 @@ def _step_mac_group(args, sj, device_code: str, mac_group: str) -> int:
     if st in ("would_add", "would_create"):
         print(_warn(f"MAC 组『{res['group']}』：{res['detail']}；去掉 --no-upload 正式运行时会处理。"))
         return 0
-    print(_err(f"MAC 组『{res['group']}』未完成：{res['detail']}"), file=sys.stderr)
-    print(_c("  未上传。处理好后重跑 prep（已生成的 Excel 会复用）；确定不需要可加 --no-mac。", "dim"),
-          file=sys.stderr)
+    _mac_failed_banner(res["group"], res["detail"])
     return 1
+
+
+def _no_mac_banner(where: str = "") -> None:
+    """--no-mac 的红色提醒（开头、步骤2b、结尾都打）。"""
+    bar = "!" * 64
+    print(_c(bar, "red"))
+    print(_c(f"!! --no-mac：本次 prep 未检查场测 MAC 组{where}。请确认场测 MAC 已在『测试+设备类型代码』组里。", "red"))
+    print(_c(bar, "red"))
+
+
+def _mac_failed_banner(group: str, detail: str) -> None:
+    """MAC 组失败的醒目提醒（stderr）。"""
+    bar = "=" * 64
+    lines = [
+        bar,
+        f"✗✗ MAC 组未完成：{group}",
+        f"   原因：{detail}",
+        "   prep 已停止：未上传 S3，这份 Excel 也没有记为『最近 prep』",
+        "   （publish / online / dass 不会默认使用它）。",
+        "   处理好后重跑同一条 prep 命令（已生成的 Excel 会复用）；确定不需要 MAC 组可加 --no-mac。",
+        bar,
+    ]
+    for ln in lines:
+        print(_c(ln, "red"), file=sys.stderr)
 
 
 def _validate_output_row_like(row: dict) -> list[str]:
@@ -496,7 +556,35 @@ def _prompt_new_device(eng, code, feature, name, mac, ask=input):
     return None
 
 
+def _excel_all_text(path: str) -> str:
+    """Excel 所有 sheet 所有单元格的文字（找 MAC 列之外写的 MAC 用）。读不了返回空串。"""
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return ""
+    parts = []
+    try:
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                parts.extend(str(v) for v in row if v is not None)
+    finally:
+        wb.close()
+    return "\n".join(parts)
+
+
 def main() -> int:
+    """--no-mac 时在开头和结尾各打一次红色提醒；其余见 _main。"""
+    no_mac = "--no-mac" in sys.argv[1:]
+    if no_mac:
+        _no_mac_banner()
+    try:
+        return _main()
+    finally:
+        if no_mac:
+            _no_mac_banner("（结束）")
+
+
+def _main() -> int:
     args = _build_parser().parse_args()
 
     # 相对路径按「调用者所在目录」解析（deployota 会先 cd 到项目目录，不处理就会找不到文件）。
@@ -699,14 +787,23 @@ def main() -> int:
             print(_c("  - " + prob, "red"), file=sys.stderr)
         return 1
     print(_ok("严格校验通过（sheet / 18 列表头 / 每行地址与 OTA 类型 / 设备字段 均合格）。"))
-    # 记下这份 Excel：后续 upload / online / dass 不给文件时默认接着用它。
-    from . import last_prep
-    last_prep.save(output_path)
-
-    # (3b) 场测 MAC 组：确保 MAC（后 8 位）在 CMS『测试<设备类型代码>』组里。失败则不上传。
-    rc = _step_mac_group(args, sj, final_device_code, mac_group)
+    # (3b) 场测 MAC 组：确保 MAC（后 8 位）在 CMS『测试<设备类型代码>』组里。
+    #      失败 → 醒目提醒并停止：不上传，也不记为『最近 prep』（publish / online / dass 不会默认用这份 Excel）。
+    mac_out: dict = {}
+    rc = _step_mac_group(args, sj, final_device_code, mac_group,
+                         raw_text=_excel_all_text(args.file) if excel_input else text, out=mac_out)
     if rc:
-        return rc
+        return _stop(output_path, rc)
+
+    # 收尾：最终检查（MAC 组 / 提示语 / S3 / 行数）。通过才把这份 Excel 记为『最近 prep』。
+    def finish(s3_check: bool, local_md5_ok: set) -> int:
+        rc2 = _final_checks(args, output_path, final_device_code, mac_out.get("macs", []), mac_out.get("res"),
+                            parsed_rows, s3_check=s3_check, local_md5_ok=local_md5_ok)
+        if rc2:
+            return _stop(output_path, rc2)
+        from . import last_prep
+        last_prep.save(output_path)   # 后续 publish / online / dass 不给文件时默认接着用它
+        return 0
 
     # (4) 步骤3 上传（或 --no-upload 计划）。
     urls = eng.extract_ftp_zip_urls(sj)
@@ -724,7 +821,7 @@ def main() -> int:
             if other:
                 print(_warn(f"源数据的 zip 地址不是 ftp://（共 {len(other)} 个，如 {other[0]}），"
                             "当前不支持下载，真实上传时会无文件可传。"))
-        return 0
+        return finish(s3_check=False, local_md5_ok=set())
 
     if not urls:
         other = _non_ftp_source_urls(eng, sj)
@@ -733,7 +830,7 @@ def main() -> int:
                        "当前只支持从 FTP 下载。"), file=sys.stderr)
         else:
             print(_err("无可上传的 FTP zip（源数据未含 ftp:// 地址）"), file=sys.stderr)
-        return 1
+        return _stop(output_path, 1)
 
     # (4b) S3 预检：对每个 zip，若 S3 已存在同名文件且【大小一致】(与生成 Excel 里的「文件大小」比)，
     #      则跳过该文件的下载+上传（MD5 作辅助：能比就比，比上更放心）。--force 时不预检、全量重传。
@@ -748,40 +845,53 @@ def main() -> int:
         print(_ok(f"全部 {len(urls)} 个文件 S3 上已存在且大小一致，跳过下载和上传（complete）。"))
         print(output_path)
         print(f"S3 前缀：s3://{bucket}/{prefix}")
-        print(_ok("prep 全部完成：生成 → 校验 → S3 已是最新（免下载免上传）。"))
-        return 0
+        return finish(s3_check=True, local_md5_ok=set())
 
     print(_c(f"—— 步骤3：FTP 下载 + 上传 S3（{len(todo_urls)}/{len(urls)} 个需处理）——", "bold"))
 
+    # 先只下载，逐个比对 MD5 / 大小（与 Excel 一致才上传，坏包不进 S3），再上传。
     work_dir = tempfile.mkdtemp(prefix="otagen_")
+    temp_dir = os.path.join(work_dir, "temp")
+    progress = _make_progress_printer()
     result = transfer.download_and_upload(
-        todo_urls,
-        final_device_code,
-        work_dir=work_dir,
-        auto_upload=True,
-        cleanup_after_upload=True,
-        log=print,
-        progress=_make_progress_printer(),
+        todo_urls, final_device_code, work_dir=work_dir,
+        auto_upload=False, cleanup_after_upload=False, log=print, progress=progress,
     )
+    print(f"已下载：{len(result.downloaded)}  失败：{len(result.failed)}")
+    if result.failed:
+        print(_err(f"下载失败项：{result.failed}"), file=sys.stderr)
+        transfer.cleanup_zip_dir(temp_dir, log=print)
+        return _stop(output_path, 1)
+
+    print(_c("—— 步骤3：下载后 MD5 / 大小核对（与 Excel 一致才上传）——", "bold"))
+    local_md5_ok, md5_bad = _verify_local_md5(result.downloaded, size_md5_by_zip)
+    if md5_bad:
+        print(_err("下载的升级包与 Excel 的 MD5 / 大小不一致，未上传："), file=sys.stderr)
+        for b in md5_bad:
+            print(_c("  - " + b, "red"), file=sys.stderr)
+        transfer.cleanup_zip_dir(temp_dir, log=print)
+        return _stop(output_path, 1)
+
+    up = transfer.upload_dir_to_s3(temp_dir, final_device_code, log=print, progress=progress)
     print(output_path)
-    print(f"S3 前缀：{result.s3_prefix}")
+    print(f"S3 前缀：{up.s3_prefix}")
     if skip_names:
         print(_ok(f"S3 预检跳过（已存在且大小一致）：{len(skip_names)} 个"))
-    print(f"已下载：{len(result.downloaded)}  已上传：{len(result.uploaded)}  失败：{len(result.failed)}")
-    if result.failed:
-        print(_err(f"上传失败项：{result.failed}"), file=sys.stderr)
-        return 1
+    print(f"已上传：{len(up.uploaded)}  失败：{len(up.failed)}")
+    if up.failed:
+        print(_err(f"上传失败项：{up.failed}"), file=sys.stderr)
+        return _stop(output_path, 1)
+    transfer.cleanup_zip_dir(temp_dir, log=print)
 
     # (5) 步骤3b 上传后校验：用 boto3 head_object 回查每个已上传文件确实在 S3 上。
     print(_c("—— 步骤3b：上传后 S3 回查 ——", "bold"))
-    verify_bad = _verify_s3_uploads(bucket, prefix, result.uploaded)
+    verify_bad = _verify_s3_uploads(bucket, prefix, up.uploaded)
     if verify_bad:
         print(_err("步骤3b 上传后 S3 校验未通过（以下文件上传后在 S3 未找到）："), file=sys.stderr)
         for b in verify_bad:
             print(_c("  - " + b, "red"), file=sys.stderr)
-        return 1
-    print(_ok("prep 全部完成：生成 → 校验 → 上传 → S3 回查，均 correct。"))
-    return 0
+        return _stop(output_path, 1)
+    return finish(s3_check=True, local_md5_ok=local_md5_ok)
 
 
 _PREP_INDEX_FILE = ".prep_index.json"
@@ -1040,6 +1150,109 @@ def _verify_s3_uploads(bucket: str, prefix: str, filenames: list[str]) -> list[s
     return bad
 
 
+def _stop(output_path: str, rc: int) -> int:
+    """prep 没完成就停：若『最近 prep』记的正是这份 Excel，一并清掉（publish / online / dass 不会默认用它）。"""
+    from . import last_prep
+    if last_prep.forget(output_path):
+        print(_c("  已清除『最近 prep』记录（它指向的正是这份 Excel）。", "red"), file=sys.stderr)
+    return rc
+
+
+def _verify_local_md5(paths: list[str], size_md5_by_zip: dict) -> tuple[set, list[str]]:
+    """下载到本地的 zip 逐个算 MD5、量大小，与 Excel 比。返回 (一致的文件名集合, 问题列表)。"""
+    from .prep_final import file_md5
+    good, bad = set(), []
+    for p in paths:
+        name = os.path.basename(p)
+        exp = size_md5_by_zip.get(name)
+        if not exp:
+            bad.append(f"{name}：Excel 里找不到这个文件对应的行")
+            continue
+        size = os.path.getsize(p)
+        if exp.get("size") is not None and size != exp["size"]:
+            bad.append(f"{name}：大小不一致 下载={size} / Excel={exp['size']}")
+            continue
+        md5 = file_md5(p)
+        if not exp.get("md5"):
+            bad.append(f"{name}：Excel 里没有 MD5，无法核对")
+        elif md5 != exp["md5"].lower():
+            bad.append(f"{name}：MD5 不一致 下载={md5} / Excel={exp['md5'].lower()}")
+        else:
+            print("  " + _ok(f"{name}：大小 {size}、MD5 {md5} 与 Excel 一致"))
+            good.add(name)
+    return good, bad
+
+
+def _final_mac_item(F, args, group: str, macs: list[str], res: dict | None, col_bad: list[str]) -> dict:
+    """最终检查第 1 项：由步骤2b 的 ensure_macs 结果 + Excel『MAC组』列问题得出。"""
+    name = "场测 MAC 组"
+    if args.no_mac:
+        return F.item(name, "warn", "--no-mac：未检查 CMS MAC 组", col_bad)
+    if not macs or not res:
+        return F.item(name, "fail", "没有场测 MAC 或没有 MAC 组检查结果", col_bad)
+    st = res.get("status")
+    missing = res.get("missing", []) if st not in ("ok", "added", "created") else []
+    lines = [f"{m}  " + ("✗ 不在组内" if m in missing else "✓ 在组内") for m in macs] + col_bad
+    how = {"ok": "原本就在组内", "added": "本次已加入并回读确认", "created": "本次新建组并回读确认"}
+    if col_bad:
+        return F.item(name, "fail", "Excel『MAC组』列不对", lines)
+    if st in how:
+        return F.item(name, "pass", f"{len(macs)} 个 MAC 都在『{group}』（{how[st]}），Excel 每行 MAC组 正确", lines)
+    if st in ("would_add", "would_create"):      # --no-upload 只查不改
+        return F.item(name, "warn", res.get("detail", ""), lines)
+    if st == "tested":                           # --mac-dry-run：填好后取消，没保存
+        return F.item(name, "warn", f"--mac-dry-run 测试模式未保存，组里仍缺 {', '.join(missing)}", lines)
+    return F.item(name, "fail", res.get("detail", "") or f"MAC 组检查未完成（{st}）", lines)
+
+
+def _final_checks(args, output_path: str, device_code: str, macs: list[str], mac_res: dict | None,
+                  parsed_rows: int,
+                  s3_check: bool, local_md5_ok: set) -> int:
+    """prep 最终检查：MAC 组 / 提示语 / 升级包 S3 / 规则行数。有 ✗ 返回 1。"""
+    from . import prep_final as F
+    from .mac_group import group_name
+    from .otagen import config as otagen_config
+    print(_c("—— 步骤4：最终检查 ——", "bold"))
+    items = []
+    group = group_name(device_code)
+    rh, rrows = F.read_sheet(output_path, "升级规则")
+    rr = F.rule_rows(rh, rrows)
+
+    # 1) 场测 MAC 组：用步骤2b 的 CMS 结果（2b 已查过；加入/新建后 2b 也已回读确认），不再重复查 CMS；
+    #    另核对 Excel『MAC组』列。
+    items.append(_final_mac_item(F, args, group, macs, mac_res, F.check_mac_column(rr, group)))
+
+    # 2) 升级提示语。
+    mh, mrows = F.read_sheet(output_path, "升级提示语")
+    items.append(F.check_messages(mh, mrows))
+
+    # 3) 升级包 / S3。
+    aws_prefix = otagen_config.AWS_PREFIX
+    up = F.url_problems(rr, device_code, aws_prefix)
+    if up:
+        items.append(F.item("升级包 / S3", "fail", f"{len(up)} 处地址 / MD5 / 大小不对", up))
+    elif not s3_check:
+        items.append(F.item("升级包 / S3", "skip", "--no-upload：未检查 S3"))
+    else:
+        import boto3
+        s3 = boto3.client("s3")
+        items.append(F.check_s3(rr, otagen_config.S3_UPLOAD_BUCKET, aws_prefix,
+                                lambda b, k: s3.head_object(Bucket=b, Key=k), local_md5_ok))
+
+    # 4) 规则行数。
+    if len(rr) == parsed_rows and rr:
+        items.append(F.item("规则行数", "pass", f"Excel {len(rr)} 行 = 输入 {parsed_rows} 行"))
+    else:
+        items.append(F.item("规则行数", "fail", f"Excel {len(rr)} 行，输入解析出 {parsed_rows} 行"))
+
+    lines, failed = F.render(items)
+    for ln in lines:
+        print(ln)
+    if not failed:
+        print(_ok(f"prep 全部完成：{output_path}"))
+    return 1 if failed else 0
+
+
 # —— 不触碰 FTP/S3/~/.aws 的纯离线自测（python -m automation.prep --selftest）——
 def _selftest() -> int:
     from datetime import datetime
@@ -1142,11 +1355,45 @@ def _selftest() -> int:
         import io
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             r1 = _step_mac_group(ns3, {"rows": [{"MAC": "cc:12:28:cd:db:d8"}]}, "X", "")
-            r2 = _step_mac_group(ns2, {"rows": [{"MAC": ""}]}, "X", "")
+            r2 = _step_mac_group(ns2, {"rows": [{"MAC": "空着为默认不设置"}]}, "X", "")
             r3 = _step_mac_group(ns2, {"rows": [{"MAC": "cc:12:28:cd:db:d8"}]}, "", "")
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                r4 = _step_mac_group(ns2, {"rows": [{"MAC": "cc:12:28:cd:db:d8", "机型信息": "65"},
+                                                    {"MAC": "28cddbd", "机型信息": "75"}]}, "X", "")
+            r4_msg = buf.getvalue()
         check("MAC 组：--no-mac 跳过", r1 == 0)
-        check("MAC 组：没有 MAC 跳过", r2 == 0)
+        check("MAC 组：没有 MAC → 停止", r2 == 1)
+        check("MAC 组：有一行写法看不懂 → 停止并点出那一行", r4 == 1 and "第2行 75" in r4_msg and "『28cddbd』" in r4_msg)
         check(f"MAC 组：有 MAC 但没设备代码 → 退出（得到 {r3}）", r3 == 1)
+        # 最终检查第 1 项：复用步骤2b 结果（不再查 CMS）。
+        from . import prep_final as _F
+        _m = ["b7fc8ce6", "b7fc8ce7"]
+        _st = lambda a, r, cb=(): _final_mac_item(_F, a, "测试X", _m, r, list(cb))["status"]
+        check("最终检查 MAC：2b ok / added / created → pass",
+              all(_st(ns2, {"status": s, "missing": []}) == "pass" for s in ("ok", "added", "created")))
+        check("最终检查 MAC：--no-upload 只查不改 / --mac-dry-run → warn",
+              _st(ns2, {"status": "would_add", "missing": _m[:1]}) == "warn"
+              and _st(ns2, {"status": "tested", "missing": _m[:1]}) == "warn")
+        check("最终检查 MAC：failed / cancelled / Excel MAC组列错 → fail",
+              _st(ns2, {"status": "failed"}) == "fail" and _st(ns2, {"status": "cancelled"}) == "fail"
+              and _st(ns2, {"status": "ok", "missing": []}, ["第1行"]) == "fail")
+        check("最终检查 MAC：--no-mac → warn", _st(ns3, None) == "warn")
+        # 下载后 MD5 / 大小核对。
+        _d = tempfile.mkdtemp()
+        temp_dirs.append(_d)
+        _zp = os.path.join(_d, "a.zip")
+        with open(_zp, "wb") as _f:
+            _f.write(b"hello")
+        _md5 = hashlib.md5(b"hello").hexdigest()
+        with contextlib.redirect_stdout(io.StringIO()):
+            g1, b1 = _verify_local_md5([_zp], {"a.zip": {"size": 5, "md5": _md5.upper()}})
+            g2, b2 = _verify_local_md5([_zp], {"a.zip": {"size": 5, "md5": "0" * 32}})
+            g3, b3 = _verify_local_md5([_zp], {"a.zip": {"size": 6, "md5": _md5}})
+            g4, b4 = _verify_local_md5([_zp], {})
+        check("下载后核对：MD5 一致（大小写无关）", g1 == {"a.zip"} and not b1)
+        check("下载后核对：MD5 / 大小不一致、Excel 无此行 → 不上传",
+              b2 and "MD5 不一致" in b2[0] and b3 and "大小不一致" in b3[0] and b4 and not (g2 or g3 or g4))
 
         # 自带子包可导入。
         import importlib

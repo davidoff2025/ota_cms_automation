@@ -922,14 +922,15 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
                 "  ./deployota dass init              用 prep 最近生成的 Excel（需已有 Rule ID 列）\n"
                 "  ./deployota dass init 路径.xlsx    指定 Excel\n\n"
                 "  插入 N 行并逐格填写 → 你在浏览器核对 → 终端输入 approve 才提交。\n"
+                "  --auto-approve：全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。\n"
                 "  填写完成后记录阶段『场测』，并把本批写入部署库。publish 第 4 步就是它。\n\n"
                 "放量（ota50 起）请用 ./deployota update <ota50|ota200|ota1k|ota5k|ota20k|ota-all> <Rule ID>。\n"
                 "（旧用法 dass <otaXX> <Excel> 仍可用，但不经过 CMS 灰度，不推荐。）\n"
                 "退出码：0 成功；1 出错；2 成功率闸门未通过；3 有行没填成功。"
             )
             raise SystemExit(0)
-        if arg == "--strict":
-            continue  # 在 main 里读：关闭『闸门未通过时人工批复』
+        if arg in ("--strict", "--auto-approve"):
+            continue  # 在 main 里读：--strict 关闭『闸门未通过时人工批复』；--auto-approve 跳过提交前确认
         if arg in VALID_OPTIONS:
             option = arg
         elif arg.startswith("-"):
@@ -943,8 +944,44 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
     return option, excel
 
 
+AUTO_APPROVE_ENV = "OTA_DASS_AUTO_APPROVE"
+
+
+def enable_auto_approve() -> None:
+    """--auto-approve：本进程及子进程（publish 第 4 步）的 DASS 提交都不再等你输入 approve。"""
+    os.environ[AUTO_APPROVE_ENV] = "1"
+
+
+def auto_approve() -> bool:
+    return os.environ.get(AUTO_APPROVE_ENV, "").strip() == "1"
+
+
+def _ask_submit(prompt: str, all_ok: bool) -> tuple[bool, str]:
+    """提交前确认。返回 (是否提交, 方式说明)。
+
+    --auto-approve 且这一步全部成功 → 自动提交；有没成功的行 → 不自动提交，退回到人工确认。
+    人工确认：终端可交互即可（可见浏览器在页面上核对；后台模式看上面的日志和 artifacts/ 截图）。
+    """
+    if auto_approve():
+        if all_ok:
+            print(color("（--auto-approve：全部成功，自动提交，不再等待 approve）", "yellow"))
+            return True, "auto"
+        print(color("⚠ --auto-approve：有行没成功，不自动提交，改为人工确认。", "yellow"))
+    if not sys.stdin.isatty():
+        return False, "no_tty"
+    if not config.HEADED:
+        print(color(f"（后台模式看不到页面：请核对上面的日志和截图 {config.ARTIFACTS_DIR}）", "dim"))
+    try:
+        ans = input(prompt).strip().lower()
+    except EOFError:
+        ans = ""
+    return ans in ("approve", "提交", "submit", "yes", "y"), "manual"
+
+
 def main() -> int:
     option, excel = _parse_cli(sys.argv[1:])
+    if "--auto-approve" in sys.argv[1:]:
+        enable_auto_approve()
 
     # ——— 浏览器启动之前：先完成选项校验与 Excel 读取，保证静态快速失败 ———
     if not excel:
@@ -1113,13 +1150,9 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                 group_submits: list[int] = []
 
                 def _approve_group() -> bool:
-                    if not (config.HEADED and sys.stdin.isatty()):
-                        return False
-                    try:
-                        ans = input("\n本组已写入。核对后输入 approve 提交并继续下一组（其它输入 = 停止）：").strip().lower()
-                    except EOFError:
-                        ans = ""
-                    if ans not in ("approve", "提交", "submit", "yes", "y"):
+                    go, _how = _ask_submit("\n本组已写入。核对后输入 approve 提交并继续下一组（其它输入 = 停止）：",
+                                           all_ok=True)
+                    if not go:
                         return False
                     if approve_and_submit(fr, page):
                         group_submits.append(1)
@@ -1188,34 +1221,32 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             else:
                 print(color("（按 Rule ID 更新：不重复写部署库，部署记录已在库里）", "dim"))
 
-            if config.HEADED:
-                try:
-                    ans = input("\n请在浏览器核对后输入 approve 提交（其它输入 = 不提交）：").strip().lower()
-                except EOFError:
-                    ans = ""
-                if ans in ("approve", "提交", "submit", "yes", "y"):
-                    ok_submit = approve_and_submit(fr, page)
-                    A.step("DASS 提交", A.OK if ok_submit else A.FAIL,
-                           "已提交" if ok_submit else "没找到提交按钮，未提交，请在浏览器手动提交")
-                    A.set_submitted(bool(ok_submit))
-                    if ok_submit:
-                        print(color("\n✅ 记录已提交。可在浏览器确认结果。", "green"))
-                    else:
-                        print(color("\n⚠ 未能自动提交，请在浏览器手动完成。", "yellow"))
-                    try:
-                        input("\n按回车关闭浏览器 ... ")
-                    except EOFError:
-                        time.sleep(60)
+            where = "在浏览器核对后" if config.HEADED else "核对上面的日志 / 截图后"
+            go, how = _ask_submit(f"\n请{where}输入 approve 提交（其它输入 = 不提交）：", all_ok=fill_ok)
+            # 可见浏览器 + 人工确认时，提交后留着页面让你看；自动提交 / 后台模式直接关闭。
+            linger = config.HEADED and how == "manual" and sys.stdin.isatty()
+            if go:
+                ok_submit = approve_and_submit(fr, page)
+                note = "（--auto-approve 自动提交）" if how == "auto" else ""
+                A.step("DASS 提交", A.OK if ok_submit else A.FAIL,
+                       ("已提交" + note) if ok_submit else "没找到提交按钮，未提交，请在浏览器手动提交")
+                A.set_submitted(bool(ok_submit))
+                if ok_submit:
+                    print(color(f"\n✅ 记录已提交{note}。", "green"))
+                    _shot(page, "submitted")
                 else:
-                    print("已取消提交（未做任何批复/提交操作）。")
-                    A.step("DASS 提交", A.WARN, "你没有输入 approve，DASS 未提交（页面关闭后填写的内容会丢失）")
-                    try:
-                        input("按回车关闭浏览器 ... ")
-                    except EOFError:
-                        time.sleep(30)
+                    print(color("\n⚠ 未能自动提交，请在浏览器手动完成。", "yellow"))
+            elif how == "no_tty":
+                print("非交互终端，无法确认，不提交（可加 --auto-approve）。")
+                A.step("DASS 提交", A.WARN, "非交互终端无法确认，DASS 未提交（可加 --auto-approve）")
             else:
-                print("非可见模式（HEADED=0），不进行交互提交；请人工核对后提交。")
-                A.step("DASS 提交", A.WARN, "无头模式不提交（CMS_HEADED=false），DASS 未提交")
+                print("已取消提交（未做任何批复/提交操作）。")
+                A.step("DASS 提交", A.WARN, "你没有输入 approve，DASS 未提交（页面关闭后填写的内容会丢失）")
+            if linger:
+                try:
+                    input("\n按回车关闭浏览器 ... ")
+                except EOFError:
+                    pass
             return 0 if fill_ok else 3
         except Exception as e:
             print(color(f"✗ 出错：{e}", "red"))
@@ -1238,6 +1269,26 @@ def _selftest() -> int:
         if not cond:
             ok = False
 
+    # —— --auto-approve：全部成功才自动提交；有失败退回人工（非交互终端 → 不提交）——
+    import contextlib
+    import io
+    _saved = os.environ.pop(AUTO_APPROVE_ENV, None)
+    _tty = sys.stdin.isatty
+    try:
+        sys.stdin.isatty = lambda: False
+        with contextlib.redirect_stdout(io.StringIO()):
+            r_off = _ask_submit("?", all_ok=True)
+            enable_auto_approve()
+            r_ok = _ask_submit("?", all_ok=True)
+            r_bad = _ask_submit("?", all_ok=False)
+        check("没加 --auto-approve + 非交互 → 不提交", r_off == (False, "no_tty"))
+        check("--auto-approve + 全部成功 → 自动提交", r_ok == (True, "auto"))
+        check("--auto-approve + 有行没成功 → 不自动提交", r_bad == (False, "no_tty"))
+    finally:
+        sys.stdin.isatty = _tty
+        os.environ.pop(AUTO_APPROVE_ENV, None)
+        if _saved is not None:
+            os.environ[AUTO_APPROVE_ENV] = _saved
     # —— 表头匹配：去空白、去末尾括号说明 ——
     check("表头『是否展示\\n(取值0、1)』→ 是否展示", header_key("是否展示\n(取值0、1)") == "是否展示")
     check("表头全角括号也能去掉", header_key("是否展示（取值0、1）") == "是否展示")

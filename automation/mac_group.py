@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import re
 
-# 完整 MAC：6 组两位十六进制，分隔符可以是 : - . 空格 或没有分隔符（12 位连写）
-_MAC_RE = re.compile(r"(?i)(?<![0-9a-f])((?:[0-9a-f]{2}[:\-. ]){5}[0-9a-f]{2}|[0-9a-f]{12})(?![0-9a-f])")
+# 可识别的 MAC 写法：
+#   完整 MAC：6 组两位十六进制，分隔符可以是 : - . 空格 或没有分隔符（12 位连写）
+#   只给后 8 位：8 位十六进制连写（'b7fc8ce6'），或 4 组两位用 : / - 分隔（'b7:fc:8c:e6'）
+# 前后不能紧挨着十六进制位，也不能是『分隔符 + 十六进制位』（避免从更长的串里截一段，比如 5 组的残缺 MAC）。
+_MAC_RE = re.compile(
+    r"(?i)(?<![0-9a-f])(?<![0-9a-f][:\-])"
+    r"((?:[0-9a-f]{2}[:\-. ]){5}[0-9a-f]{2}|[0-9a-f]{12}|(?:[0-9a-f]{2}[:\-]){3}[0-9a-f]{2}|[0-9a-f]{8})"
+    r"(?![0-9a-f])(?![:\-][0-9a-f])")
 
 
 def mac_tail8(mac: str) -> str:
@@ -29,7 +35,7 @@ def extract_macs(cell: str) -> list[str]:
     """从一个『场测MAC』单元格里取出所有 MAC，返回后 8 位列表（去重保序）。
 
     单元格可能是：'cc:12:28:cd:db:d8' / '1）cc:12:28:db:91:ec\\n2）a0:00:4c:c8:36:d9' /
-    逗号、顿号、空格分隔 / '空着为默认不设置'（没有 MAC，返回 []）。
+    直接给后 8 位 'b7fc8ce6、b7fc8ce7' / 逗号、顿号、空格分隔 / '空着为默认不设置'（没有 MAC，返回 []）。
     """
     out: list[str] = []
     for m in _MAC_RE.finditer(str(cell or "")):
@@ -77,6 +83,44 @@ def macs_from_rows(rows: list[dict]) -> dict[str, list[str]]:
     return out
 
 
+# 去掉合法 MAC 之后，剩下的『像十六进制串』（含 : - . 分隔）有 ≥6 个十六进制位 → 看不懂的 MAC 写法
+_HEXISH_RE = re.compile(r"(?i)[0-9a-f](?:[0-9a-f:\-.]*[0-9a-f])?")
+# 原文全文扫描只认带 : 或 - 分隔的标准写法（12 位连写在 URL / 哈希里容易误判）
+_SEP_MAC_RE = re.compile(r"(?i)(?<![0-9a-f:\-])((?:[0-9a-f]{2}:){5}[0-9a-f]{2}|(?:[0-9a-f]{2}-){5}[0-9a-f]{2})(?![0-9a-f:\-])")
+
+
+def unrecognized_parts(cell: str) -> list[str]:
+    """单元格里『像 MAC 但不是完整 12 位 MAC』的片段（如只写了 8 位、少一位）。说明文字（无十六进制串）返回 []。"""
+    rest = _MAC_RE.sub(" ", str(cell or ""))
+    out = []
+    for m in _HEXISH_RE.finditer(rest):
+        tok = m.group(0)
+        if len(re.sub(r"(?i)[^0-9a-f]", "", tok)) >= 6:
+            out.append(tok)
+    return out
+
+
+def scan_rows(rows: list[dict]) -> list[dict]:
+    """逐行列出场测 MAC：[{行号(从1起), 机型, 原文, macs(后8位), bad(看不懂的片段)}]。"""
+    out = []
+    for i, r in enumerate(rows, 1):
+        raw = str(r.get("MAC", "") or "").strip()
+        out.append({"row": i, "model": str(r.get("机型信息", "") or "").strip(), "raw": raw,
+                    "macs": extract_macs(raw), "bad": unrecognized_parts(raw)})
+    return out
+
+
+def scan_text_macs(text: str) -> list[str]:
+    """在整份原文里找标准写法的 MAC（xx:xx:xx:xx:xx:xx / xx-xx-…），返回后 8 位（去重保序）。"""
+    out: list[str] = []
+    for m in _SEP_MAC_RE.finditer(str(text or "")):
+        t = mac_tail8(m.group(1))
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+
 def _selftest() -> int:
     good = True
 
@@ -102,6 +146,28 @@ def _selftest() -> int:
     check("组名", group_name("A311D2AndrWE6GE") == "测试A311D2AndrWE6GE")
     check("从数据行收集", macs_from_rows([{"MAC": "", "机型信息": "a"}, {"MAC": "cc:12:28:cd:db:d8", "机型信息": "65WE6GE(01)"}])
           == {"28cddbd8": ["65WE6GE(01)"]})
+    check("直接给后 8 位（顿号 / 逗号 / 换行 / 大写）", extract_macs("b7fc8ce6、b7fc8ce7") == ["b7fc8ce6", "b7fc8ce7"]
+          and extract_macs("B7FC8CE6,\nb7fc8ce7") == ["b7fc8ce6", "b7fc8ce7"]
+          and unrecognized_parts("b7fc8ce6、b7fc8ce7") == [])
+    check("后 8 位用冒号 / 横线分隔", extract_macs("b7:fc:8c:e6") == ["b7fc8ce6"]
+          and extract_macs("1）B7-FC-8C-E6") == ["b7fc8ce6"])
+    check("完整 MAC 与后 8 位混写", extract_macs("cc:12:28:cd:db:d8、b7fc8ce7") == ["28cddbd8", "b7fc8ce7"])
+    check("看不懂：少一位 / 7 位 / 10 位 / 5 组残缺",
+          unrecognized_parts("cc:12:28:cd:db:d") == ["cc:12:28:cd:db:d"]
+          and unrecognized_parts("b7fc8ce") == ["b7fc8ce"] and unrecognized_parts("12b7fc8ce6") == ["12b7fc8ce6"]
+          and extract_macs("cc:12:28:cd:db") == [] and unrecognized_parts("cc:12:28:cd:db") == ["cc:12:28:cd:db"])
+    check("后 8 位区间写法不猜，报看不懂", extract_macs("b7fc8ce6-b7fc8ce7") == []
+          and unrecognized_parts("b7fc8ce6-b7fc8ce7") == ["b7fc8ce6-b7fc8ce7"])
+    check("看得懂的不报", unrecognized_parts("1）cc:12:28:db:91:ec\n2）a0:00:4c:c8:36:d9") == []
+          and unrecognized_parts("1.cc:12:28:db:91:ec") == [])
+    check("说明文字不报", unrecognized_parts("空着为默认不设置") == [] and unrecognized_parts("无 / N/A / default") == [])
+    sr = scan_rows([{"MAC": "cc:12:28:cd:db:d8", "机型信息": "65"}, {"MAC": "28cddbd", "机型信息": "75"},
+                    {"MAC": "", "机型信息": "86"}])
+    check("逐行扫描", [r["macs"] for r in sr] == [["28cddbd8"], [], []] and sr[1]["bad"] == ["28cddbd"]
+          and sr[2]["row"] == 3 and sr[2]["model"] == "86")
+    check("全文扫描只认分隔写法", scan_text_macs("场测MAC：cc:12:28:cd:db:d8，备用 A0-00-4C-C8-36-D9 "
+                                       "md5 debfa7e56660272595ba7e257eb3ce44 cc1228cddbd8")
+          == ["28cddbd8", "4cc836d9"])
     print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
     return 0 if good else 1
 

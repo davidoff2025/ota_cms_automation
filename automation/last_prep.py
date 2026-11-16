@@ -35,3 +35,15 @@ def load() -> dict | None:
     except (OSError, ValueError):
         pass
     return None
+
+
+def forget(excel_path: str) -> bool:
+    """若『最近 prep』记的正是 excel_path，就删掉这条记录（prep 的 MAC 组失败时用）。返回是否删了。"""
+    rec = load()
+    if not rec or os.path.abspath(rec["excel"]) != os.path.abspath(excel_path):
+        return False
+    try:
+        STATE_FILE.unlink()
+        return True
+    except OSError:
+        return False

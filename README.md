@@ -56,7 +56,21 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 
 - 凭据只从 `config/.env` 读取，该文件已在 `.gitignore`，不会被提交。
 - AWS 区域和密钥不写在 `.env`，走 boto3 默认链（`~/.aws`、实例角色或环境变量）。
-- `CMS_HEADED=true`（默认）开可见浏览器。DASS 的人工核对环节需要有头模式。
+- `CMS_HEADED=true`（默认）开可见浏览器；`false` 在后台运行、不显示页面，截图照常存到 `artifacts/`。
+
+### 后台运行与跳过 DASS 确认
+
+```bash
+CMS_HEADED=false ./deployota prep --file 文本.txt            # 只这一条命令在后台跑
+CMS_HEADED=false ./deployota update ota200 65370-65379 --yes --auto-approve   # 全程不弹页面、不等确认
+```
+
+- **后台模式下 DASS 也能提交**：页面看不到，终端照样问 `approve`，请对照上面的日志和 `artifacts/` 截图核对。
+- **`--auto-approve`**（`dass` / `update` / `publish` 都支持）：跳过 DASS 提交前的 `approve`。
+  - 只有**全部写入成功**才自动提交；有没写成功、没匹配上的行 → 不自动提交，退回人工确认
+    （非交互终端则不提交）。`update` 的逐组提交也自动进行。
+  - **不会**绕过成功率闸门：不达标照样要你输入 `override` 或中止。CMS 执行前的确认用 `--yes` 另外跳过。
+  - 提交后截图 `artifacts/*_submitted.png`，操作总结里写「已提交（--auto-approve 自动提交）」。
 
 确认安装正常：`./deployota --help`。
 
@@ -200,18 +214,43 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 3b. **场测 MAC 组**（CMS「维度管理 → MAC组管理」）：确保输入里的场测 MAC 都在 MAC 组「测试+设备类型代码」里
    （如 `测试A311D2AndrWE6GE`）。
    - MAC 只存**后 8 位**小写：`cc:12:28:cd:db:d8` → `28cddbd8`。文本和 Excel 的「场测MAC」都能读，一个单元格里可以有多个
-     （`1）cc:…  2）a0:…`）；必须是完整的 12 位 MAC，「空着为默认不设置」之类视为没有 MAC，跳过这一步。
+     （`1）cc:…  2）a0:…`）。
+   - **全部 MAC 都拿出来**：逐行打印「第 N 行 机型：原文 → 后 8 位」；另外扫描整份输入（文本全文 / Excel 所有单元格），
+     MAC 列之外写的 `xx:xx:xx:xx:xx:xx` / `xx-xx-…` 也一并加入检查。部分行没写 MAC 时黄色提醒你确认。
+   - 认得的写法：完整 MAC（`cc:12:28:cd:db:d8`、`CC-12-…`、`cc1228cddbd8`）取后 8 位；
+     **直接给后 8 位**（`b7fc8ce6、b7fc8ce7`、`b7:fc:8c:e6`）原样使用（转小写）。
+   - **写法看不懂 → 停止**：单元格里像 MAC 但两种都不是（少一位、7 位、10 位、残缺的 5 组、`b7fc8ce6-b7fc8ce7` 这种区间写法），
+     红框点出第几行、原文，不上传。「空着为默认不设置」这类说明文字不算。
+   - **一个 MAC 都没有 → 停止**。确实不需要 MAC 组时加 `--no-mac`（开头、这一步、结尾都会红字提醒「本次未检查 MAC 组」）。
+   - `publish` 不做 MAC 检查，MAC 组只在 prep 这一步把关。
    - 按设备类型 + 名称搜索，**按名称精确**找到这个组（同一设备类型下的 `9618自测扩充` 之类不算），看列表「MAC组」列的区间。
    - 都在组内（含落在某个区间里）→ OK，不改动。
    - 组存在但缺 MAC → 「编辑」，每个缺的 MAC 加一行（MAC起 = MAC止 = 后 8 位）→ 你输入 `yes` → 保存。
    - 组不存在 → 「新建」，选设备类型、名称填「测试+设备类型代码」、加入 MAC → 你输入 `yes` → 保存。
-   - 保存后重新搜索回读，所有 MAC 都在组内才算成功；失败或你没确认 → **不上传**并退出（处理好后重跑，已生成的 Excel 会复用；
-     确定不需要可加 `--no-mac`）。
+   - 设备类型**精确匹配**：下拉候选项「名称(代码)」括号里的代码必须和设备类型代码完全相等，且只有一项
+     （`MT9666Andro` 不会选到 `MT9666Android`）；选完再读回核对。匹配不上 → 算失败。
+   - 保存后重新搜索回读，所有 MAC 都在组内才算成功。
+   - 失败或你没确认 → 打印醒目的红色提示并**停止**：不上传 S3，这份 Excel 不记为「最近 prep」
+     （以前记过也会清掉，所以 `publish` / `online` / `dass` 不会默认用它）。处理好后重跑同一条 prep 命令
+     （已生成的 Excel 会复用）；确定不需要可加 `--no-mac`。
    - `--no-upload` 时只查不改，打印「需要加入 / 需要新建」。
    - 映射表里的 MAC 组名与「测试+设备类型代码」不同时会提醒，但检查的始终是「测试+设备类型代码」。
-4. **S3 预检**：S3 上已有同名文件且大小一致的，跳过下载和上传。
-5. **下载并上传**：从 `ftp://` 地址下载，传到 `s3://fam-media-andr/ota/<设备码>/<YYYYMMDD>/`，
-   带进度百分比；上传后用 `head_object` 回查确认。Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
+4. **S3 预检 → 下载 → MD5 核对 → 上传**（详见表格下面的「S3 预检」「下载并上传」）。
+5. **最终检查**（「prep 最终检查」报告，任一项 ✗ → prep 不算完成、退出码 1、不记为「最近 prep」）：
+
+   | 检查项 | 内容 |
+   |---|---|
+   | 1. 场测 MAC 组 | 用步骤 3b 的 CMS 结果（不重复登录查询；加入/新建后 3b 已回读确认）：输入里的全部 MAC 都在「测试+设备类型代码」组里；Excel 每行「MAC组」列 = 这个组名。`--no-upload` 只查不改、`--mac-dry-run` 未保存 → ⚠ |
+   | 2. 升级提示语 | 表头「语种 / 描述」；**第 1 行必须是简体中文**；语种都在标准列表里、不重复；描述不为空；描述里不能有制表符（= 另一个语种被并进来了，例如 `Indonesia<Tab>Fitur…` 混进英语）。简体中文与英语完全相同（源数据没给中文，按规则复制英语）→ ⚠ 提醒 |
+   | 3. 升级包 / S3 | 每行地址是 `https://ota-dl.intsmarthub.com/ota/<设备类型代码>/…/xxx.zip`、MD5 32 位、大小为正数；按地址算出 S3 key，`head_object` 存在且大小 = Excel「文件大小」；小文件（单段上传）再比 MD5。`--no-upload` 时跳过 |
+   | 4. 规则行数 | Excel 数据行数 = 输入解析出的行数 |
+
+   通过后才把这份 Excel 记为「最近 prep」（`publish` / `online` / `dass` 不给文件时默认用它）。
+
+**S3 预检**：S3 上已有同名文件且大小一致的，跳过下载和上传。
+**下载并上传**：从 `ftp://` 地址下载；**下载完逐个算 MD5、量大小，与 Excel 不一致的不上传**（整批停止）；
+一致才传到 `s3://fam-media-andr/ota/<设备码>/<YYYYMMDD>/`，带进度百分比；上传后用 `head_object` 回查确认。
+Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
 
 **限制**：升级包只能从 `ftp://` 地址下载。申请模板里如果是 `http://` 地址，Excel 能生成，
 但没有可下载的 zip，真实上传会报错。请改成 `ftp://用户@主机/路径` 的形式。
@@ -240,7 +279,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 要点：
 
 - **DASS 的人工确认保留**：填完后终端会问「是否批复并提交？」，输入 `approve`（或 `提交` / `yes` / `y`）才提交，
-  其它输入都不提交。检查点④通过只代表填写完成。
+  其它输入都不提交。检查点④通过只代表填写完成。想跳过这一步见前面「后台运行与跳过 DASS 确认」（`--auto-approve`）。
 - **防重复导入**：Excel 里已经有 Rule ID 说明导入过，`publish` 会直接拒绝（再导入会触发 CMS「目标版本已经存在」）。
   这时只需上线就用 `./deployota online`。
 - **失败后不要直接重跑**：每个失败提示里都写了该怎么处理。例如检查点①失败时模板可能已在 CMS 建好，
@@ -538,7 +577,7 @@ JSONL 为主存，同时导出 CSV。
 | `CMS_USERNAME` / `CMS_PASSWORD` | CMS 凭据 |
 | `DASS_URL` / `DASS_LOGIN_URL` | DASS 地址 |
 | `DASS_USERNAME` / `DASS_PASSWORD` | DASS 凭据 |
-| `CMS_HEADED` | `true`（默认）开可见浏览器；`false` 无头。DASS 人工核对需要有头 |
+| `CMS_HEADED` | `true`（默认）开可见浏览器；`false` 后台运行，不显示页面（可只对一条命令：`CMS_HEADED=false ./deployota …`）。后台时 DASS 在终端确认，或加 `--auto-approve` |
 | `CMS_ARTIFACTS_DIR` | 截图和中间产物目录（默认 `artifacts/`） |
 | `OTA_WORKSPACE` | 统一工作目录；prep 默认输出目录、部署库（`OTADATA`）都在这下面 |
 | `OTA_DEPLOY_DB_DIR` | 单独指定部署库目录（可选） |
@@ -607,7 +646,7 @@ JSONL 为主存，同时导出 CSV。
 ## 九、安全边界
 
 - 凭据只从 `config/.env` 读取，不写进代码，不入库。
-- 「提交」是高影响操作：`dass` 在提交前暂停等你输入 `approve`，不会无人值守发布。
+- 「提交」是高影响操作：`dass` 在提交前暂停等你输入 `approve`；只有你明确加 `--auto-approve` 且全部写入成功时才会自动提交。
 - 「上线 / 替换」会改线上规则且不可撤销：写按钮都经过二次确认检查，条件不满足只打印不点；
   mac 组等判断只要不确定就保守中止，不猜。
 - `prep` 的 FTP 下载和 S3 上传不可逆，演练先加 `--no-upload`。
@@ -624,6 +663,8 @@ JSONL 为主存，同时导出 CSV。
 ```bash
 ./.venv/bin/python -m automation.prep --selftest
 ./.venv/bin/python -m automation.mac_group --selftest
+./.venv/bin/python -m automation.cms_mac --selftest
+./.venv/bin/python -m automation.prep_final --selftest
 ./.venv/bin/python -m automation.active_ota --selftest
 ./.venv/bin/python -m automation.active_offline --selftest
 ./.venv/bin/python -m automation.dass_fill --selftest
@@ -647,6 +688,7 @@ ota_cms_automation/
     last_prep.py          # 记录 prep 最近生成的 Excel（.last_prep.json）
     mac_group.py          # 场测 MAC → 后 8 位、MAC 组区间解析（纯逻辑，带 --selftest）
     cms_mac.py            # CMS「MAC组管理」：查组 / 编辑加 MAC / 新建组（prep 调用）
+    prep_final.py         # prep 最终检查：MAC 组 / 提示语 / 升级包 S3 / 行数（带 --selftest）
     otagen/               # 生成引擎、传输、映射表（data/device_history_seed.json）
     active_ota.py         # CMS：导入建规则(upload) / 上线(online) / 合并(publish)
     active_offline.py     # CMS：按 Rule ID 下线(offline)

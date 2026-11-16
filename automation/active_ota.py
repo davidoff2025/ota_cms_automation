@@ -1556,11 +1556,12 @@ deployota online [EXCEL | Rule ID...] [--device CODE] —— CMS 上线
 设备类型代码按 Rule ID 自动找：部署库 → prep Excel → CMS 在线规则页。
 """,
     "publish": """\
-deployota publish [EXCEL] [--no-dass] —— 一步完成：导入 → Rule ID → 上线 → DASS 场测
+deployota publish [EXCEL] [--no-dass] [--auto-approve] —— 一步完成：导入 → Rule ID → 上线 → DASS 场测
 
   检查点 ① 导入成功  ② 得到 Rule ID（数量 = Excel 行数，回写并读回一致）
          ③ 全部上线  ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
   任一检查点失败：红框提醒原因和下一步，后面不再执行。--no-dass 只做前 3 个。
+  --auto-approve：DASS 全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。
   Excel 已含 Rule ID（导入过）时拒绝重复导入，只需上线请用 ./deployota online。
 """,
 }
@@ -1964,8 +1965,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"
-        elif arg in ("--selftest", "--no-dass"):
-            continue  # --selftest 在 __main__ 处理；--no-dass 在 main 里读（只对 publish 生效）
+        elif arg in ("--selftest", "--no-dass", "--auto-approve"):
+            continue  # --selftest 在 __main__ 处理；--no-dass / --auto-approve 在 main 里读（只对 publish 生效）
         elif arg in _SUBCOMMANDS:
             if mode is not None:
                 print(f"✗ 只能指定一个子命令，已有 {mode!r} 又遇到 {arg!r}。")
@@ -2093,6 +2094,9 @@ def main() -> int:
 
             # —— 子命令 publish：导入 + 取 Rule ID + 上线，三个检查点 ——
             if mode == "publish":
+                if "--auto-approve" in sys.argv[1:]:   # 子进程 dass init 继承这个环境变量
+                    from .dass_fill import enable_auto_approve
+                    enable_auto_approve()
                 return run_publish(page, excel, with_dass="--no-dass" not in sys.argv[1:])
 
             print(color(f"✗ 未知模式：{mode!r}", "red"))

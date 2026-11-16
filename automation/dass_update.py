@@ -19,6 +19,8 @@ OPTION（只前进）：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
 选项：
   --dry-run       测试模式（不做闸门、不执行批量操作、不改 DASS）
   --yes           跳过 CMS 执行前的确认
+  --auto-approve  跳过 DASS 提交前的 approve：全部写入成功才自动提交（含逐组提交）；有没成功的仍要你确认。
+                  不会绕过成功率闸门（闸门不达标照样要 override 或中止）
   --no-cms        不动 CMS，只更新 DASS（以 DASS 更新成功记录阶段）
   --strict        闸门不达标直接中止，不询问人工批复
   --skip-missing  部署库里解析不出的 Rule ID 跳过，其余照常（默认整体中止）
@@ -131,10 +133,13 @@ def main() -> int:
     no_cms = "--no-cms" in argv
     dry_run = "--dry-run" in argv
     assume_yes = "--yes" in argv
+    if "--auto-approve" in argv:
+        from .dass_fill import enable_auto_approve
+        enable_auto_approve()
     option = None
     specs: list[str] = []
     for a in argv:
-        if a in ("--skip-missing", "--strict", "--no-cms", "--yes", "--dry-run"):
+        if a in ("--skip-missing", "--strict", "--no-cms", "--yes", "--dry-run", "--auto-approve"):
             continue
         if a == "init":
             print(err("init 需要 Excel（要插入新行），请用：./deployota dass init"), file=sys.stderr)
