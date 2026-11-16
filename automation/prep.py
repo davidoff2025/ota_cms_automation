@@ -50,7 +50,7 @@ from ._log import ok as _ok, warn as _warn, err as _err, color as _c
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deployota prep",
-        description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 上传 S3（三步一键）。",
+        description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 场测 MAC 组 → 上传 S3。",
     )
     p.add_argument("--file", dest="file", default=None,
                    help="输入文件：.txt（升级信息文本）或 .xlsx/.xlsm（OTA 申请模板 Excel，直接解析；旧版 .xls 需先另存为 .xlsx）；"
@@ -73,7 +73,47 @@ def _build_parser() -> argparse.ArgumentParser:
                         "默认不一致会等待人工确认，无法交互时退出。")
     p.add_argument("--force", dest="force", action="store_true", default=False,
                    help="即使输出目录已存在相同内容的 Excel 也强制重新生成（默认复用已有）。")
+    p.add_argument("--no-mac", dest="no_mac", action="store_true", default=False,
+                   help="跳过 CMS『测试<设备类型代码>』MAC 组检查。")
+    p.add_argument("--mac-dry-run", dest="mac_dry_run", action="store_true", default=False,
+                   help="MAC 组测试模式：在 CMS 里填好后点『取消』，不保存（随后继续上传）。")
     return p
+
+
+def _step_mac_group(args, sj, device_code: str, mac_group: str) -> int:
+    """步骤 2b：场测 MAC 组检查/加入。返回 0 = 继续；非 0 = 退出码（不上传）。"""
+    from .mac_group import group_name, macs_from_rows
+    print(_c("—— 步骤2b：场测 MAC 组 ——", "bold"))
+    if args.no_mac:
+        print(_warn("已指定 --no-mac：跳过 MAC 组检查。"))
+        return 0
+    rows = sj.get("rows", []) if isinstance(sj, dict) else []
+    macs = list(macs_from_rows(rows))
+    if not macs:
+        print(_warn("输入里没有找到场测 MAC 地址，跳过 MAC 组检查。"))
+        return 0
+    if not device_code:
+        print(_err("没有设备类型代码，无法检查 MAC 组（可加 --device-code，或 --no-mac 跳过）。"), file=sys.stderr)
+        return 1
+    want = group_name(device_code)
+    if mac_group and mac_group.strip() != want:
+        print(_warn(f"映射表/输入里的 MAC 组是『{mac_group}』，这里检查的是『{want}』。"))
+    from playwright.sync_api import sync_playwright
+    from .cms_mac import ensure_macs
+    with sync_playwright() as p:
+        res = ensure_macs(p, device_code, macs, assume_yes=args.assume_yes,
+                          dry_run=args.mac_dry_run, read_only=args.no_upload)
+    st = res["status"]
+    if st in ("ok", "added", "created", "tested"):
+        print(_ok(f"MAC 组『{res['group']}』：{res['detail']}"))
+        return 0
+    if st in ("would_add", "would_create"):
+        print(_warn(f"MAC 组『{res['group']}』：{res['detail']}；去掉 --no-upload 正式运行时会处理。"))
+        return 0
+    print(_err(f"MAC 组『{res['group']}』未完成：{res['detail']}"), file=sys.stderr)
+    print(_c("  未上传。处理好后重跑 prep（已生成的 Excel 会复用）；确定不需要可加 --no-mac。", "dim"),
+          file=sys.stderr)
+    return 1
 
 
 def _validate_output_row_like(row: dict) -> list[str]:
@@ -166,6 +206,115 @@ def _validate_excel(path: str) -> list[str]:
         return problems
     finally:
         wb.close()
+
+
+_DEVICE_COL_LABELS = ("设备类型代码", "设备类型代码(方案号)", "featurecode", "特征码", "featurecode(特征码)")
+
+
+def lift_device_columns(eng, text: str) -> tuple[str, dict | None]:
+    """竖排粘贴（每格一行）里，若表头最前面是『设备类型代码（方案号）』/『featurecode』这两列，
+    把它们改写成表格前的『标签\n值』形式（引擎支持的写法），并从每行数据里去掉这几列的值。
+
+    返回 (新文本, 说明或 None)。不是这种排法时原样返回 (text, None)。
+    要求：同一份里设备类型代码 / featurecode 只有一个值（一个 Excel 对应一个设备类型，本来就是约定）。
+    """
+    norm = eng.app.normalize_header
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    nb = [k for k, ln in enumerate(lines) if ln.strip()]
+    if not nb:
+        return text, None
+    # 1) 最前面连续的『设备类型代码 / featurecode』表头
+    lead = []
+    for k in nb:
+        if norm(lines[k]) in _DEVICE_COL_LABELS:
+            lead.append(k)
+        else:
+            break
+    if not lead or len(lead) >= len(nb):
+        return text, None
+    after = nb[len(lead)]
+    # 紧跟着的必须是表格表头（机型等）；否则是『标签\n值』写法，引擎本来就支持，不动。
+    if not eng._is_vertical_header_line(lines[after]):
+        return text, None
+    labels = [lines[k].strip() for k in lead]
+    keys = [norm(lines[k]) for k in lead]
+    rest = nb[len(lead):]
+    # 2) 找第一行数据的起点：有 featurecode 列时用『feature code 值』定位，否则用映射表里的设备类型代码定位
+    start = -1
+    fi = next((i for i, k in enumerate(keys) if k.startswith("featurecode") or k == "特征码"), None)
+    if fi is not None:
+        p = next((i for i, k in enumerate(rest) if eng.app.looks_like_feature_code(lines[k].strip())), -1)
+        start = p - fi if p >= 0 else -1
+    else:
+        known = {str(r.get("device_code", "")).lower() for r in eng.app.load_device_history_seed()}
+        start = next((i for i, k in enumerate(rest) if lines[k].strip().lower() in known), -1)
+    if start < 1 or start + len(lead) > len(rest):
+        return text, None
+    values = [lines[rest[start + i]].strip() for i in range(len(lead))]
+    if any(not v or eng._is_vertical_header_line(v) for v in values):
+        return text, None
+    # 3) 去掉每行开头重复出现的这几列的值（逐行按『连续的同一组值』匹配）
+    drop: set[int] = set()
+    rows = 0
+    i = start
+    while i + len(lead) <= len(rest):
+        if [lines[rest[i + j]].strip() for j in range(len(lead))] == values:
+            drop.update(rest[i + j] for j in range(len(lead)))
+            rows += 1
+            i += len(lead)
+        else:
+            i += 1
+    drop.update(lead)
+    meta = []
+    for lab, val in zip(labels, values):
+        meta += [lab, val]
+    new_lines = meta + [ln for k, ln in enumerate(lines) if k not in drop]
+    return "\n".join(new_lines), {"labels": labels, "values": values, "rows": rows}
+
+
+def normalize_message_lines(text: str) -> tuple[str, list[str]]:
+    """把『英语 A Test version ...』这种『语种 + 空格 + 内容』的提示语行改成引擎认的『英语：A Test version ...』。
+
+    只改不含 Tab、以已知语种名开头、语种名后是空白且后面还有内容的行。返回 (新文本, 改到的语种列表)。
+    """
+    from .otagen.legacy_engine import MESSAGE_LANGUAGE_NAMES
+    names = sorted(MESSAGE_LANGUAGE_NAMES, key=len, reverse=True)
+    pat = re.compile(r"^\s*(" + "|".join(re.escape(n) for n in names) + r")[ \u3000]+(\S.*)$", re.IGNORECASE)
+    out, hit = [], []
+    for ln in str(text or "").split("\n"):
+        m = pat.match(ln) if "\t" not in ln else None
+        if m:
+            out.append(f"{m.group(1)}：{m.group(2).rstrip()}")
+            hit.append(m.group(1))
+        else:
+            out.append(ln)
+    return "\n".join(out), hit
+
+
+def move_messages_before_table(eng, text: str) -> tuple[str, int]:
+    """竖排粘贴里，表格后面的『语种：内容』提示语会被引擎并进最后一行数据然后截掉。
+    把从第一条提示语开始到末尾的内容挪到表格表头前面（引擎在那里能正确识别）。
+
+    只处理竖排（不含 Tab）的文本；不是竖排、或表格后没有提示语时原样返回。返回 (新文本, 挪动的行数)。
+    """
+    t = str(text or "")
+    if "\t" in t or eng.reshape_vertical_paste(t) == t:
+        return t, 0
+    from .otagen.legacy_engine import MESSAGE_LANGUAGE_NAMES
+    names = sorted(MESSAGE_LANGUAGE_NAMES, key=len, reverse=True)
+    label = re.compile(r"^\s*(" + "|".join(re.escape(n) for n in names) + r")\s*[:：=]", re.IGNORECASE)
+    lines = t.split("\n")
+    hdr = next((i for i, ln in enumerate(lines) if ln.strip() and eng._is_vertical_header_line(ln)), -1)
+    if hdr < 0:
+        return t, 0
+    first = next((i for i in range(hdr + 1, len(lines)) if label.match(lines[i])), -1)
+    if first < 0:
+        return t, 0
+    block = [ln for ln in lines[first:]]
+    while block and not block[-1].strip():
+        block.pop()
+    new = lines[:hdr] + block + lines[hdr:first]
+    return "\n".join(new), len([b for b in block if b.strip()])
 
 
 def _canonical_device_code(eng, code: str):
@@ -389,6 +538,20 @@ def main() -> int:
 
     eng = OTAEngine()
 
+    if not excel_input:
+        # 竖排粘贴里『设备类型代码 / featurecode』作为表格前两列时，引擎认不出（它只认这两项写在表格外）。
+        # 先把这两列挪成表格前的『标签 / 值』，再交给引擎。
+        text, lifted = lift_device_columns(eng, text)
+        if lifted:
+            print(_warn("竖排表格的前几列是 " + " / ".join(lifted["labels"])
+                        + f"：已移到表格外（{', '.join(lifted['values'])}），从 {lifted['rows']} 行数据里去掉了这几列。"))
+        text, langs = normalize_message_lines(text)
+        if langs:
+            print(_warn(f"提示语『语种 + 空格 + 内容』写法已识别：{', '.join(langs)}"))
+        text, moved = move_messages_before_table(eng, text)
+        if moved:
+            print(_warn(f"竖排表格后面的提示语（{moved} 行）已移到表格前，避免被并进最后一行数据。"))
+
     if excel_input:
         print(_c("—— 输入：Excel 文件（直接解析）——", "bold"))
         print(f"  {os.path.abspath(args.file)}")
@@ -539,6 +702,11 @@ def main() -> int:
     # 记下这份 Excel：后续 upload / online / dass 不给文件时默认接着用它。
     from . import last_prep
     last_prep.save(output_path)
+
+    # (3b) 场测 MAC 组：确保 MAC（后 8 位）在 CMS『测试<设备类型代码>』组里。失败则不上传。
+    rc = _step_mac_group(args, sj, final_device_code, mac_group)
+    if rc:
+        return rc
 
     # (4) 步骤3 上传（或 --no-upload 计划）。
     urls = eng.extract_ftp_zip_urls(sj)
@@ -966,6 +1134,19 @@ def _selftest() -> int:
         check("解析 --no-upload/--file/--device-code", ns.no_upload and ns.file == "x.txt" and ns.device_code == "C")
         ns2 = _build_parser().parse_args([])
         check("--no-upload 默认 False", ns2.no_upload is False)
+        check("--no-mac / --mac-dry-run 默认 False", ns2.no_mac is False and ns2.mac_dry_run is False)
+        ns3 = _build_parser().parse_args(["--no-mac", "--mac-dry-run"])
+        check("解析 --no-mac / --mac-dry-run", ns3.no_mac and ns3.mac_dry_run)
+        # MAC 组步骤的离线分支（不打开浏览器）。
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            r1 = _step_mac_group(ns3, {"rows": [{"MAC": "cc:12:28:cd:db:d8"}]}, "X", "")
+            r2 = _step_mac_group(ns2, {"rows": [{"MAC": ""}]}, "X", "")
+            r3 = _step_mac_group(ns2, {"rows": [{"MAC": "cc:12:28:cd:db:d8"}]}, "", "")
+        check("MAC 组：--no-mac 跳过", r1 == 0)
+        check("MAC 组：没有 MAC 跳过", r2 == 0)
+        check(f"MAC 组：有 MAC 但没设备代码 → 退出（得到 {r3}）", r3 == 1)
 
         # 自带子包可导入。
         import importlib
@@ -981,6 +1162,34 @@ def _selftest() -> int:
         for d in temp_dirs:
             shutil.rmtree(d, ignore_errors=True)
 
+    # —— 竖排粘贴：设备类型代码 / featurecode 作为表格前两列，提示语在表格后、用空格分隔 ——
+    try:
+        _e = OTAEngine()
+        _vert = "\n".join([
+            "设备类型代码（方案号）", "featurecode", "机型", "扩展信息", "品牌 ", "OTA类型", "区域", "源版本 ", "目标版本 ",
+            "版本变化", "升级包地址", "升级包大小", "MD5", "场测MAC", "最大检测数",
+            "A311D2AndrWE6GE", "861003009000010000000101", "65WE6GE(01)", "65WE6GE01888", "Hisense", "非强制升级", "全部",
+            "0001UQ0815", "0001MQ0818", "Q0815_to_Q0818",
+            "ftp://ftpuser@10.18.203.205/upload/A311D2/x/OTA_INC/65WE6GE_OTA_Q0815_to_Q0818.zip",
+            "3073914", "debfa7e56660272595ba7e257eb3ce44", "cc:12:28:cd:db:d8", "空着为默认不设置", "",
+            "英语 A Test version for EN16031 certification ."])
+        _t, _lift = lift_device_columns(_e, _vert)
+        _t, _langs = normalize_message_lines(_t)
+        _t, _moved = move_messages_before_table(_e, _t)
+        _info = _e.resolve_device_info_from_text(_t)
+        _sj = _e.parse_pasted_text(_t)
+        check("竖排：设备类型代码 / featurecode 作为表格列能解析",
+              _lift is not None and _info.get("device_code") == "A311D2AndrWE6GE"
+              and _info.get("feature_code") == "861003009000010000000101")
+        check("竖排：只有 1 行数据，机型正确", len(_sj["rows"]) == 1 and _sj["rows"][0].get("机型信息") == "65WE6GE(01)")
+        check("竖排：表格后『英语 + 空格 + 内容』提示语保留",
+              _langs == ["英语"] and _moved == 1
+              and any(m["description"].startswith("A Test version") for m in _sj.get("messages", [])))
+        _sup = "\n".join(["设备类型代码（方案号）", "A311D2AndrWE6GE", "featurecode", "861003009000010000000101", "机型"])
+        check("已支持的『标签/值』写法不被改动", lift_device_columns(_e, _sup)[1] is None)
+        check("Tab 粘贴不挪提示语", move_messages_before_table(_e, "机型\t源版本\n英语：x")[1] == 0)
+    except Exception as _ex:
+        check(f"竖排粘贴自测异常：{_ex}", False)
     print("\n自测结果：", "全部通过 ✅" if ok else "存在失败 ❌")
     return 0 if ok else 1
 

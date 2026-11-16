@@ -1,7 +1,7 @@
 """deployota —— OTA 部署统一入口（薄分发）：把 `deployota <子命令> [参数...]` 原样转发给对应模块。
 
 子命令 -> 模块：
-  prep     -> automation.prep              生成 Excel → 校验 → FTP 下载 → 上传 S3
+  prep     -> automation.prep              生成 Excel → 校验 → MAC 组 → FTP 下载 → 上传 S3
   publish  -> automation.active_ota publish  upload + online + dass init，4 个检查点
   online   -> automation.active_ota online   上线（Excel 或 Rule ID）
   dass     -> automation.dass_fill         DASS 填报（init）
@@ -88,7 +88,7 @@ def _usage() -> str:
         "  ./deployota update ota50 <Rule ID>        ③ 逐档放量：ota50 → ota200 → ota1k → ota5k → ota20k → ota-all",
         "",
         "准备",
-        "  prep      生成标准 Excel → 严格校验 → FTP 下载 → 上传 S3",
+        "  prep      生成标准 Excel → 严格校验 → 场测 MAC 进『测试+设备类型代码』MAC 组 → FTP 下载 → 上传 S3",
         "部署",
         "  publish   CMS 导入建规则 → 回收 Rule ID → 上线 → DASS init，4 个检查点，任一失败醒目提醒",
         "  dass      DASS 填报：dass init 插入新行（场测）",

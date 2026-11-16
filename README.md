@@ -4,7 +4,7 @@
 
 ```
 OTA 申请模板(Excel)
-   │  prep      生成标准 Excel → 严格校验 → FTP 下载升级包 → 上传 S3（地址换成 ota-dl 链接）
+   │  prep      生成标准 Excel → 严格校验 → 场测 MAC 进 CMS MAC 组 → FTP 下载升级包 → 上传 S3（地址换成 ota-dl 链接）
    ▼
 标准 Excel
    │  publish   CMS 导入建规则 → 拿 Rule ID(回写 Excel) → 逐条上线 → DASS init 填报   ← 4 个检查点
@@ -97,7 +97,7 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 
 | 命令 | 作用 | 写线上数据？ |
 |---|---|---|
-| `./deployota prep` | 生成 Excel → 严格校验 → FTP 下载 → 上传 S3 | 是（S3，`--no-upload` 则否） |
+| `./deployota prep` | 生成 Excel → 严格校验 → MAC 组 → FTP 下载 → 上传 S3 | 是（CMS MAC 组需输入 yes、S3；`--no-upload` 则都不写） |
 | `./deployota publish` | CMS 导入 + 回收 Rule ID + 上线 + dass init，4 个检查点 | 是（CMS 导入/上线，DASS 填报） |
 | `./deployota online [Rule ID]` | 逐条上线 + 冲突处理 + 汇总（Excel，或直接给 Rule ID） | 是（CMS 上线/替换） |
 | `./deployota offline <Rule ID>` | 按 Rule ID 下线（在线的直接下线，已下线/找不到的跳过） | 是（CMS 下线，需输入 yes） |
@@ -179,6 +179,10 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 | `--no-upload` | 只生成+校验，打印 S3 计划和 ftp zip 清单，不碰 FTP/S3 |
 | `--yes`, `-y` | 设备信息与映射表不一致时自动继续（非交互场景用） |
 | `--force` | 强制重新生成并全量重传（默认复用相同内容的已有 Excel、跳过 S3 上已存在的同大小文件） |
+| `--no-mac` | 跳过场测 MAC 组检查 |
+| `--mac-dry-run` | MAC 组测试模式：在 CMS 里填好后点「取消」，不保存（截图 `artifacts/*_mac_before_save.png`） |
+
+`--yes` 也会跳过 MAC 组保存前的 yes 确认。
 
 **工作目录规则**（优先级从高到低）：`--out-dir` > `--file` 所在目录 > `OTA_WORKSPACE`。
 `--file` 和 `--out-dir` 的相对路径按你运行命令时所在的目录解析，也支持 `~/xxx`。
@@ -193,6 +197,18 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 2. **生成**：生成「升级规则 + 升级提示语」两个表的标准 Excel。同一内容已生成过则复用（`--force` 可重做）。
 3. **严格校验**：表名、18 列表头、每行升级文件地址（https、.zip 结尾、无 3 个以上连续斜杠）、
    OTA 类型 ∈ {1,2,11}、设备字段等。不通过直接退出，不上传。
+3b. **场测 MAC 组**（CMS「维度管理 → MAC组管理」）：确保输入里的场测 MAC 都在 MAC 组「测试+设备类型代码」里
+   （如 `测试A311D2AndrWE6GE`）。
+   - MAC 只存**后 8 位**小写：`cc:12:28:cd:db:d8` → `28cddbd8`。文本和 Excel 的「场测MAC」都能读，一个单元格里可以有多个
+     （`1）cc:…  2）a0:…`）；必须是完整的 12 位 MAC，「空着为默认不设置」之类视为没有 MAC，跳过这一步。
+   - 按设备类型 + 名称搜索，**按名称精确**找到这个组（同一设备类型下的 `9618自测扩充` 之类不算），看列表「MAC组」列的区间。
+   - 都在组内（含落在某个区间里）→ OK，不改动。
+   - 组存在但缺 MAC → 「编辑」，每个缺的 MAC 加一行（MAC起 = MAC止 = 后 8 位）→ 你输入 `yes` → 保存。
+   - 组不存在 → 「新建」，选设备类型、名称填「测试+设备类型代码」、加入 MAC → 你输入 `yes` → 保存。
+   - 保存后重新搜索回读，所有 MAC 都在组内才算成功；失败或你没确认 → **不上传**并退出（处理好后重跑，已生成的 Excel 会复用；
+     确定不需要可加 `--no-mac`）。
+   - `--no-upload` 时只查不改，打印「需要加入 / 需要新建」。
+   - 映射表里的 MAC 组名与「测试+设备类型代码」不同时会提醒，但检查的始终是「测试+设备类型代码」。
 4. **S3 预检**：S3 上已有同名文件且大小一致的，跳过下载和上传。
 5. **下载并上传**：从 `ftp://` 地址下载，传到 `s3://fam-media-andr/ota/<设备码>/<YYYYMMDD>/`，
    带进度百分比；上传后用 `head_object` 回查确认。Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
@@ -201,6 +217,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 但没有可下载的 zip，真实上传会报错。请改成 `ftp://用户@主机/路径` 的形式。
 
 > ⚠ 真实的 FTP 下载和 S3 上传是不可逆的外部操作（升级包动辄上 GB）。演练请先加 `--no-upload`。
+> MAC 组保存会直接改 CMS，保存前要你输入 `yes`；想先看 CMS 里会填成什么样，用 `--mac-dry-run`。
 
 ### 4.2 `publish`：导入 + 上线 + DASS init（带检查点）
 
@@ -606,6 +623,7 @@ JSONL 为主存，同时导出 CSV。
 
 ```bash
 ./.venv/bin/python -m automation.prep --selftest
+./.venv/bin/python -m automation.mac_group --selftest
 ./.venv/bin/python -m automation.active_ota --selftest
 ./.venv/bin/python -m automation.active_offline --selftest
 ./.venv/bin/python -m automation.dass_fill --selftest
@@ -627,6 +645,8 @@ ota_cms_automation/
     deployota.py          # 子命令分发 + 默认使用 prep 刚生成的 Excel
     prep.py               # 生成 Excel → 校验 → FTP 下载 → 上传 S3
     last_prep.py          # 记录 prep 最近生成的 Excel（.last_prep.json）
+    mac_group.py          # 场测 MAC → 后 8 位、MAC 组区间解析（纯逻辑，带 --selftest）
+    cms_mac.py            # CMS「MAC组管理」：查组 / 编辑加 MAC / 新建组（prep 调用）
     otagen/               # 生成引擎、传输、映射表（data/device_history_seed.json）
     active_ota.py         # CMS：导入建规则(upload) / 上线(online) / 合并(publish)
     active_offline.py     # CMS：按 Rule ID 下线(offline)

@@ -254,6 +254,28 @@ def _print_stage_lines(hit_ids: list[str]) -> None:
             print(color(f"             冲突：{line}", "yellow"))
 
 
+def drop_cms_duplicates(groups: list) -> tuple[list, list]:
+    """同一批规则在库里记了两份（本机 Excel 入库一次、CMS 回补又入库一次）时，只保留本机 Excel 那份。
+
+    规则：一个『CMS:』来源的有效批次，若它命中的 Rule ID 全部也被某个本机 Excel 来源的有效批次命中，就省略它。
+    返回 (保留的 groups, 被省略的批次号列表)。只影响显示，不改部署库。
+    """
+    def is_cms(rec):
+        return str(rec.get("Excel路径", "")).startswith("CMS:")
+
+    def active(rec):
+        return str(rec.get("状态", depdb.STATUS_ACTIVE)) == depdb.STATUS_ACTIVE
+
+    covered = {x for rec, hit in groups if active(rec) and not is_cms(rec) for x in hit}
+    keep, dropped = [], []
+    for rec, hit in groups:
+        if is_cms(rec) and active(rec) and set(hit) <= covered:
+            dropped.append(rec.get("批次号", ""))
+        else:
+            keep.append((rec, hit))
+    return keep, dropped
+
+
 def _print_group(rec: dict, hit_ids: list[str]) -> None:
     void = str(rec.get("状态", depdb.STATUS_ACTIVE)) == depdb.STATUS_VOID
     tag = color("[作废]", "red") if void else color("[有效]", "green")
@@ -324,9 +346,14 @@ def show_rules(spec_args: list[str]) -> int:
     print(color(f"查询 Rule ID：{compress_ids(ids)}（共 {len(ids)} 个）    部署库：{depdb.db_dir()}（{len(rows)} 个批次）",
                 "bold"))
     groups, missing = lookup(ids, rows)
+    groups, dup_cms = drop_cms_duplicates(groups)
     print("")
     for rec, hit in groups:
         _print_group(rec, hit)
+        print("")
+    if dup_cms:
+        print(color(f"（另有 {len(dup_cms)} 个 CMS 回补的重复批次与上面的本机 Excel 批次是同一批规则，已省略："
+                    f"{', '.join(dup_cms)}）", "dim"))
         print("")
     found = {x for _, hit in groups for x in hit}
     print(color("────────── 汇总 ──────────", "bold"))
@@ -385,6 +412,13 @@ def _selftest() -> int:
     check("月份统计：批次数/规则条数/去重/平台", (st["batches"], st["rules"], st["unique"], st["platforms"]) == (3, 9, 8, 2))
     st2 = month_stats(batches_in_months(mrows, "202604", "202605"))
     check("月份统计：作废批次单列、不计入规则条数", st2["void"] == 1 and st2["rules"] == 9)
+    xls = {"批次号": "X", "状态": "有效", "Excel路径": "/a.xlsx"}
+    cms = {"批次号": "C", "状态": "有效", "Excel路径": "CMS:abc"}
+    cms2 = {"批次号": "C2", "状态": "有效", "Excel路径": "CMS:def"}
+    keep, dropped = drop_cms_duplicates([(xls, ["1", "2", "3"]), (cms, ["1", "2", "3"]), (cms2, ["4"])])
+    check("重复的 CMS 批次被省略、独有的保留", [r["批次号"] for r, _ in keep] == ["X", "C2"] and dropped == ["C"])
+    keep2, d2 = drop_cms_duplicates([(xls, ["1"]), (cms, ["1", "2"])])
+    check("CMS 批次有额外 Rule ID 时不省略", len(keep2) == 2 and d2 == [])
     print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
     return 0 if good else 1
 
