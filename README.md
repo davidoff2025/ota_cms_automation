@@ -196,6 +196,7 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 | `--yes`, `-y` | 设备信息与映射表不一致时自动继续（非交互场景用） |
 | `--force` | 强制重新生成并全量重传（默认复用相同内容的已有 Excel、跳过 S3 上已存在的同大小文件） |
 | `--originator 姓名` | 发起人（谁提的这次 OTA 请求）。不给时终端询问，回车跳过。显示在 dass init 后的部署汇总和邮件里，并写入部署库 |
+| `--default-messages` | 源文件没有提示语、确实要用内置默认文案时加（否则最终检查判失败） |
 | `--no-mac` | 跳过场测 MAC 组检查 |
 | `--mac-dry-run` | MAC 组测试模式：在 CMS 里填好后点「取消」，不保存（截图 `artifacts/*_mac_before_save.png`） |
 
@@ -214,6 +215,23 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
 2. **生成**：生成「升级规则 + 升级提示语」两个表的标准 Excel。同一内容已生成过则复用（`--force` 可重做）。
 3. **严格校验**：表名、18 列表头、每行升级文件地址（https、.zip 结尾、无 3 个以上连续斜杠）、
    OTA 类型 ∈ {1,2,11}、设备字段等。不通过直接退出，不上传。
+2b. **提示语写法**：竖排（每行「语种<Tab>描述」）和**横排**（第一行全是语种，如 `日文<Tab>英文（言語設定＝日本語以外）`，
+   下面每列一段、单元格内可以换行）都能识别；横排会先转成竖排再解析。语种名括号里的说明会忽略，
+   「日文 / 韩文 / 法文 / 西文 / 繁體 …」这些写法也认。
+2c. **字段特征检查**（解析之后、生成 Excel 之前；最终检查再查一次）：值放错列一眼就能看出来，不对就停下，不生成 Excel、不动 CMS / S3。
+
+   | 字段 | 特征 | 不符合 |
+   |---|---|---|
+   | 设备类型代码 | 字母开头、只有字母数字、8~24 位、含数字（`MT8195Andr32P1S`、`A311D2AndrWE6GE`）；整批只有一个 | ✗ |
+   | 特征码 | 18~24 位数字；整批只有一个 | ✗ |
+   | 机型 / 扩展码 | 字母数字（可带括号后缀），不能是版本号 / 纯数字 / MD5 / 地址；扩展码通常以机型开头，但不一定 | ✗（不以机型开头 ⚠） |
+   | 源 / 目标版本 | `0001CQ0903`、`0100AWP0224`、`V1.2.3` | ✗ |
+   | 版本变化 | `X_to_Y`，两头和源 / 目标版本末尾对得上（只差末尾字母如 `Q0725t` → ⚠） | ✗ |
+   | MD5 / 包大小 / 地址 | 32 位十六进制 / 正整数 / `…*.zip` | ✗ |
+   | 品牌 / 区域 | 不能是数字 / 版本号 / 地址；为空 = 不限 | ✗（空 ⚠） |
+   | 同名升级包 | 文件名相同但 MD5 / 大小不同 → 上传 S3 后同一个地址、互相覆盖 | ✗ |
+   | 重复行 | 机型 + 扩展码 + 源版本 + 目标版本完全一样 | ✗ |
+
 3b. **场测 MAC 组**（CMS「维度管理 → MAC组管理」）：确保输入里的场测 MAC 都在 MAC 组「测试+设备类型代码」里
    （如 `测试A311D2AndrWE6GE`）。
    - MAC 只存**后 8 位**小写：`cc:12:28:cd:db:d8` → `28cddbd8`。文本和 Excel 的「场测MAC」都能读，一个单元格里可以有多个
@@ -244,8 +262,8 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
    | 检查项 | 内容 |
    |---|---|
    | 1. 场测 MAC 组 | 用步骤 3b 的 CMS 结果（不重复登录查询；加入/新建后 3b 已回读确认）：输入里的全部 MAC 都在「测试+设备类型代码」组里；Excel 每行「MAC组」列 = 这个组名。`--no-upload` 只查不改、`--mac-dry-run` 未保存 → ⚠ |
-   | 2. 版本 / 机型 | 每行源版本、目标完整版本像版本号（`0100UQ1104`、`0100AWP0224`、`V1.2.3`）；内部机型信息、设备扩展信息不为空、不是版本号；「目标版本」（如 `P0224_to_Q1112`）两头和源版本 / 目标完整版本的末尾对得上。用来发现列错位 |
-   | 3. 升级提示语 | 表头「语种 / 描述」；**第 1 行必须是简体中文**；语种都在标准列表里、不重复；描述不为空；描述里不能有制表符（= 另一个语种被并进来了，例如 `Indonesia<Tab>Fitur…` 混进英语）。简体中文与英语完全相同（源数据没给中文，按规则复制英语）→ ⚠ 提醒 |
+   | 2. 字段特征 | 每个字段按特征核对（见下面「字段特征检查」），列错位、格式不对、同名升级包、完全重复的行 → ✗；扩展码不以机型开头、品牌 / 区域为空 → ⚠ |
+   | 3. 升级提示语 | 表头「语种 / 描述」；**第 1 行必须是简体中文**；语种都在标准列表里、不重复；描述不为空；描述里不能有制表符（= 另一个语种被并进来了，例如 `Indonesia<Tab>Fitur…` 混进英语）。简体中文与英语完全相同（源数据没给中文，按规则复制英语）→ ⚠ 提醒。**提示语就是内置默认文案** → ✗（源文件的提示语没解析出来，被换成了默认文案；确实要用默认文案加 `--default-messages`） |
    | 4. 升级包 / S3 | 每行地址是 `https://ota-dl.intsmarthub.com/ota/<设备类型代码>/…/xxx.zip`、MD5 32 位、大小为正数；按地址算出 S3 key，`head_object` 存在且大小 = Excel「文件大小」；小文件（单段上传）再比 MD5。`--no-upload` 时跳过 |
    | 5. 规则行数 | Excel 数据行数 = 输入解析出的行数 |
 
@@ -721,6 +739,7 @@ JSONL 为主存，同时导出 CSV。
 ./.venv/bin/python -m automation.cms_mac --selftest
 ./.venv/bin/python -m automation.prep_final --selftest
 ./.venv/bin/python -m automation.big_stage --selftest
+./.venv/bin/python -m automation.field_rules --selftest
 ./.venv/bin/python -m automation.active_ota --selftest
 ./.venv/bin/python -m automation.active_offline --selftest
 ./.venv/bin/python -m automation.dass_fill --selftest
@@ -745,6 +764,7 @@ ota_cms_automation/
     mac_group.py          # 场测 MAC → 后 8 位、MAC 组区间解析（纯逻辑，带 --selftest）
     cms_mac.py            # CMS「MAC组管理」：查组 / 编辑加 MAC / 新建组（prep 调用）
     prep_final.py         # prep 最终检查：MAC 组 / 提示语 / 升级包 S3 / 行数（带 --selftest）
+    field_rules.py        # 字段特征检查：列错位、格式、同名升级包、重复行（带 --selftest）
     big_stage.py          # 放 20K 时按源版本用户数决定 20K / 再一轮 20K / 完全开放（带 --selftest）
     otagen/               # 生成引擎、传输、映射表（data/device_history_seed.json）
     active_ota.py         # CMS：导入建规则(upload) / 上线(online) / 合并(publish)

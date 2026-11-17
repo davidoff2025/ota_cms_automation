@@ -65,7 +65,10 @@ def _s(v) -> str:
 # 2) 升级提示语
 # ----------------------------------------------------------------------
 
-def check_messages(head: list[str], rows: list[list]) -> dict:
+def check_messages(head: list[str], rows: list[list], defaults: list[str] | None = None,
+                   allow_default: bool = False) -> dict:
+    """defaults：引擎内置默认文案。Excel 里的描述有任何一条是默认文案 → ✗（源文件的提示语没解析出来、
+    被引擎悄悄换成了默认文案）；allow_default=True（--default-messages）时只给 ⚠。"""
     name = "升级提示语"
     if head[:2] != ["语种", "描述"]:
         return item(name, "fail", f"表头应为『语种 / 描述』，实际：{head[:2]}")
@@ -90,6 +93,13 @@ def check_messages(head: list[str], rows: list[list]) -> dict:
         if "\t" in d:
             seg = next((ln for ln in d.splitlines() if "\t" in ln), "")
             fails.append(f"『{l}』的描述里有制表符，疑似把另一个语种并进来了：『{' '.join(seg.split())[:40]}…』")
+    norm = lambda t: " ".join(str(t or "").split())
+    dset = {norm(d) for d in (defaults or [])}
+    used_default = [l for l, d in msgs if norm(d) in dset]
+    if used_default:
+        msg = (f"提示语用的是内置默认文案（{'、'.join(used_default)}）：源文件里的提示语没有解析出来"
+               "（请检查提示语写法；确实要用默认文案加 --default-messages）")
+        (warns if allow_default else fails).append(msg)
     by = dict(msgs)
     if by.get("简体中文") and by.get("简体中文") == by.get("英语"):
         warns.append("简体中文 与 英语 描述完全相同（源数据没给中文提示语，按规则复制了英语）")
@@ -105,7 +115,8 @@ def check_messages(head: list[str], rows: list[list]) -> dict:
 def rule_rows(head: list[str], rows: list[list]) -> list[dict]:
     want = {"设备类型代码": "code", "内部机型信息": "model", "MAC组": "mac_group", "升级文件地址": "url",
             "升级文件的MD5值": "md5", "文件大小": "size", "设备扩展信息": "ext", "源版本": "src",
-            "目标完整版本": "tgt", "目标版本": "change"}
+            "目标完整版本": "tgt", "目标版本": "change", "特征码": "feature", "品牌组": "brand",
+            "区域组": "region"}
     idx = {k: _col(head, h) for h, k in want.items()}
     out = []
     for i, r in enumerate(rows, 1):
@@ -152,6 +163,26 @@ def check_versions(rr: list[dict]) -> dict:
         return " / ".join(vals) if len(vals) <= 3 else f"{len(vals)} 个"
     return item(name, "pass", f"{len(rr)} 行：源版本 {few({r['src'] for r in rr})} → "
                               f"目标 {few({r['tgt'] for r in rr})}，和版本变化一致")
+
+
+def check_fields(rr: list[dict]) -> dict:
+    """字段特征（field_rules）：对生成的 Excel 每行查一遍。有 ✗ → fail；只有 ⚠ → warn。"""
+    from .field_rules import check_rows
+    keys = ("code", "feature", "model", "ext", "src", "tgt", "change", "url", "md5", "size", "brand", "region")
+    issues = check_rows([{k: r.get(k, "") for k in keys} for r in rr])
+    fails = [t for s, t in issues if s == "fail"]
+    warns = [t for s, t in issues if s == "warn"]
+    lines = (fails + warns)[:20] + ([f"…… 还有 {len(fails) + len(warns) - 20} 处"] if len(fails) + len(warns) > 20 else [])
+    if fails:
+        return item("字段特征", "fail", f"{len(fails)} 处字段不对（列可能错位）" + (f"，另 {len(warns)} 处 ⚠" if warns else ""), lines)
+    def few(vals):
+        vals = sorted(vals)
+        return " / ".join(vals) if len(vals) <= 3 else f"{len(vals)} 个"
+    detail = (f"{len(rr)} 行字段格式都对：源版本 {few({r['src'] for r in rr})} → 目标 {few({r['tgt'] for r in rr})}，"
+              "和版本变化一致")
+    if warns:
+        return item("字段特征", "warn", detail + f"；{len(warns)} 处 ⚠ 提醒", lines)
+    return item("字段特征", "pass", detail)
 
 
 def s3_key_from_url(url: str, aws_prefix: str) -> str:
@@ -269,6 +300,13 @@ def _selftest() -> int:
     check("提示语：表头不对 / 没有行 → fail", check_messages(["a", "b"], [["简体中文", "x"]])["status"] == "fail"
           and check_messages(H, [])["status"] == "fail")
 
+    dflt = ["有新软件版本可用。", "A new software version is available."]
+    check("提示语：用了内置默认文案 → fail", check_messages(H, [["简体中文", "有新软件版本可用。"],
+                                                       ["英语", "A new software version is available."]],
+                                                    defaults=dflt)["status"] == "fail")
+    check("提示语：默认文案 + --default-messages → warn",
+          check_messages(H, [["简体中文", "有新软件版本可用。"]], defaults=dflt, allow_default=True)["status"] == "warn")
+    check("提示语：自己的文案不受影响", check_messages(H, [["简体中文", "中"], ["英语", "en"]], defaults=dflt)["status"] == "pass")
     P = "https://ota-dl.intsmarthub.com"
     check("URL → S3 key", s3_key_from_url(f"{P}/ota/X/20261116/a.zip", P) == "ota/X/20261116/a.zip"
           and s3_key_from_url("http://x/a.zip", P) == "")

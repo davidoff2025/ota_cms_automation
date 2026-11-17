@@ -76,6 +76,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--originator", dest="originator", default=None,
                    help="发起人姓名（这次 OTA 请求是谁提的）。不给时在终端询问，可直接回车跳过；"
                         "会显示在 dass init 后的部署汇总和邮件里，并写入部署库。")
+    p.add_argument("--default-messages", dest="default_messages", action="store_true", default=False,
+                   help="源文件没有提示语、确实要用内置默认文案时加（否则最终检查发现是默认文案会判失败）。")
     p.add_argument("--no-mac", dest="no_mac", action="store_true", default=False,
                    help="跳过 CMS『测试<设备类型代码>』MAC 组检查。")
     p.add_argument("--mac-dry-run", dest="mac_dry_run", action="store_true", default=False,
@@ -296,9 +298,73 @@ _DEVICE_COL_LABELS = ("设备类型代码", "设备类型代码(方案号)", "fe
 _VERSION_RE = re.compile(r"^(?:\d{4}[A-Z]{1,3}\d{4}|V\d+(?:\.\d+)+)$", re.IGNORECASE)
 
 
+# 引擎语种别名表里没有的写法（『X文』『繁體』…）。括号里的说明（如『英文（言語設定＝日本語以外）』）先去掉再认。
+EXTRA_LANGUAGE_ALIASES = {
+    "日文": "日语", "日本语": "日语", "日語": "日语",
+    "韩文": "韩语", "韓文": "韩语", "韩国语": "韩语",
+    "法文": "法语", "德文": "德语", "俄文": "俄语", "泰文": "泰语",
+    "西文": "西班牙语", "西班牙文": "西班牙语", "葡文": "葡萄牙语", "葡萄牙文": "葡萄牙语",
+    "意大利文": "意大利语", "意文": "意大利语", "荷兰文": "荷兰语", "波兰文": "波兰语",
+    "阿拉伯文": "阿拉伯语", "印尼文": "印尼语", "马来文": "马来语", "越南文": "越南语",
+    "繁体": "繁体中文", "繁體": "繁体中文", "繁體中文": "繁体中文", "繁中": "繁体中文",
+    "简体": "简体中文", "簡體中文": "简体中文", "中文简体": "简体中文",
+}
+_PAREN_RE = re.compile(r"[（(][^（）()]*[)）]")
+
+
+def resolve_language(eng, label) -> str:
+    """语种标签 → 标准语种名（认不出返回空串）。先去掉括号说明，再查补充别名，最后交给引擎。"""
+    raw = str(label or "").strip()
+    if not raw or len(raw) > 40:
+        return ""
+    core = _PAREN_RE.sub("", raw).strip(" :：/")
+    for cand in (core, raw):
+        if cand in EXTRA_LANGUAGE_ALIASES:
+            return EXTRA_LANGUAGE_ALIASES[cand]
+    orig = getattr(eng.app, "_orig_normalize_message_language", eng.app.normalize_message_language)
+    return orig(core) or orig(raw) or ""
+
+
 def patch_engine(eng) -> None:
-    """修正引擎的版本号识别（见 _VERSION_RE）。对 OTAEngine 实例调用一次即可。"""
+    """修正引擎：版本号识别（见 _VERSION_RE）、语种别名（见 EXTRA_LANGUAGE_ALIASES）。对 OTAEngine 实例调用一次即可。"""
     eng.app.looks_like_version = lambda value: bool(_VERSION_RE.match(str(value or "").strip()))
+    if not hasattr(eng.app, "_orig_normalize_message_language"):
+        eng.app._orig_normalize_message_language = eng.app.normalize_message_language
+        eng.app.normalize_message_language = lambda language: resolve_language(eng, language)
+
+
+def columnar_messages_to_rows(eng, text: str) -> tuple[str, list[str], str]:
+    """横排提示语 → 引擎认的竖排『语种<Tab>描述』。
+
+    横排：一行全是语种（Tab 分隔，如『日文<Tab>英文（言語設定＝日本語以外）』），下面每列一段内容，
+    单元格内可以换行，列与列之间只有一个 Tab。条件：表头每格都是语种（≥2 个），后面内容里 Tab 个数正好 = 语种数 − 1。
+    返回 (新文本, 认出的语种, 问题说明)。没有横排表头 → 原样返回、问题为空；有表头但对不上 → 原样返回、给出问题。
+    """
+    lines = str(text or "").split("\n")
+    for i, ln in enumerate(lines):
+        if "\t" not in ln:
+            continue
+        cells = [c.strip() for c in ln.split("\t")]
+        if len(cells) < 2 or any(not c for c in cells):
+            continue
+        langs = [resolve_language(eng, c) for c in cells]
+        if not all(langs):
+            continue
+        body = "\n".join(lines[i + 1:]).strip("\n")
+        if body.count("\t") != len(cells) - 1:
+            return text, langs, (f"提示语是横排的（{' / '.join(cells)}），但下面内容里有 {body.count(chr(9))} 个 Tab，"
+                                 f"应为 {len(cells) - 1} 个，没法按列拆开")
+        descs = []
+        for part in body.split("\t"):
+            part = part.strip()
+            if len(part) >= 2 and part[0] == '"' and part[-1] == '"':      # Excel 复制多行单元格会加引号
+                part = part[1:-1].replace('""', '"')
+            descs.append(part.strip())
+        if any(not d for d in descs):
+            return text, langs, "横排提示语里有空的一列"
+        block = ["语种\t描述"] + [f"{lg}\t{d}" for lg, d in zip(langs, descs)]
+        return "\n".join(lines[:i] + block), langs, ""
+    return text, [], ""
 
 
 def lift_device_columns(eng, text: str) -> tuple[str, dict | None]:
@@ -664,6 +730,11 @@ def _main() -> int:
         if lifted:
             print(_warn("竖排表格的前几列是 " + " / ".join(lifted["labels"])
                         + f"：已移到表格外（{', '.join(lifted['values'])}），从 {lifted['rows']} 行数据里去掉了这几列。"))
+        text, col_langs, col_problem = columnar_messages_to_rows(eng, text)
+        if col_langs and not col_problem:
+            print(_warn(f"提示语是横排的（每个语种一列）：已转成竖排，语种：{', '.join(col_langs)}"))
+        elif col_problem:
+            print(_err(f"提示语没法解析：{col_problem}"), file=sys.stderr)
         text, langs = normalize_message_lines(text)
         if langs:
             print(_warn(f"提示语『语种 + 空格 + 内容』写法已识别：{', '.join(langs)}"))
@@ -768,6 +839,24 @@ def _main() -> int:
     parsed_rows = len(sj.get("rows", [])) if isinstance(sj, dict) else 0
     print(_c("—— 解析结果概览 ——", "bold"))
     print(f"  数据行数：{parsed_rows}")
+
+    # 字段特征检查：值放错列（列错位）、格式不对、同一升级包 MD5 不一致、规则重复……生成 Excel 之前就拦住。
+    from . import field_rules as FR
+    issues = FR.check_rows(FR.from_source(sj.get("rows", [])), device_code or "", feature_code or "")
+    fails = [t for s_, t in issues if s_ == "fail"]
+    warns = [t for s_, t in issues if s_ == "warn"]
+    print(_c("—— 字段特征检查 ——", "bold"))
+    for t in warns[:20]:
+        print(_warn(t))
+    if fails:
+        print(_err(f"字段特征检查未通过（{len(fails)} 处）：解析出的数据有字段放错列或格式不对，未生成 Excel、"
+                   "没有动 CMS / S3："), file=sys.stderr)
+        for t in fails[:30]:
+            print(_c("  - " + t, "red"), file=sys.stderr)
+        if len(fails) > 30:
+            print(_c(f"  …… 还有 {len(fails) - 30} 处", "red"), file=sys.stderr)
+        return 1
+    print(_ok(f"字段特征检查通过（{parsed_rows} 行" + (f"，{len(warns)} 处 ⚠ 提醒" if warns else "") + "）。"))
 
     # 输出目录优先级：--out-dir > 输入 .txt 所在目录（--file 时）> OTA 工作目录 OTA_WORKSPACE。
     if args.out_dir:
@@ -1259,12 +1348,14 @@ def _final_checks(args, output_path: str, device_code: str, macs: list[str], mac
     #    另核对 Excel『MAC组』列。
     items.append(_final_mac_item(F, args, group, macs, mac_res, F.check_mac_column(rr, group)))
 
-    # 2) 版本 / 机型（列有没有错位）。
-    items.append(F.check_versions(rr))
+    # 2) 字段特征（版本 / 机型 / 扩展码 / MD5 / 大小 / 品牌 …，列有没有错位）。
+    items.append(F.check_fields(rr))
 
     # 3) 升级提示语。
     mh, mrows = F.read_sheet(output_path, "升级提示语")
-    items.append(F.check_messages(mh, mrows))
+    from .otagen.engine import OTAEngine
+    defaults = [m["description"] for m in OTAEngine().app.get_default_ota_messages()]
+    items.append(F.check_messages(mh, mrows, defaults=defaults, allow_default=args.default_messages))
 
     # 4) 升级包 / S3。
     aws_prefix = otagen_config.AWS_PREFIX
@@ -1419,6 +1510,27 @@ def _selftest() -> int:
               _st(ns2, {"status": "failed"}) == "fail" and _st(ns2, {"status": "cancelled"}) == "fail"
               and _st(ns2, {"status": "ok", "missing": []}, ["第1行"]) == "fail")
         check("最终检查 MAC：--no-mac → warn", _st(ns3, None) == "warn")
+        # 横排提示语（每个语种一列）+『日文 / 英文（…）』写法
+        _ce = OTAEngine()
+        patch_engine(_ce)
+        check("语种别名：日文 / 英文（言語設定＝日本語以外）/ 繁體 / 西文",
+              [resolve_language(_ce, x) for x in ("日文", "英文（言語設定＝日本語以外）", "繁體", "西文", "简体中文")]
+              == ["日语", "英语", "繁体中文", "西班牙语", "简体中文"]
+              and resolve_language(_ce, "描述") == "" and resolve_language(_ce, "重要なソフトウェア") == "")
+        _col = ("规则行\n\n升级文案如下：\n\n日文\t英文（言語設定＝日本語以外）\n重要な更新。\n・安定化。\t"
+                "An important update.\n- Stability.\n")
+        _t, _l, _p = columnar_messages_to_rows(_ce, _col)
+        check("横排提示语 → 竖排", _l == ["日语", "英语"] and not _p
+              and "语种\t描述\n日语\t重要な更新。\n・安定化。\n英语\tAn important update.\n- Stability." in _t)
+        _t2, _l2, _p2 = columnar_messages_to_rows(_ce, "日文\t英文\n只有一列没有 Tab")
+        check("横排但 Tab 个数对不上 → 原样返回并报问题", _t2 == "日文\t英文\n只有一列没有 Tab" and "Tab" in _p2)
+        check("竖排『语种<Tab>描述』不当横排处理", columnar_messages_to_rows(_ce, "语种\t描述\n英语\tx")[1] == [])
+        _m = _ce.parse_pasted_text(
+            "机型\t扩展信息\t源版本\t目标版本\t版本变化\t升级包地址\t升级文件MD5值\t升级包大小\tMAC\t品牌\tOTA类型\t区域\n"
+            "32P1S(9A)\t32P1S9A888\t0001CQ0903\t0001CQ1116\tQ0903_to_Q1116\tftp://u@h/a/X.zip\t"
+            "d82026de64b20398467b8c1423b19aaa\t118219077\t12122323\tREGZA\t非强制升级\t全球\n\n" + _t)["messages"]
+        check("横排转换后引擎解析出日语、英语（多行保留）",
+              [m["language"] for m in _m] == ["日语", "英语"] and "・安定化。" in _m[0]["description"])
         # 3 个字母的版本号（MSD6886：0100AWP0224）：列不能错位。
         _pe = OTAEngine()
         patch_engine(_pe)
