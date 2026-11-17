@@ -18,7 +18,8 @@ OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
 
 # 同意语句里的阶段写法
 APPROVAL_STAGE = {"ota50": "OTA50", "ota200": "OTA200", "ota1k": "OTA1000", "ota5k": "OTA5000",
-                  "ota20k": "OTA20000", "ota-all": "OTA完全放开"}
+                  "ota20k": "OTA20000", "ota-all": "OTA完全放开",
+                  "ota5k-all": "OTA完全放开", "ota20k-again": "OTA20000 第2轮"}
 
 
 def short_rate(text: str) -> str:

@@ -10,6 +10,11 @@ OPTION（只前进）：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
   1) 按 Rule ID 从部署库取方案号、目标完整版本、设备扩展信息（老批次没明细时读来源 Excel）。
   2) 成功率闸门（ota200 起）：报表里每个 Rule ID 的成功率都 ≥ 50% 才放行，逐个显示成功率；
      不达标时在终端原样输入 override 可人工批复继续（--strict 则不询问、直接中止）。
+  2b) 放 20K（ota20k）时，再按『源版本用户数』（同一张报表、同一行）整批判断：
+     当前 5K：有一条 > 20000 → 放 20K；全部 ≤ 20000 → 直接完全开放（CMS 全量，DASS 完全开放）。
+     当前已 20K：有一条 > 20000 → 再放一轮 20K（CMS 累计检测数 +20000，DASS 保持 OTA20000 不改）；
+                 全部 ≤ 20000 → 完全开放。当前阶段取自阶段记录；判断结果要你输入 yes（--yes 跳过）。
+     ota-all 不检查用户数。
   3) CMS「在线规则」灰度放开：按设备类型代码 + 批量规则ID 搜索，累计检测数必须是上一阶段的值
      （ota50 要求 5、ota200 要求 50 …），批量灰度 → 配置最大升级检测数选目标阶段 → 确定 →
      你输入 yes → 执行批量操作 → 回读累计检测数 = 目标值才算成功，并记录灰度阶段。
@@ -202,9 +207,23 @@ def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
            f"{len(resolved)} 个取到方案号/目标版本/设备扩展信息"
            + (f"；跳过解析不出的 {len(problems)} 个（--skip-missing）" if problems else ""))
 
-    _print_plan(option, resolved, dry_run)
-    from .dass_fill import execute
     records = [rec for rec, _ in resolved]
+    if option == "ota20k":
+        # 放 20K：整批都在 20K → 再放一轮 20K；都在 5K（或没有记录）→ 第一次。混着就停。
+        from .big_stage import start_option
+        from .stage_db import build_state, load_events
+        state = build_state(load_events())
+        cur = {r["ruleid"]: state.get(r["ruleid"], {}).get("当前阶段", "") for r in records}
+        opt2, why = start_option(cur)
+        if opt2 is None:
+            print(err(f"无法判断这批在 5K 还是 20K：{why}。什么都没改。"), file=sys.stderr)
+            A.step("判断当前阶段", A.FAIL, why + "，已中止，什么都没改")
+            return 2
+        if opt2 == "ota20k-again":
+            print(color("这批当前已在 20K：本次是『再放一轮 20K』（之后按源版本用户数决定再一轮 20K 还是完全开放）。", "bold"))
+        option = opt2
+    _print_plan("ota20k" if option == "ota20k-again" else option, resolved, dry_run)
+    from .dass_fill import execute
     if dry_run:
         # 测试模式：只在 CMS 走一遍灰度放开流程（找规则、核对检测数、打开配置窗口后取消），
         # 不做成功率闸门、不执行批量操作、不更新 DASS。
@@ -228,11 +247,12 @@ def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
         code_of, _no_dev = device_codes_for([r["ruleid"] for r in records], batches)
         for r in records:  # 明细里的方案号就是设备类型代码，部署库查不到时用它兜底
             code_of.setdefault(r["ruleid"], r.get("方案号", ""))
-        before = lambda p: run_grey_release(p, option, code_of, assume_yes=assume_yes)
+        before = lambda p, opt: run_grey_release(p, opt, code_of, assume_yes=assume_yes)
         print(color("（流程：成功率闸门 → CMS 在线规则灰度放开 → DASS 更新阶段；加 --no-cms 只更新 DASS）", "dim"))
     else:
         A.step("CMS 灰度放开", A.SKIP, "--no-cms：不动 CMS")
-    return execute(option, records, None, allow_gate_override=not strict, before_update=before)
+    return execute(option, records, None, allow_gate_override=not strict, before_update=before,
+                   assume_yes=assume_yes)
 
 
 def _selftest() -> int:

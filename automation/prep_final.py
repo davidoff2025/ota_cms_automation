@@ -104,7 +104,8 @@ def check_messages(head: list[str], rows: list[list]) -> dict:
 
 def rule_rows(head: list[str], rows: list[list]) -> list[dict]:
     want = {"设备类型代码": "code", "内部机型信息": "model", "MAC组": "mac_group", "升级文件地址": "url",
-            "升级文件的MD5值": "md5", "文件大小": "size"}
+            "升级文件的MD5值": "md5", "文件大小": "size", "设备扩展信息": "ext", "源版本": "src",
+            "目标完整版本": "tgt", "目标版本": "change"}
     idx = {k: _col(head, h) for h, k in want.items()}
     out = []
     for i, r in enumerate(rows, 1):
@@ -118,6 +119,39 @@ def check_mac_column(rr: list[dict], group: str) -> list[str]:
     """Excel 每行『MAC组』列必须 = 测试+设备类型代码。返回问题列表。"""
     return [f"第{r['row']}行 {r['model']}：MAC组『{r['mac_group'] or '（空）'}』≠『{group}』"
             for r in rr if r["mac_group"] != group]
+
+
+_FULL_VER = re.compile(r"(?i)^(?:\d{4}[A-Z]{1,3}\d{4}|V\d+(?:\.\d+)+)$")
+
+
+def check_versions(rr: list[dict]) -> dict:
+    """每行：源版本 / 目标完整版本像版本号；机型信息、设备扩展信息不为空、不是版本号；
+    『目标版本』（版本变化，如 P0224_to_Q1112）两头要和源版本 / 目标完整版本的末尾对得上。"""
+    name = "版本 / 机型"
+    bad = []
+    for r in rr:
+        where = f"第{r['row']}行 {r['model'] or '?'}"
+        for key, label in (("src", "源版本"), ("tgt", "目标完整版本")):
+            if not _FULL_VER.match(r[key]):
+                bad.append(f"{where}：{label}『{r[key] or '（空）'}』不像版本号")
+        for key, label in (("model", "内部机型信息"), ("ext", "设备扩展信息")):
+            if not r[key]:
+                bad.append(f"{where}：{label}为空")
+            elif _FULL_VER.match(r[key]):
+                bad.append(f"{where}：{label}『{r[key]}』是版本号，列可能错位了")
+        m = re.match(r"(?i)^(.+?)_to_(.+)$", r["change"])
+        if m and r["src"] and r["tgt"]:
+            a, b = m.group(1), m.group(2)
+            if not (r["src"].upper().endswith(a.upper()) and r["tgt"].upper().endswith(b.upper())):
+                bad.append(f"{where}：版本变化『{r['change']}』和 源版本『{r['src']}』/ 目标完整版本『{r['tgt']}』对不上")
+    if bad:
+        return item(name, "fail", f"{len(bad)} 处版本 / 机型不对（列可能错位）", bad[:20] + (
+            [f"…… 还有 {len(bad) - 20} 处"] if len(bad) > 20 else []))
+    def few(vals):
+        vals = sorted(vals)
+        return " / ".join(vals) if len(vals) <= 3 else f"{len(vals)} 个"
+    return item(name, "pass", f"{len(rr)} 行：源版本 {few({r['src'] for r in rr})} → "
+                              f"目标 {few({r['tgt'] for r in rr})}，和版本变化一致")
 
 
 def s3_key_from_url(url: str, aws_prefix: str) -> str:
@@ -258,6 +292,18 @@ def _selftest() -> int:
     check("S3：分段上传 + 本地 MD5 已比 → pass", s["status"] == "pass" and "上传前" in s["lines"][0])
     s = check_s3([dict(rr[0], url=f"{P}/ota/X/20261116/c.zip")], "bkt", P, head_ok, set())
     check("S3：不存在 → fail", s["status"] == "fail")
+    vh = ["内部机型信息", "设备扩展信息", "源版本", "目标完整版本", "目标版本"]
+    good_rr = rule_rows(vh, [["43A53FUA", "43A53FUA0000784", "0100AWP0224", "0100AWQ1112", "P0224_to_Q1112"],
+                             ["55U73SUA(01)", "55U73SUA01299", "0100QQ0305", "0100UQ1104", "Q0305_to_Q1104"],
+                             ["X1", "X1EXT", "V1.2.2.3", "V1.3.9.2", "V1.2.2.3_to_V1.3.9.2"]])
+    check("版本：3 个字母的版本号 / V 版本 → pass", check_versions(good_rr)["status"] == "pass")
+    shifted = rule_rows(vh, [["0100AWP0224", "HU58A6109FUWA", "", "", "P0224_to_Q1112"]])
+    v = check_versions(shifted)
+    check("版本：列错位（源版本空、机型是版本号）→ fail",
+          v["status"] == "fail" and any("源版本" in x for x in v["lines"])
+          and any("内部机型信息『0100AWP0224』是版本号" in x for x in v["lines"]))
+    mism = rule_rows(vh, [["43A53FUA", "43A53FUA0000784", "0100AWQ0427", "0100AWQ1112", "P0224_to_Q1112"]])
+    check("版本：和版本变化对不上 → fail", check_versions(mism)["status"] == "fail")
     lines, failed = render([item("a", "pass", "x"), item("b", "warn", "y")])
     check("报告：有 warn 无 fail → 通过", not failed and "通过" in lines[-1])
     lines, failed = render([item("a", "fail", "x")])

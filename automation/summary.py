@@ -81,6 +81,42 @@ def _read_rows(xlsx_path: str):
     return device_code, rows
 
 
+STATUS_COL = "上线状态"
+
+
+def online_status(rule_ids: list[str], conflicts: dict | None = None) -> dict[str, str]:
+    """每个 Rule ID 的上线状态文字：『已上线』/『冲突未上线（与 64622）』/『-』（没有记录）。
+
+    conflicts（{新 Rule ID: 旧 Rule ID}，本次运行刚得到的）优先；其余查部署记录（rule_stages）：
+    CMS 状态『在线』→ 已上线；有『冲突中止』记录且没在线 → 冲突未上线。
+    """
+    conflicts = dict(conflicts or {})
+    state = {}
+    try:
+        from .stage_db import build_state, load_events
+        state = build_state(load_events())
+    except Exception:
+        pass
+    out = {}
+    for rid in rule_ids:
+        if rid in conflicts:
+            out[rid] = f"冲突未上线（与 {conflicts[rid]}）" if conflicts[rid] else "冲突未上线"
+            continue
+        st = state.get(rid, {})
+        if str(st.get("CMS状态", "")).startswith("在线"):
+            out[rid] = "已上线"
+            continue
+        old = next((c.get("被冲突Rule ID", "") for c in reversed(st.get("冲突", []))
+                    if c.get("角色") == "新规则" and "中止" in str(c.get("结果", ""))), None)
+        out[rid] = (f"冲突未上线（与 {old}）" if old else "冲突未上线") if old is not None else "-"
+    return out
+
+
+def _with_status(rows: list[dict], conflicts: dict | None) -> tuple[list[dict], dict[str, str]]:
+    st = online_status([r.get("Rule ID", "") for r in rows], conflicts)
+    return [dict(r, **{STATUS_COL: st.get(r.get("Rule ID", ""), "-")}) for r in rows], st
+
+
 def _rule_id_range(rows):
     """返回 Rule ID 的 (最小, 最大) 文本；非纯数字时按出现顺序取首尾。"""
     rids = [r.get("Rule ID", "").strip() for r in rows if r.get("Rule ID", "").strip()]
@@ -143,7 +179,7 @@ OFFLINE_HEADERS = ["Rule ID", "升级类型", "机型信息", "机型扩展码",
 
 
 def render_summary(device_code: str, rows: list[dict], kind: str = "online", when: str = "",
-                   originator: str = "") -> str:
+                   originator: str = "", statuses: dict | None = None) -> str:
     """渲染一个设备类型的汇总块（带颜色的文本）。kind='online' 上线汇总，'offline' 下线汇总。
 
     下线汇总与上线同一版式，但用红色标题、⛔ 标记、『下线规则总数 / 下线时间』字样和红色提示框，
@@ -158,6 +194,9 @@ def render_summary(device_code: str, rows: list[dict], kind: str = "online", whe
     else:
         title = "📦  OTA 部署信息汇总 / OTA Deployment Summary"
         tone, headers = "bold", None
+        if statuses is not None:
+            headers = [disp for disp, _ in _COLS] + [STATUS_COL]
+            rows = [dict(r, **{STATUS_COL: statuses.get(r.get("Rule ID", ""), "-")}) for r in rows]
     tw = _wcwidth(title)
     out.append(color("╔" + "═" * (tw + 2) + "╗", tone))
     out.append(color(f"║ {title} ║", tone))
@@ -172,6 +211,13 @@ def render_summary(device_code: str, rows: list[dict], kind: str = "online", whe
                    f"    ·    部署规则总数：{color(str(len(rows)), 'bold')} 条"
                    f"    ·    Rule ID 范围：{color(rng, 'green')}"
                    f"    ·    发起人：{color(originator or '-', 'bold')}")
+        if statuses is not None:
+            n_on = sum(1 for v in statuses.values() if v == "已上线")
+            n_cf = sum(1 for v in statuses.values() if v.startswith("冲突"))
+            line = f"  上线：{color(str(n_on), 'green')} 条"
+            if n_cf:
+                line += f"    ·    {color(f'冲突未上线：{n_cf} 条', 'yellow')}"
+            out.append(line)
     out.append("")
     out.append(_box_table(rows, headers))
     out.append("")
@@ -188,12 +234,13 @@ def render_summary(device_code: str, rows: list[dict], kind: str = "online", whe
     return "\n".join(out)
 
 
-def print_summary(xlsx_path: str, originator: str = "") -> int:
+def print_summary(xlsx_path: str, originator: str = "", conflicts: dict | None = None) -> int:
     device_code, rows = _read_rows(xlsx_path)
     if not rows:
         print(err("未从该 Excel 读到任何含 Rule ID 的数据行。"), file=sys.stderr)
         return 1
-    print(render_summary(device_code, rows, "online", originator=originator))
+    st = online_status([r.get("Rule ID", "") for r in rows], conflicts)
+    print(render_summary(device_code, rows, "online", originator=originator, statuses=st))
     print(ok(f"汇总完成（complete）：共 {len(rows)} 条规则。"))
     return 0
 
@@ -208,6 +255,7 @@ def _h(s) -> str:
 
 
 def render_summary_html(device_code: str, rows: list[dict], originator: str = "", when: str = "",
+                        conflicts: dict | None = None,
                         stage: str = "场测 · OTA 部署已在 CMS 上线") -> str:
     """部署汇总的 HTML 邮件正文（完整 HTML 文档）。"""
     from datetime import datetime
@@ -237,7 +285,8 @@ def render_summary_html(device_code: str, rows: list[dict], originator: str = ""
         return (f'<span style="{font}display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;'
                 f'background:{bg};color:{fg};white-space:nowrap;">{_h(text) or "-"}</span>')
 
-    headers = [disp for disp, _ in _COLS]
+    rows, statuses = _with_status(rows, conflicts)
+    headers = [disp for disp, _ in _COLS] + [STATUS_COL]
     th = "".join(f'<th align="left" style="{font}font-size:12px;font-weight:600;color:#374151;'
                  f'background:#f3f4f6;padding:9px 10px;border-bottom:2px solid #e5e7eb;white-space:nowrap;">'
                  f'{_h(h)}</th>' for h in headers)
@@ -249,6 +298,11 @@ def render_summary_html(device_code: str, rows: list[dict], originator: str = ""
             v = r.get(h, "")
             if h == "升级类型":
                 inner = badge(v)
+            elif h == STATUS_COL:
+                bg, fg = (("#ecfdf5", "#047857") if v == "已上线" else
+                          ("#fff7ed", "#c2410c") if v.startswith("冲突") else ("#f3f4f6", "#6b7280"))
+                inner = (f'<span style="{font}display:inline-block;padding:2px 8px;border-radius:10px;'
+                         f'font-size:12px;background:{bg};color:{fg};white-space:nowrap;">{_h(v)}</span>')
             elif h == "Rule ID":
                 inner = f'<span style="font-weight:600;color:#1d4ed8;">{_h(v)}</span>'
             elif h in ("源版本", "目标版本"):
@@ -259,6 +313,18 @@ def render_summary_html(device_code: str, rows: list[dict], originator: str = ""
                        f'border-bottom:1px solid #f0f0f0;white-space:nowrap;">{inner}</td>')
         trs.append(f'<tr style="background:{bg};">{"".join(tds)}</tr>')
 
+    conflict_box = ""
+    cf_ids = [rid for rid, v in statuses.items() if v.startswith("冲突")]
+    if cf_ids and "冲突" not in stage:
+        stage = f"{stage}（部分冲突未上线）"
+    if cf_ids:
+        n_on = sum(1 for v in statuses.values() if v == "已上线")
+        items = "".join(f"<li><b>{_h(rid)}</b>：{_h(statuses[rid])}，旧规则保持不变</li>" for rid in cf_ids)
+        conflict_box = (f'<tr><td style="padding:12px 28px 0 28px;"><div style="{font}background:#fff7ed;'
+                        f'border:1px solid #fed7aa;border-left:4px solid #ea580c;border-radius:6px;padding:12px 14px;'
+                        f'font-size:13px;color:#9a3412;">⚠ <b>{len(cf_ids)} 条冲突未上线</b>'
+                        f'（{n_on} 条已上线）：<ul style="margin:6px 0 0 18px;padding:0;">'
+                        f'{items}</ul></div></td></tr>')
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OTA 部署汇总 {_h(device_code)} {_h(rng)}</title></head>
@@ -298,11 +364,11 @@ def render_summary_html(device_code: str, rows: list[dict], originator: str = ""
       <tbody>{"".join(trs)}</tbody>
     </table></div>
   </td></tr>
+  {conflict_box}
   <tr><td style="padding:12px 28px 22px 28px;">
     <div style="{font}background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #f59e0b;border-radius:6px;
                 padding:12px 14px;font-size:13px;color:#92400e;">
-      ⚠ <b>灰度提醒</b>：进行下一阶段灰度发布时，请提供本次的 Rule ID 信息。本次部署 Rule ID 范围：<b>{_h(rng)}</b><br>
-      下一步：<span style="font-family:Menlo,Consolas,monospace;">./deployota update ota50 {_h(rng.replace(' ', ''))}</span>
+      ⚠ <b>灰度提醒</b>：进行下一阶段灰度发布时，请提供本次的 Rule ID 信息。本次部署 Rule ID 范围：<b>{_h(rng)}</b>
     </div>
   </td></tr>
   <tr><td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:12px 28px;">
@@ -314,7 +380,9 @@ def render_summary_html(device_code: str, rows: list[dict], originator: str = ""
 
 
 def build_summary_html(xlsx_path: str, originator: str = "",
-                       stage: str = "场测 · OTA 部署已在 CMS 上线") -> tuple[str, str, str]:
+                       stage: str = "场测 · OTA 部署已在 CMS 上线",
+                       conflicts: dict | None = None) -> tuple[str, str, str]:
+    """conflicts：{新 Rule ID: 冲突的旧 Rule ID}，这些行标『冲突未上线』，并加一段说明。"""
     """→ (主题, HTML, 纯文本备用)。读不到含 Rule ID 的行时抛 ValueError。"""
     device_code, rows = _read_rows(xlsx_path)
     if not rows:
@@ -322,8 +390,11 @@ def build_summary_html(xlsx_path: str, originator: str = "",
     lo, hi = _rule_id_range(rows)
     rng = lo if lo == hi else f"{lo}~{hi}"
     subject = f"[OTA 部署] {device_code} Rule ID {rng}（{len(rows)} 条）" + (f" · 发起人 {originator}" if originator else "")
-    text = re.sub(r"\x1b\[[0-9;]*m", "", render_summary(device_code, rows, "online", originator=originator))
-    return subject, render_summary_html(device_code, rows, originator=originator, stage=stage), text
+    st = online_status([r.get("Rule ID", "") for r in rows], conflicts)
+    text = re.sub(r"\x1b\[[0-9;]*m", "", render_summary(device_code, rows, "online", originator=originator,
+                                                          statuses=st))
+    return subject, render_summary_html(device_code, rows, originator=originator, stage=stage,
+                                        conflicts=conflicts), text
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -355,6 +426,19 @@ def main() -> int:
 
 # —— 不连网的纯逻辑自测 ——
 def _selftest() -> int:
+    import tempfile, os
+    _db_saved = os.environ.get("OTA_DEPLOY_DB_DIR")
+    os.environ["OTA_DEPLOY_DB_DIR"] = tempfile.mkdtemp(prefix="summary_selftest_db_")   # 不读真实部署库
+    try:
+        return _selftest_body()
+    finally:
+        if _db_saved is None:
+            os.environ.pop("OTA_DEPLOY_DB_DIR", None)
+        else:
+            os.environ["OTA_DEPLOY_DB_DIR"] = _db_saved
+
+
+def _selftest_body() -> int:
     import tempfile, os
     from openpyxl import Workbook
     ok_all = True
@@ -405,6 +489,25 @@ def _selftest() -> int:
           and html_.count("55U75SUA") >= 1 and "<script" not in html_)
     check("邮件主题含设备、Rule ID、发起人", "MT9655AMAndrGTV" in subj and "65345~65348" in subj and "张三" in subj)
     check("纯文本备用版没有颜色控制符", "\x1b[" not in text_ and "发起人" in text_)
+    _s, hc, tc = build_summary_html(p, originator="x", conflicts={"65345": "64622"})
+    check("冲突未上线：HTML 有『上线状态』列、标出这一行并列出说明，纯文本也写上",
+          "上线状态" in hc and "冲突未上线（与 64622）" in hc and "1 条冲突未上线" in hc
+          and "部分冲突未上线" in hc and "冲突未上线（与 64622）" in tc)
+    _s2, hn, _t2 = build_summary_html(p, originator="x")
+    check("没有冲突：不出现冲突说明", "条冲突未上线" not in hn)
+    check("HTML 不再有『下一步：./deployota update …』", "下一步" not in hc and "deployota update" not in hc)
+    # 从部署记录查状态：CMS 在线 → 已上线；冲突中止 → 冲突未上线（与 旧号）；没记录 → -
+    from .stage_db import record_cms, record_conflicts
+    record_cms(["65348"], "在线", "selftest", {"65348": "MT9655AMAndrGTV"})
+    record_conflicts([{"new": "65345", "old": "64622", "result": "冲突中止", "mac": ""}], "selftest",
+                     {"65345": "MT9655AMAndrGTV"})
+    st = online_status(["65345", "65348", "65999"])
+    check("状态来自部署记录", st == {"65345": "冲突未上线（与 64622）", "65348": "已上线", "65999": "-"})
+    term = render_summary("DEV", rows, originator="x", statuses=st)
+    check("终端汇总：有『上线状态』列和上线 / 冲突条数",
+          "上线状态" in term and "已上线" in term and "冲突未上线（与 64622）" in term and "冲突未上线：1 条" in term)
+    _s3, hl, _t3 = build_summary_html(p, originator="x")   # 不传 conflicts：从部署记录查
+    check("HTML 不传 conflicts 也能从记录查出冲突", "冲突未上线（与 64622）" in hl and "已上线" in hl)
 
     print("\n自测结果：", "全部通过 ✅" if ok_all else "存在失败 ❌")
     return 0 if ok_all else 1

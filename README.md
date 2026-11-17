@@ -244,9 +244,10 @@ cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV   # 从 stdin �
    | 检查项 | 内容 |
    |---|---|
    | 1. 场测 MAC 组 | 用步骤 3b 的 CMS 结果（不重复登录查询；加入/新建后 3b 已回读确认）：输入里的全部 MAC 都在「测试+设备类型代码」组里；Excel 每行「MAC组」列 = 这个组名。`--no-upload` 只查不改、`--mac-dry-run` 未保存 → ⚠ |
-   | 2. 升级提示语 | 表头「语种 / 描述」；**第 1 行必须是简体中文**；语种都在标准列表里、不重复；描述不为空；描述里不能有制表符（= 另一个语种被并进来了，例如 `Indonesia<Tab>Fitur…` 混进英语）。简体中文与英语完全相同（源数据没给中文，按规则复制英语）→ ⚠ 提醒 |
-   | 3. 升级包 / S3 | 每行地址是 `https://ota-dl.intsmarthub.com/ota/<设备类型代码>/…/xxx.zip`、MD5 32 位、大小为正数；按地址算出 S3 key，`head_object` 存在且大小 = Excel「文件大小」；小文件（单段上传）再比 MD5。`--no-upload` 时跳过 |
-   | 4. 规则行数 | Excel 数据行数 = 输入解析出的行数 |
+   | 2. 版本 / 机型 | 每行源版本、目标完整版本像版本号（`0100UQ1104`、`0100AWP0224`、`V1.2.3`）；内部机型信息、设备扩展信息不为空、不是版本号；「目标版本」（如 `P0224_to_Q1112`）两头和源版本 / 目标完整版本的末尾对得上。用来发现列错位 |
+   | 3. 升级提示语 | 表头「语种 / 描述」；**第 1 行必须是简体中文**；语种都在标准列表里、不重复；描述不为空；描述里不能有制表符（= 另一个语种被并进来了，例如 `Indonesia<Tab>Fitur…` 混进英语）。简体中文与英语完全相同（源数据没给中文，按规则复制英语）→ ⚠ 提醒 |
+   | 4. 升级包 / S3 | 每行地址是 `https://ota-dl.intsmarthub.com/ota/<设备类型代码>/…/xxx.zip`、MD5 32 位、大小为正数；按地址算出 S3 key，`head_object` 存在且大小 = Excel「文件大小」；小文件（单段上传）再比 MD5。`--no-upload` 时跳过 |
+   | 5. 规则行数 | Excel 数据行数 = 输入解析出的行数 |
 
    通过后才把这份 Excel 记为「最近 prep」（`publish` / `online` / `dass` 不给文件时默认用它）。
 
@@ -282,8 +283,8 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
 | ⓪ prep 准备完成（仅 `--file`） | prep 退出码 0（最终检查全部通过），并拿到这次生成的 Excel。失败时 CMS 和 DASS 都没动，修好后重跑同一条命令 | 10 |
 | ① 导入上传成功 | 导入向导走完且无页面报错，模板在「OTA升级模板」列表里找到 | 11 |
 | ② 得到 Rule ID | 回收到的 Rule ID 数量 == Excel 数据行数；回写 Excel 后读回一致 | 12 |
-| ③ 上线成功 | 全部 Rule ID 回读为已上线，没有失败或冲突中止 | 13 |
-| ④ DASS init 填报完成 | 上线全部成功后，用同一份 Excel 跑 `dass init`；退出码 0 才算通过 | 14 |
+| ③ 上线成功 | 全部 Rule ID 回读为已上线。**冲突中止不算失败**（旧规则 MAC 组为空、没有替换）：标 ⚠、列出这些 Rule ID，继续 ④，④ 只填已上线的那些；有「失败」或一条都没上线才停 | 13 |
+| ④ DASS init 填报完成 | 用同一份 Excel 跑 `dass init`（有冲突未上线时只填已上线的行）；退出码 0 才算通过。汇总邮件里冲突的行标「冲突未上线」 | 14 |
 
 结束时总会打印一份「检查点报告」，每项显示 ✓ / ✗ / 未执行。导入前的检查不通过（Excel 没数据、已含 Rule ID、
 设备类型 / 目标版本不唯一）和登录 CMS 出错也会红框报警，写明原因和下一步（退出码 2 / 1）。
@@ -311,6 +312,8 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
   - **密送（Bcc）**：每封固定 `王涛/Devin Wang <devinw@hisense.com>`（`OTA_MAIL_BCC`），其他收件人看不到。
   - To / Cc 里都不会出现 devinw@hisense.com。
   - 第一次场测部署的邮件写「场测 · OTA 部署已在 CMS 上线」，不写 DASS 状态（DASS 结果看终端的操作总结）。
+  - 终端汇总和 HTML 都有「上线状态」列：已上线 / 冲突未上线（与 旧 Rule ID）/ -（没有记录），状态取自部署记录；
+    有冲突时另列一段「N 条冲突未上线」。
   - 邮件服务器在 `config/.env` 里配置（`OTA_SMTP_*`）；没配就只保存 HTML、提示未发送。邮件失败不影响部署结果。
   发起人也写入部署库，`history` / `query` 显示为「发起人」。
 - **补发汇总**：`./deployota mail 65391 [--originator 姓名] [--mail-to "…"]` —— 按 Rule ID 找到这批和它的 Excel，
@@ -474,6 +477,9 @@ Excel 里的地址已换成 `https://ota-dl.intsmarthub.com/...`。
 `OPTION` 取值：`init`（默认）/ `ota50` / `ota200` / `ota1k` / `ota5k` / `ota20k` / `ota-all`。
 OPTION 和 Excel 路径都可省略，顺序不限。
 
+`dass init --only 65394-65399,65401`：只填这些 Rule ID（单个 / 区间 / 逗号），其余行不填。
+用于 publish 有冲突未上线、需要单独补做 DASS 时；汇总邮件里没填的行标「冲突未上线」（旧 Rule ID 取自冲突记录）。
+
 **流程**：（ota200 起）先过成功率闸门 → 填入/更新并逐条打印写入明细 → 截图 `artifacts/` → 暂停，
 你在浏览器里核对后，在终端输入 `approve` 才执行「验证 → 提交」，其它输入取消。
 
@@ -481,6 +487,24 @@ OPTION 和 Excel 路径都可省略，顺序不限。
 
 - 打印一张**部署汇总表**（含升级类型），
 - 把本次部署写入部署库（见 4.5），幂等，同一批不会重复写。
+
+**放 20K 时的「源版本用户数」判断**（`update ota20k`，整批一起判断；`update ota-all` 不检查）
+
+成功率闸门通过（或你 `override`）后，从同一张报表、同一行读每条 Rule ID 的「源版本用户数」：
+
+| 当前阶段 | 这批里有「源版本用户数」> 20,000 的？ | 动作 | CMS | DASS 当前阶段 |
+|---|---|---|---|---|
+| OTA5000 | 有（至少一条） | 放到 20K | 6255 → 26255 | OTA20000 |
+| OTA5000 | 没有（全部 ≤ 20,000） | 完全开放 | → 全量(-1) | 完全开放 |
+| OTA20000 | 有（至少一条） | 再放一轮 20K | 累计检测数 +20000（26255 → 46255 …） | 保持 OTA20000，不改 |
+| OTA20000 | 没有（全部 ≤ 20,000） | 完全开放 | → 全量(-1) | 完全开放 |
+
+- 正好 20,000 算低于。当前阶段取自阶段记录：整批都在 20K → 第二轮；一批里混着 5K 和 20K → 停，请分开跑。
+- 先打印每条的成功率和用户数、判断结果，你输入 `yes` 才执行（`--yes` 跳过）。
+- 报表滞后、按上一阶段查不到时，用报表里该规则实际那一行的用户数，标「仅供参考」（这种情况闸门本身也要你 `override`）。
+  一条都读不到 → 停；部分读不到 → 停，输入 `override` 可以只按读到的判断。
+- 再放一轮 20K：执行后回读，累计检测数必须 = 执行前 +20000 才算成功；阶段记录不变，CMS 备注里记下这一轮。
+  同意语句写「OTA20000 第2轮」；完全开放写「OTA完全放开」。
 
 **升级成功率闸门**
 
@@ -696,6 +720,7 @@ JSONL 为主存，同时导出 CSV。
 ./.venv/bin/python -m automation.mac_group --selftest
 ./.venv/bin/python -m automation.cms_mac --selftest
 ./.venv/bin/python -m automation.prep_final --selftest
+./.venv/bin/python -m automation.big_stage --selftest
 ./.venv/bin/python -m automation.active_ota --selftest
 ./.venv/bin/python -m automation.active_offline --selftest
 ./.venv/bin/python -m automation.dass_fill --selftest
@@ -720,6 +745,7 @@ ota_cms_automation/
     mac_group.py          # 场测 MAC → 后 8 位、MAC 组区间解析（纯逻辑，带 --selftest）
     cms_mac.py            # CMS「MAC组管理」：查组 / 编辑加 MAC / 新建组（prep 调用）
     prep_final.py         # prep 最终检查：MAC 组 / 提示语 / 升级包 S3 / 行数（带 --selftest）
+    big_stage.py          # 放 20K 时按源版本用户数决定 20K / 再一轮 20K / 完全开放（带 --selftest）
     otagen/               # 生成引擎、传输、映射表（data/device_history_seed.json）
     active_ota.py         # CMS：导入建规则(upload) / 上线(online) / 合并(publish)
     active_offline.py     # CMS：按 Rule ID 下线(offline)

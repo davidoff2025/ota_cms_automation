@@ -63,6 +63,8 @@ STAGE_LABELS = {
     "ota5k": "OTA5000",
     "ota20k": "OTA20000",
     "ota-all": "完全开放",
+    "ota5k-all": "完全开放",        # 内部键：5000 直接完全开放
+    "ota20k-again": "OTA20000",     # 内部键：再放一轮 20K（DASS 不改）
 }
 
 # 各递进选项在 DASS『当前阶段』里要找的上一阶段；ota50 无上一阶段，不参与此过滤。
@@ -72,6 +74,8 @@ PREV_STAGE = {
     "ota5k": "OTA1000",
     "ota20k": "OTA5000",
     "ota-all": "OTA20000",
+    "ota5k-all": "OTA5000",
+    "ota20k-again": "OTA20000",
 }
 
 # 要填写的 DASS 列（其余列：OTA类型/所有人/是否展示/状态/各时间/灰度档位 一律留空）。
@@ -923,6 +927,8 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
                 "  ./deployota dass init 路径.xlsx    指定 Excel\n\n"
                 "  插入 N 行并逐格填写 → 你在浏览器核对 → 终端输入 approve 才提交。\n"
                 "  --auto-approve：全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。\n"
+                "  --only 65394-65399,65401：只填这些 Rule ID（如 publish 有冲突未上线时补做 DASS）；\n"
+                "                其余行不填，汇总邮件里标『冲突未上线』。\n"
                 "  --mail-to \"王敏 <wangmin3@hisense.com>; …\"：最后汇总邮件的收件人（不给就弹出输入框）；\n"
                 "                固定抄送发件人和 devinw@hisense.com。\n"
                 "  填写完成后记录阶段『场测』，并把本批写入部署库。publish 第 4 步就是它。\n\n"
@@ -948,9 +954,58 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
 
 FIRST_DEPLOY_STAGE = "场测 · OTA 部署已在 CMS 上线"
 MAIL_DEFER_ENV = "OTA_MAIL_DEFER"   # publish 设为 1：dass init 子进程不发邮件，由 publish 最后统一发
+ONLY_RULEIDS_ENV = "OTA_DASS_ONLY_RULEIDS"   # publish 有冲突未上线时：只填这些 Rule ID（逗号分隔）
 
 
-def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok: bool = True) -> None:
+def filter_records(records: list[dict], only: str) -> tuple[list[dict], list[str]]:
+    """只保留 Rule ID 在 only（逗号分隔）里的行。返回 (保留的行, 被去掉的 Rule ID)。only 为空 = 不过滤。"""
+    want = {norm_ruleid(x) for x in str(only or "").split(",") if norm_ruleid(x)}
+    if not want:
+        return records, []
+    keep = [r for r in records if norm_ruleid(r.get("ruleid", "")) in want]
+    dropped = [norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", "")) not in want]
+    return keep, dropped
+
+
+_NOT_FILLED: dict[str, str] = {}   # {没填的 Rule ID: 冲突的旧 Rule ID}，给最后的汇总邮件标『冲突未上线』
+
+
+def _old_conflict_ids(ids: list[str]) -> dict[str, str]:
+    """从冲突记录（rule_conflicts.csv）查每个新 Rule ID 冲突的旧 Rule ID；查不到留空。"""
+    out = {i: "" for i in ids}
+    try:
+        import csv
+        from .stage_db import CONFLICT_CSV, _path
+        for row in csv.DictReader(open(_path(CONFLICT_CSV), encoding="utf-8-sig")):
+            n = norm_ruleid(row.get("新Rule ID", ""))
+            if n in out:
+                out[n] = norm_ruleid(row.get("被冲突Rule ID", ""))
+    except Exception:
+        pass
+    return out
+
+
+def pop_only(argv: list[str]) -> list[str]:
+    """--only 65394-65399,65401（单个 / 区间 / 逗号）→ 放进 ONLY_RULEIDS_ENV；返回去掉它之后的 argv。"""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        val = None
+        if a == "--only" and i + 1 < len(argv):
+            val, i = argv[i + 1], i + 2
+        elif a.startswith("--only="):
+            val, i = a.split("=", 1)[1], i + 1
+        else:
+            out.append(a)
+            i += 1
+            continue
+        from .dass_perf_query import parse_ruleid_args
+        os.environ[ONLY_RULEIDS_ENV] = ",".join(parse_ruleid_args([val]))
+    return out
+
+
+def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok: bool = True,
+                  conflicts: list[dict] | None = None) -> None:
     """部署最后一步（dass init 提交之后）：生成 HTML 部署汇总，存到 Excel 旁边（<Excel 名>.summary.html），
     问收件人（--mail-to 或终端粘贴 Outlook 收件人串），发给这些人，并固定抄送发件人 + devinw@hisense.com。
     任何一步失败只提示，不影响部署结果。"""
@@ -959,7 +1014,10 @@ def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok:
     stage = FIRST_DEPLOY_STAGE
     try:
         from .summary import build_summary_html
-        subject, html, text = build_summary_html(excel, originator=originator, stage=stage)
+        cf = {r["ruleid"]: r.get("conflict_ruleid", "") for r in (conflicts or [])}
+        if cf:
+            stage = "场测 · OTA 部署已在 CMS 上线（部分冲突未上线）"
+        subject, html, text = build_summary_html(excel, originator=originator, stage=stage, conflicts=cf)
         path = os.path.splitext(os.path.abspath(excel))[0] + ".summary.html"
         Path(path).write_text(html, encoding="utf-8")
         print(color(f"✓ HTML 部署汇总已保存：{path}", "green"))
@@ -977,6 +1035,51 @@ def _mail_summary(excel: str, originator: str, submitted: bool = False, fill_ok:
     sent, why = send_html(subject, html, text, to=to, cc=cc, bcc=bcc)
     print(color(("✓ 汇总邮件" if sent else "⚠ 汇总邮件") + f"：{why}", "green" if sent else "yellow"))
     A.step("汇总邮件", A.OK if sent else A.WARN, why + ("" if sent else f"（HTML 已存：{path}）"))
+
+
+def _decide_big_stage(option: str, allow_override: bool, assume_yes: bool) -> str | None:
+    """成功率闸门之后：按本批『源版本用户数』决定实际动作。返回内部阶段键；None = 中止（CMS、DASS 都没动）。"""
+    from . import action_summary as A
+    from .big_stage import ACTION_TEXT, THRESHOLD, decide, format_table
+    from .dass_perf import LAST_USERS, LAST_USERS_NOTE
+    STEP = f"源版本用户数判断（> {THRESHOLD:,} 才放 20K）"
+    users = dict(LAST_USERS)
+    rates = dict(getattr(A.CURRENT, "rates", {}) or {})
+    print(color(f"\n======== 源版本用户数判断（> {THRESHOLD:,} 才放 20K，整批一起）========", "bold"))
+    for ln in format_table(users, rates, dict(LAST_USERS_NOTE)):
+        print(ln)
+    d = decide(option, users)
+    if d["action"] is None:
+        print(color(f"⛔ {d['reason']}。", "red"))
+        if allow_override and d["missing"] and sys.stdin.isatty():
+            try:
+                ans = input("  输入 override = 只按读到的用户数判断；其它输入 = 中止：").strip()
+            except EOFError:
+                ans = ""
+            if ans == "override":
+                d = decide(option, users, allow_missing=True)
+        if d["action"] is None:
+            A.step(STEP, A.FAIL, d["reason"] + "，已中止（CMS、DASS 都没动）")
+            return None
+    act = d["action"]
+    print(color(f"判断：{d['reason']} → {ACTION_TEXT[act]}", "bold"))
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print(err("非交互终端无法确认，已中止（需要无人值守请加 --yes）。"))
+            A.step(STEP, A.FAIL, "非交互终端无法确认，已中止（CMS、DASS 都没动）")
+            return None
+        try:
+            go = input(f"  将执行：{ACTION_TEXT[act]}。输入 yes 继续，其它任意输入取消：").strip().lower() == "yes"
+        except EOFError:
+            go = False
+        if not go:
+            print("已取消，CMS、DASS 都没动。")
+            A.step(STEP, A.FAIL, "你取消了（CMS、DASS 都没动）")
+            return None
+    A.step(STEP, A.WARN if d["missing"] else A.OK,
+           f"{d['reason']} → {ACTION_TEXT[act]}" + (f"（读不到用户数：{'、'.join(d['missing'])}，你已 override）"
+                                                   if d["missing"] else ""))
+    return act
 
 
 AUTO_APPROVE_ENV = "OTA_DASS_AUTO_APPROVE"
@@ -1015,7 +1118,7 @@ def _ask_submit(prompt: str, all_ok: bool) -> tuple[bool, str]:
 
 def main() -> int:
     from .mailer import pop_mail_to
-    option, excel = _parse_cli(pop_mail_to(sys.argv[1:]))   # --mail-to "…" 放进环境变量，部署完发汇总用
+    option, excel = _parse_cli(pop_only(pop_mail_to(sys.argv[1:])))   # --mail-to / --only 放进环境变量
     if "--auto-approve" in sys.argv[1:]:
         enable_auto_approve()
 
@@ -1026,6 +1129,14 @@ def main() -> int:
     print(f"操作模式：{option}")
     print(f"数据源 Excel：{excel}")
     records = read_updated_excel(excel)  # 文件不存在时抛 FileNotFoundError，快速失败
+    if option == "init":
+        records, dropped = filter_records(records, os.environ.get(ONLY_RULEIDS_ENV, ""))
+        if dropped:
+            print(color(f"只填已上线的 {len(records)} 条；没上线的 {len(dropped)} 条不填：{', '.join(dropped)}", "yellow"))
+            _NOT_FILLED.update(_old_conflict_ids(dropped))
+        if not records:
+            print(color("✗ --only 里的 Rule ID 在 Excel 里一个都没找到，未做任何填写。", "red"))
+            return 2
     return execute(option, records, excel, allow_gate_override="--strict" not in sys.argv[1:])
 
 
@@ -1053,7 +1164,7 @@ def _gate_override(allow: bool) -> bool:
 
 
 def execute(option: str, records: list[dict], excel: str | None = None,
-            allow_gate_override: bool = True, before_update=None) -> int:
+            allow_gate_override: bool = True, before_update=None, assume_yes: bool = False) -> int:
     """用已经准备好的记录列表执行 DASS 填报/更新（浏览器会话 + 闸门 + 人工批复）。
 
     记录来源不限：Excel（main）或按 Rule ID 从部署库解析（deployota update，见 dass_update）。
@@ -1138,10 +1249,16 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
                     A.step(GATE, A.OK, "全部 ≥ 50%，放行")
 
+            # ———— 放 20K：按『源版本用户数』决定 20K / 再一轮 20K / 完全开放（整批一起）————
+            if option in ("ota20k", "ota20k-again"):
+                option = _decide_big_stage(option, allow_gate_override, assume_yes)
+                if option is None:
+                    return 2
+
             # ———— 闸门之后、更新 DASS 之前的外部步骤（deployota update 用它在 CMS 做灰度放开）————
-            # 回调收到 playwright 实例 p，返回可以继续更新 DASS 的 Rule ID 集合；None = 中止。
+            # 回调收到 playwright 实例 p 和（判断后的）阶段键，返回可以继续更新 DASS 的 Rule ID 集合；None = 中止。
             if before_update is not None:
-                ok_ids = before_update(p)
+                ok_ids = before_update(p, option)
                 if ok_ids is None:
                     print(color("\n⛔ CMS 灰度放开未完成：DASS 不更新。", "red"))
                     A.step(f"DASS 更新到 {STAGE_LABELS.get(option, option)}", A.SKIP, "CMS 没有放开，DASS 未更新")
@@ -1155,6 +1272,13 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     A.step(f"DASS 更新到 {STAGE_LABELS.get(option, option)}", A.SKIP, "CMS 没有放开成功的 Rule ID，DASS 未更新")
                     return 4
                 records = kept
+                if option == "ota20k-again":
+                    # 再放一轮 20K：DASS 当前阶段保持 OTA20000，不改。
+                    A.set_option(option)
+                    A.set_approved(sorted(norm_ruleid(r.get("ruleid", "")) for r in kept))
+                    A.step("DASS", A.SKIP, "再放一轮 20K：DASS 当前阶段保持 OTA20000，不改")
+                    print(color("\n✓ 再放一轮 20K 完成（CMS）。DASS 当前阶段保持 OTA20000，不改。", "green"))
+                    return 0
             navigate_to_fillin(page)
             page.wait_for_timeout(2500)
             # 必须选中『安卓升级状态填报』那个 iframe（有『显示行数』框）。闸门刚打开过展示报表时，
@@ -1285,7 +1409,8 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             # 部署的最后一步：汇总邮件（问收件人；固定抄送发件人 + devinw）。只在 init（新部署）时发。
             # publish 调用时（OTA_MAIL_DEFER=1）不在这里发：publish 打完检查点报告后统一问收件人、发一次。
             if option == "init" and excel and os.environ.get(MAIL_DEFER_ENV) != "1":
-                _mail_summary(excel, originator, submitted=submitted, fill_ok=fill_ok)
+                _mail_summary(excel, originator, submitted=submitted, fill_ok=fill_ok,
+                              conflicts=[{"ruleid": n, "conflict_ruleid": o} for n, o in _NOT_FILLED.items()])
             if linger:
                 try:
                     input("\n按回车关闭浏览器 ... ")
@@ -1333,6 +1458,10 @@ def _selftest() -> int:
         os.environ.pop(AUTO_APPROVE_ENV, None)
         if _saved is not None:
             os.environ[AUTO_APPROVE_ENV] = _saved
+    recs = [{"ruleid": "65393"}, {"ruleid": "65394"}, {"ruleid": "65395"}]
+    k, d = filter_records(recs, "65394, 65395")
+    check("只填已上线：过滤掉冲突未上线的行", [r["ruleid"] for r in k] == ["65394", "65395"] and d == ["65393"])
+    check("没有过滤名单 = 全部填", filter_records(recs, "") == (recs, []))
     # —— 表头匹配：去空白、去末尾括号说明 ——
     check("表头『是否展示\\n(取值0、1)』→ 是否展示", header_key("是否展示\n(取值0、1)") == "是否展示")
     check("表头全角括号也能去掉", header_key("是否展示（取值0、1）") == "是否展示")

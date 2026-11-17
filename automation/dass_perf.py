@@ -53,7 +53,7 @@ from .dass_fill import (
 from .dass_login import _shot, _click_menu_in_any_frame, _dump_visible_menu
 
 # 触发闸门校验的档位：从 ota200 起的递进档位。ota50 / init 不校验。
-GATE_OPTIONS = {"ota200", "ota1k", "ota5k", "ota20k", "ota-all"}
+GATE_OPTIONS = {"ota200", "ota1k", "ota5k", "ota20k", "ota-all", "ota5k-all", "ota20k-again"}
 
 # 通过阈值（含等于）。
 PASS_THRESHOLD = 50.0
@@ -92,7 +92,7 @@ PERF_PAGE_HARD_CAP = 200
 PERF_KNOWN_COLUMNS = [
     "大区域", "方案号", "方案国家", "机型", "设备扩展信息", "当前阶段",
     "当前阶段开放时间", "升级策略ruleid", "国家码", "国家", "品牌",
-    "源版本", "目标版本", "目标版本类型", "升级成功率",
+    "源版本", "目标版本", "目标版本类型", "升级成功率", "源版本用户数",
 ]
 
 # 绩效页逻辑列名 -> 表头实际文本。
@@ -100,6 +100,12 @@ PERF_SUCCESS_RATE_HEADER = "升级成功率"
 PERF_RULEID_HEADER = "升级策略ruleid"
 PERF_PLAN_HEADER = "方案号"
 PERF_TARGET_HEADER = "目标版本"
+PERF_USERS_HEADER = "源版本用户数"   # 放 20K 时按它决定 20K / 再一轮 20K / 完全开放（big_stage.py）
+
+# 最近一次成功率闸门读到的『源版本用户数』：{norm_ruleid: int 或 None（读不到）}。
+LAST_USERS: dict = {}
+# 用户数的来源说明：{norm_ruleid: '' （按上一阶段查到）或 '报表阶段 OTA1000，仅供参考'}。
+LAST_USERS_NOTE: dict = {}
 
 # 绩效页菜单叶子（实测以『安卓升级展示报表』为准；任务原称『安卓升级展示绩效』）。
 PERF_MENU_LEAF_CANDIDATES = ["安卓升级展示报表", "安卓升级展示绩效"]
@@ -219,8 +225,9 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
     # 诊断用的两列（缺失时置空，不影响成功率/ruleid 的读取）。
     stage_letter = letters.get("当前阶段", "")
     open_letter = letters.get("当前阶段开放时间", "")
+    users_letter = letters.get(PERF_USERS_HEADER, "")
     rows = fr.evaluate(
-        """({ridLetter, rateLetter, stageLetter, openLetter}) => {
+        """({ridLetter, rateLetter, stageLetter, openLetter, usersLetter}) => {
             // 以 ruleid 列为行锚：收集所有 id 形如 '<ridLetter><n>-<x>-<session>' 且 n>=2 的单元格。
             const ridRe = new RegExp('^' + ridLetter + '(\\\\d+)-\\\\d+-');
             const seen = {};
@@ -237,8 +244,10 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
                 const rc = document.querySelector('[id^="' + rateLetter + n + '-"]');
                 const rate_text = rc ? (rc.innerText || '').trim() : '';
                 const oc = openLetter ? document.querySelector('[id^="' + openLetter + n + '-"]') : null;
+                const uc = usersLetter ? document.querySelector('[id^="' + usersLetter + n + '-"]') : null;
                 res.push({ n: n, ruleid: ruleid, rate_text: rate_text,
-                           open_text: oc ? (oc.innerText || '').trim() : '' });
+                           open_text: oc ? (oc.innerText || '').trim() : '',
+                           users_text: uc ? (uc.innerText || '').trim() : '' });
             });
             res.sort((a, b) => a.n - b.n);
             // 『当前阶段』是跨行合并单元格：只在每组首行渲染，其余行沿用上方最近的那个。
@@ -261,7 +270,7 @@ def read_perf_rows(fr, letters: dict) -> list[dict]:
             return res;
         }""",
         {"ridLetter": rid_letter, "rateLetter": rate_letter,
-         "stageLetter": stage_letter, "openLetter": open_letter},
+         "stageLetter": stage_letter, "openLetter": open_letter, "usersLetter": users_letter},
     )
     return rows
 
@@ -601,6 +610,7 @@ def query_rates_stage1(
             "raw_ruleid": row.get("ruleid", ""),
             "stage_text": row.get("stage_text", ""),   # 诊断用：报表里该规则的『当前阶段』
             "open_text": row.get("open_text", ""),     # 诊断用：『当前阶段开放时间』
+            "users_text": row.get("users_text", ""),   # 『源版本用户数』（放 20K 时用）
         }
     return result
 
@@ -720,6 +730,7 @@ def check_success_rate(fr, page, records, option: str) -> bool:
                         "rate": info["rate"],
                         "stage": "Stage1",
                         "rate_text": info["rate_text"],
+                        "users_text": info.get("users_text", ""),
                     }
 
     # ———— Stage2：对 Stage1 未命中的 Rule ID 逐个精准查询 ————
@@ -749,6 +760,7 @@ def check_success_rate(fr, page, records, option: str) -> bool:
                 "rate": rate,
                 "stage": "Stage2",
                 "rate_text": matches[0].get("rate_text", ""),
+                "users_text": matches[0].get("users_text", ""),
             }
         else:
             found_rate[rid] = {"rate": None, "stage": "未找到", "rate_text": ""}
@@ -785,6 +797,21 @@ def check_success_rate(fr, page, records, option: str) -> bool:
         else:
             out[rid] = {"text": "", "src": ""}
     A.set_rates(out)
+    # 『源版本用户数』：只取按上一阶段查到的那一行（查不到 → None）。
+    # 『源版本用户数』：按上一阶段查到的那一行；报表滞后查不到时，用报表里该规则实际那一行的值（标『仅供参考』）。
+    from .big_stage import parse_users
+    LAST_USERS.clear()
+    LAST_USERS_NOTE.clear()
+    for rid in excel_ruleids:
+        info = found_rate.get(rid, {})
+        if info.get("stage") in ("Stage1", "Stage2"):
+            LAST_USERS[rid], LAST_USERS_NOTE[rid] = parse_users(info.get("users_text")), ""
+        elif (info.get("fallback") or {}).get("users_text"):
+            fb = info["fallback"]
+            LAST_USERS[rid] = parse_users(fb.get("users_text"))
+            LAST_USERS_NOTE[rid] = f"报表阶段 {fb.get('stage_text') or '?'}，仅供参考"
+        else:
+            LAST_USERS[rid], LAST_USERS_NOTE[rid] = None, ""
     return passed
 
 

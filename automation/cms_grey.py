@@ -50,6 +50,12 @@ CMS_STAGE = {
                 "prev_name": "5000阶段",  "prev_total": 6255},
     "ota-all": {"label": "全量(-1)",         "step": -1,    "name": "全量",      "total": -1,
                 "prev_name": "20000阶段", "prev_total": 26255},
+    # 内部阶段键（update ota20k 按『源版本用户数』判断后改用，见 big_stage.py）：
+    # 5000阶段 直接完全开放；20000阶段 再放一轮 20K（累计检测数按当前值 +20000，prev_total/total 为 None）。
+    "ota5k-all": {"label": "全量(-1)",       "step": -1,    "name": "全量",      "total": -1,
+                  "prev_name": "5000阶段",  "prev_total": 6255},
+    "ota20k-again": {"label": "20000阶段(20000)", "step": 20000, "name": "20000阶段", "total": None,
+                     "prev_name": "20000阶段", "prev_total": None},
 }
 CHUNK = 20          # 每次最多处理的 Rule ID 数（列表一页 20 行，保证搜索结果一屏核对完）
 BATCH_TYPE = "批量灰度"
@@ -88,6 +94,16 @@ def classify_counts(rows: list[dict], option: str) -> dict:
     """
     st = CMS_STAGE[option]
     out = {"eligible": [], "already": [], "mismatch": [], "hints": []}
+    if st["prev_total"] is None:
+        # 再放一轮 20K：阶段名称是 20000阶段 就可以放（累计检测数是多少都行，执行后要 +20000）；没有『已是目标』。
+        for r in rows:
+            rid = str(r.get("规则ID", "")).strip()
+            c = parse_count(r.get("累计检测数"))
+            if _norm_name(r.get("阶段名称")) == st["prev_name"] and c is not None and c > 0:
+                out["eligible"].append(rid)
+            else:
+                out["mismatch"].append((rid, f"{r.get('阶段名称', '') or '?'}/{r.get('累计检测数', '') or '?'}"))
+        return out
     for r in rows:
         rid = str(r.get("规则ID", "")).strip()
         ok_prev, h1 = at_stage(r, st["prev_name"], st["prev_total"])
@@ -336,8 +352,13 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
     from . import action_summary as A
     CMS_STEP = f"CMS 灰度放开到 {st['name']}"
     mode = "【测试模式：不执行批量操作，CMS 不做任何修改】" if dry_run else ""
-    print(color(f"\n======== CMS 灰度放开：{option}：{st['prev_name']}（累计 {st['prev_total']}）→ {st['name']}"
-                f"（累计 {st['total']}）{mode}========", "bold"))
+    if st["total"] is None:
+        print(color(f"\n======== CMS 灰度放开：再放一轮 20K：{st['prev_name']} → {st['name']}"
+                    f"（累计检测数 当前值 +{st['step']}）{mode}========", "bold"))
+    else:
+        print(color(f"\n======== CMS 灰度放开：{option}：{st['prev_name']}（累计 {st['prev_total']}）→ {st['name']}"
+                    f"（累计 {st['total']}）{mode}========", "bold"))
+    before_cnt: dict[str, int | None] = {}
     tested: list[str] = []
     done, already, mismatch, failed = [], [], [], []
     browser = p.chromium.launch(headless=not config.HEADED)
@@ -364,6 +385,7 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
                 rows = [r for r in rows if r["规则ID"] in part]
                 for r in rows:
                     print(f"  {r['规则ID']}  {dev}  阶段={r.get('阶段名称', '')}  累计检测数={r.get('累计检测数', '')}")
+                    before_cnt[r["规则ID"]] = parse_count(r.get("累计检测数"))
                 c = classify_counts(rows, option)
                 for rid_, h in c["hints"]:
                     print(warn(f"  {rid_}：{h}"))
@@ -442,6 +464,15 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
             after = {r["规则ID"]: r for r in search_ids(page, ids)}
             for r in ids:
                 row = after.get(r, {})
+                if st["total"] is None:   # 再放一轮 20K：回读累计检测数必须 = 执行前 +20000
+                    want = (before_cnt.get(r) or 0) + st["step"]
+                    got = parse_count(row.get("累计检测数"))
+                    if _norm_name(row.get("阶段名称")) == st["name"] and got == want:
+                        done.append(r)
+                    else:
+                        failed.append((r, f"执行后 阶段名称={row.get('阶段名称', '?')}、累计检测数={row.get('累计检测数', '?')}，"
+                                          f"应为 {st['name']}、累计 {want}（执行前 {before_cnt.get(r)} +{st['step']}）"))
+                    continue
                 reached, _ = at_stage(row, st["name"], st["total"])
                 if reached or parse_count(row.get("累计检测数")) == st["total"]:
                     done.append(r)
@@ -459,7 +490,13 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
             return None
         A.step(CMS_STEP, A.OK if (done or already) and not (mismatch or failed) else (A.WARN if (done or already) else A.FAIL),
                _cms_detail(st, done, already, mismatch, failed))
-        if done or already:
+        if option == "ota20k-again" and done:
+            # 阶段还是 20K（时间线不变），在 CMS 备注里记下这一轮。
+            from .stage_db import record_cms_note
+            record_cms_note(done, "20K 再放一轮：" + "、".join(
+                f"{r} {before_cnt.get(r)}→{(before_cnt.get(r) or 0) + st['step']}" for r in done),
+                f"update ota20k (CMS 第2轮)", code_of)
+        elif done or already:
             # 阶段记录以 CMS 灰度放开成功（回读阶段名称 = 目标阶段）为准。
             from .stage_db import record_stage
             record_stage(done + already, option, f"update {option} (CMS)", code_of)
@@ -535,7 +572,16 @@ def _selftest() -> int:
     check("没有阶段名称时退回用累计检测数", classify_counts([{"规则ID": "z", "累计检测数": "255"}], "ota1k")["eligible"] == ["z"])
     check("跳档不放开（ota1k 但当前测试阶段）",
           classify_counts([{"规则ID": "7", "阶段名称": "测试阶段", "累计检测数": "5"}], "ota1k")["eligible"] == [])
-    check("档位映射完整", set(CMS_STAGE) == {"ota50", "ota200", "ota1k", "ota5k", "ota20k", "ota-all"})
+    check("档位映射完整", set(CMS_STAGE) == {"ota50", "ota200", "ota1k", "ota5k", "ota20k", "ota-all",
+                                         "ota5k-all", "ota20k-again"})
+    c2 = classify_counts([{"规则ID": "a", "阶段名称": "20000阶段", "累计检测数": "26,255"},
+                          {"规则ID": "b", "阶段名称": "20000阶段", "累计检测数": "46255"},
+                          {"规则ID": "c", "阶段名称": "5000阶段", "累计检测数": "6255"}], "ota20k-again")
+    check("再放一轮 20K：20000阶段 任意累计数都可以放，别的阶段不动",
+          c2["eligible"] == ["a", "b"] and [r for r, _ in c2["mismatch"]] == ["c"] and c2["already"] == [])
+    c3 = classify_counts([{"规则ID": "d", "阶段名称": "5000阶段", "累计检测数": "6255"},
+                          {"规则ID": "e", "阶段名称": "全量", "累计检测数": "-1"}], "ota5k-all")
+    check("5000 直接完全开放：5000阶段 可放，已全量算已是目标", c3["eligible"] == ["d"] and c3["already"] == ["e"])
     check("分块", [len(x) for x in chunks(list(range(45)))] == [20, 20, 5])
     check("搜索结果核对", _check_exact([{"规则ID": "1"}], ["1"]) == ""
           and "多出" in _check_exact([{"规则ID": "1"}, {"规则ID": "2"}], ["1"]))

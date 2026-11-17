@@ -290,6 +290,17 @@ def _validate_excel(path: str) -> list[str]:
 _DEVICE_COL_LABELS = ("设备类型代码", "设备类型代码(方案号)", "featurecode", "特征码", "featurecode(特征码)")
 
 
+# 版本号写法：4 位数字 + 1~3 个字母 + 4 位数字（0100UQ1104、0100AWP0224），或 V1.2.3 这种。
+# 复制来的引擎只认 1~2 个字母，0100AWP0224（MSD6886）认不出 → 整行按内容『重新对齐』时把列放错
+# （源版本 / 目标版本变空，机型信息填成源版本）。这里替换引擎的版本判断，不改引擎文件本身。
+_VERSION_RE = re.compile(r"^(?:\d{4}[A-Z]{1,3}\d{4}|V\d+(?:\.\d+)+)$", re.IGNORECASE)
+
+
+def patch_engine(eng) -> None:
+    """修正引擎的版本号识别（见 _VERSION_RE）。对 OTAEngine 实例调用一次即可。"""
+    eng.app.looks_like_version = lambda value: bool(_VERSION_RE.match(str(value or "").strip()))
+
+
 def lift_device_columns(eng, text: str) -> tuple[str, dict | None]:
     """竖排粘贴（每格一行）里，若表头最前面是『设备类型代码（方案号）』/『featurecode』这两列，
     把它们改写成表格前的『标签\n值』形式（引擎支持的写法），并从每行数据里去掉这几列的值。
@@ -644,6 +655,7 @@ def _main() -> int:
         return 2
 
     eng = OTAEngine()
+    patch_engine(eng)
 
     if not excel_input:
         # 竖排粘贴里『设备类型代码 / featurecode』作为表格前两列时，引擎认不出（它只认这两项写在表格外）。
@@ -1247,11 +1259,14 @@ def _final_checks(args, output_path: str, device_code: str, macs: list[str], mac
     #    另核对 Excel『MAC组』列。
     items.append(_final_mac_item(F, args, group, macs, mac_res, F.check_mac_column(rr, group)))
 
-    # 2) 升级提示语。
+    # 2) 版本 / 机型（列有没有错位）。
+    items.append(F.check_versions(rr))
+
+    # 3) 升级提示语。
     mh, mrows = F.read_sheet(output_path, "升级提示语")
     items.append(F.check_messages(mh, mrows))
 
-    # 3) 升级包 / S3。
+    # 4) 升级包 / S3。
     aws_prefix = otagen_config.AWS_PREFIX
     up = F.url_problems(rr, device_code, aws_prefix)
     if up:
@@ -1264,7 +1279,7 @@ def _final_checks(args, output_path: str, device_code: str, macs: list[str], mac
         items.append(F.check_s3(rr, otagen_config.S3_UPLOAD_BUCKET, aws_prefix,
                                 lambda b, k: s3.head_object(Bucket=b, Key=k), local_md5_ok))
 
-    # 4) 规则行数。
+    # 5) 规则行数。
     if len(rr) == parsed_rows and rr:
         items.append(F.item("规则行数", "pass", f"Excel {len(rr)} 行 = 输入 {parsed_rows} 行"))
     else:
@@ -1404,6 +1419,20 @@ def _selftest() -> int:
               _st(ns2, {"status": "failed"}) == "fail" and _st(ns2, {"status": "cancelled"}) == "fail"
               and _st(ns2, {"status": "ok", "missing": []}, ["第1行"]) == "fail")
         check("最终检查 MAC：--no-mac → warn", _st(ns3, None) == "warn")
+        # 3 个字母的版本号（MSD6886：0100AWP0224）：列不能错位。
+        _pe = OTAEngine()
+        patch_engine(_pe)
+        _awp = ("机型\t扩展信息\t源版本 \t目标版本 \t版本变化\t升级包地址\t升级文件MD5值\t升级包大小(Byte)\tMAC\t品牌 \tOTA类型\t区域\n"
+                "43A53FUA\t43A53FUA0000784\t0100AWP0224\t0100AWQ1112\tP0224_to_Q1112\t"
+                "ftp://u@h/a/X_OTA_P0224_to_Q1112.zip\t514b4e36f4bd0df7eed752d8528fe8ba\t227484372\t"
+                "b7fc8ce6、b7fc8ce7\tHisense\t强制升级\t不限制\n")
+        _r = _pe.parse_pasted_text(_awp)["rows"][0]
+        check("3 个字母版本号：机型 / 扩展码 / 源版本 / 目标版本 不错位",
+              (_r["机型信息"], _r["机器扩展码"], _r["源版本"], _r["目标版本"])
+              == ("43A53FUA", "43A53FUA0000784", "0100AWP0224", "0100AWQ1112"))
+        check("版本号识别：0100UQ1104 / 0100AWP0224 / V1.2.3 是，43A53FUA 不是",
+              all(_pe.app.looks_like_version(x) for x in ("0100UQ1104", "0100AWP0224", "V1.2.3"))
+              and not _pe.app.looks_like_version("43A53FUA"))
         # 下载后 MD5 / 大小核对。
         _d = tempfile.mkdtemp()
         temp_dirs.append(_d)

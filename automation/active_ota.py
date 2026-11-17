@@ -1698,18 +1698,25 @@ def format_checkpoint_report(cps: list[dict]) -> str:
         title = f"检查点{n} {CP_NAMES[n]}"
         if st == "pass":
             lines.append(color(f"  ✓ {title}", "green") + (f"：{detail}" if detail else ""))
+        elif st == "warn":
+            lines.append(color(f"  ⚠ {title}", "yellow") + (f"：{detail}" if detail else ""))
         elif st == "fail":
             lines.append(color(f"  ✗ {title}：失败", "red") + (f" —— {detail}" if detail else ""))
             if first_fail is None:
                 first_fail = n
         else:
             lines.append(color(f"  - {title}：未执行", "yellow") + (f"（{detail}）" if detail else ""))
-    if first_fail is None and all(c["status"] == "pass" for c in cps):
+    if first_fail is None and all(c["status"] in ("pass", "warn") for c in cps):
         has0 = any(c["n"] == 0 for c in cps)
         has4 = any(c["n"] == 4 for c in cps)
-        done = (("prep 完成（升级包已上 S3）、" if has0 else "") + "已导入、拿到 Rule ID、全部上线成功"
+        cp3_warn = any(c["n"] == 3 and c["status"] == "warn" for c in cps)
+        done = (("prep 完成（升级包已上 S3）、" if has0 else "") + "已导入、拿到 Rule ID、"
+                + ("部分上线（有冲突未上线）" if cp3_warn else "全部上线成功")
                 + ("、DASS init 已填报" if has4 else ""))
-        lines.append(color(f"  ★ 全部检查点通过：{done}。", "green"))
+        if any(c["status"] == "warn" for c in cps):
+            lines.append(color(f"  ★ 发布完成（有 ⚠，见上）：{done}。", "yellow"))
+        else:
+            lines.append(color(f"  ★ 全部检查点通过：{done}。", "green"))
     else:
         ff = "?" if first_fail is None else first_fail
         lines.append(color(f"  ✗ 发布未完成：卡在检查点{ff}（{CP_NAMES.get(first_fail, '')}）。"
@@ -1728,18 +1735,22 @@ def _cp_alert(n: int, reason: str, hints: list[str]) -> None:
     print(color(bar, "red") + "\n")
 
 
-def _run_dass_init(excel: str) -> int:
+def _run_dass_init(excel: str, only: list[str] | None = None) -> int:
     """在子进程里跑 `dass_fill init <excel>`（它自己起浏览器；子进程继承终端，人工核对/批复照常交互）。
     汇总邮件不在子进程里发（OTA_MAIL_DEFER=1），publish 打完检查点报告后统一发。"""
     import subprocess
-    from .dass_fill import MAIL_DEFER_ENV
+    from .dass_fill import MAIL_DEFER_ENV, ONLY_RULEIDS_ENV
     os.environ[MAIL_DEFER_ENV] = "1"
+    if only:
+        os.environ[ONLY_RULEIDS_ENV] = ",".join(only)   # 只填这些 Rule ID（冲突未上线的不填）
+    else:
+        os.environ.pop(ONLY_RULEIDS_ENV, None)
     sys.stdout.flush()
     root = Path(__file__).resolve().parent.parent
     return subprocess.run([sys.executable, "-m", "automation.dass_fill", "init", excel], cwd=str(root)).returncode
 
 
-def _publish_mail(excel: str, online_ok: bool) -> None:
+def _publish_mail(excel: str, online_ok: bool, conflicts: list[dict] | None = None) -> None:
     """publish 全部执行完（检查点报告之后）：弹出收件人输入框，一次把部署汇总发给所有人。
     只有规则已在 CMS 上线（检查点3 通过）才发；否则提示没发。"""
     if not online_ok:
@@ -1748,7 +1759,7 @@ def _publish_mail(excel: str, online_ok: bool) -> None:
     from .dass_fill import _mail_summary
     from .last_prep import originator_for
     try:
-        _mail_summary(excel, originator_for(excel))
+        _mail_summary(excel, originator_for(excel), conflicts=conflicts or [])
     except Exception as e:     # 邮件问题不影响 publish 结果
         print(color(f"⚠ 部署汇总邮件出错：{e}", "yellow"))
 
@@ -1768,10 +1779,11 @@ def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None =
     if prep_cp:                      # publish --file：检查点0 prep 已通过，放进同一份报告
         cps.insert(0, dict(prep_cp))
     idx = {c["n"]: i for i, c in enumerate(cps)}
+    publish_state: dict = {"conflicts": []}
 
     def finish(code: int) -> int:
         print("\n" + format_checkpoint_report(cps))
-        _publish_mail(excel, cps[idx[3]]["status"] == "pass")
+        _publish_mail(excel, cps[idx[3]]["status"] in ("pass", "warn"), publish_state.get("conflicts", []))
         if config.HEADED:
             print("\n浏览器将在 20 秒后关闭（可自行查看页面）...")
             time.sleep(20)
@@ -1857,26 +1869,40 @@ def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None =
             "Rule ID 已在 Excel 里。先到 CMS『规则上下线编排』核对哪些已上线，再用 ./deployota online 重跑（已上线的会自动跳过）。",
         ], "publish_cp3_fail")
     print("\n" + summarize(final))
-    bad = [r for r in final if r.get("status") != STATUS_ONLINE]
-    if bad:
+    online_ids = [r["ruleid"] for r in final if r.get("status") == STATUS_ONLINE]
+    conflicts = [r for r in final if r.get("status") == STATUS_CONFLICT_ABORT]
+    failed = [r for r in final if r.get("status") not in (STATUS_ONLINE, STATUS_CONFLICT_ABORT)]
+    if failed or not online_ids:
+        # 真正的失败（或一条都没上线）才停下；冲突中止本身不算失败。
+        bad = failed or conflicts
         detail = "；".join(
             f"{r['ruleid']}={'冲突中止' if r.get('status') == STATUS_CONFLICT_ABORT else '失败'}"
             + (f"（{r['note']}）" if r.get("note") else "")
             for r in bad)
         return fail(3, f"{len(bad)}/{len(final)} 条未上线：{detail}", [
-            "未上线的 Rule ID 见上方汇总；冲突中止 = 被冲突规则的 mac 组为空或无法确认，需人工处理。",
+            "未上线的 Rule ID 见上方汇总；失败的原因见上方日志和 artifacts/ 截图。",
             "处理完后用 ./deployota online 重跑（已上线的会自动跳过）。",
         ], "publish_cp3_fail")
-    cps[idx[3]].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
-    print(color(f"✓ 检查点3 通过：{len(final)} 条 Rule ID 全部上线。", "green"))
+    publish_state["conflicts"] = conflicts
+    if conflicts:
+        cf = "、".join(f"{r['ruleid']}（与 {r.get('conflict_ruleid') or '?'} 冲突）" for r in conflicts)
+        cps[idx[3]].update(status="warn", detail=f"{len(online_ids)}/{len(final)} 条在线；"
+                                                 f"{len(conflicts)} 条冲突未上线（旧规则保持不变）：{cf}")
+        print(color(f"⚠ 检查点3：{len(online_ids)} 条已上线；{len(conflicts)} 条冲突未上线（旧规则 MAC 组为空，"
+                    f"没有替换）：{cf}。继续下一步。", "yellow"))
+    else:
+        cps[idx[3]].update(status="pass", detail=f"{len(final)}/{len(final)} 条全部在线")
+        print(color(f"✓ 检查点3 通过：{len(final)} 条 Rule ID 全部上线。", "green"))
     if not with_dass:
         _print_deploy_summary(excel)
         return finish(0)
 
     # —— 检查点4：DASS init 填报 ——
     print(color("\n▶ 检查点4：DASS init 填报（填写后需你在终端人工核对并输入 approve 才提交）", "bold"))
+    if conflicts:
+        print(color(f"  只填已上线的 {len(online_ids)} 条；冲突未上线的 {len(conflicts)} 条不填 DASS。", "yellow"))
     try:
-        rc = _run_dass_init(excel)
+        rc = _run_dass_init(excel, only=online_ids if conflicts else None)
     except Exception as e:
         return fail(4, f"无法启动 DASS 填报：{e}", [
             "CMS 导入和上线都已完成，不要重跑 publish。单独跑：./deployota dass init",
@@ -1888,7 +1914,8 @@ def run_publish(page, excel: str, with_dass: bool = True, prep_cp: dict | None =
     if rc != 0:
         return fail(4, f"DASS init 异常退出（退出码 {rc}）。", [
             "见上方 dass 日志里的错误原文与 artifacts/ 里的截图。", redo])
-    cps[idx[4]].update(status="pass", detail=f"{len(final)} 条已填入 DASS（提交与否以你在终端的 approve 为准）")
+    cps[idx[4]].update(status="pass", detail=f"{len(online_ids)} 条已填入 DASS（提交与否以你在终端的 approve 为准）"
+                                              + (f"；冲突未上线的 {len(conflicts)} 条没填" if conflicts else ""))
     print(color("✓ 检查点4 通过：DASS init 已填写完成。", "green"))
     return finish(0)
 
@@ -2323,6 +2350,11 @@ def _selftest() -> int:
         e1, _cp, rc1 = publish_prep_stage(["--file", "a.txt", "--no-upload"])
         e2, _cp2, rc2 = publish_prep_stage(["--yes"])
     check("publish 带 --no-upload / 缺 --file → 检查点0 失败（不跑 prep）", e1 is None and rc1 == 10 and e2 is None and rc2 == 10)
+    rw = format_checkpoint_report([{"n": 1, "status": "pass"}, {"n": 2, "status": "pass"},
+                                   {"n": 3, "status": "warn", "detail": "11/17 条在线；6 条冲突未上线"},
+                                   {"n": 4, "status": "pass"}])
+    check("检查点3 冲突（warn）→ 发布完成（有 ⚠），继续到 DASS", "发布完成（有 ⚠" in rw and "部分上线" in rw
+          and "卡在" not in rw and "⚠ 检查点3" in rw)
     # —— publish：检查点报告 ——
     rep_ok = format_checkpoint_report([{"n": n, "status": "pass", "detail": "x"} for n in (1, 2, 3)])
     check("publish 全通过含『全部检查点通过』", "全部检查点通过" in rep_ok and "✗" not in rep_ok)

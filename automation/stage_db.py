@@ -30,7 +30,8 @@ from . import depdb
 
 STAGES = ["场测", "50", "200", "1K", "5K", "20K", "完全开放"]
 OPTION_STAGE = {"init": "场测", "ota50": "50", "ota200": "200", "ota1k": "1K",
-                "ota5k": "5K", "ota20k": "20K", "ota-all": "完全开放"}
+                "ota5k": "5K", "ota20k": "20K", "ota-all": "完全开放",
+                "ota5k-all": "完全开放", "ota20k-again": "20K"}
 JSONL_NAME = "rule_stages.jsonl"
 CSV_NAME = "rule_stages.csv"
 CSV_FIELDS = ["Rule ID", "设备类型代码", "当前阶段"] + STAGES + ["CMS状态", "CMS状态时间", "CMS备注"]
@@ -174,6 +175,22 @@ def record_cms(ids: list[str], status: str, source: str, code_of: dict | None = 
         return write
     except Exception as e:
         print(f"（CMS 状态记录写入跳过：{e}）")
+        return []
+
+
+def record_cms_note(ids: list[str], note: str, source: str, code_of: dict | None = None,
+                    when: str | None = None) -> list[str]:
+    """CMS 状态不变（仍『在线』），只追加一条带备注的 CMS 事件（例如『20K 再放一轮』）。"""
+    try:
+        ids = list(dict.fromkeys(str(x).strip() for x in ids if str(x).strip()))
+        state = build_state(load_events())
+        dev = _device_of(ids, code_of, state)
+        t = when or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append([{"Rule ID": r, "设备类型代码": dev.get(r, ""), "类型": "CMS", "状态": "在线",
+                  "时间": t, "来源": source, "备注": note} for r in ids])
+        return ids
+    except Exception as e:
+        print(f"（CMS 备注写入跳过：{e}）")
         return []
 
 
