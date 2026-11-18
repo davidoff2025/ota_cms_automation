@@ -103,13 +103,17 @@ def _bar_html(cells: list[dict]) -> str:
     tds = []
     for i, c in enumerate(cells):
         if i:
-            lit = cells[i - 1]["state"] != "todo" and c["state"] != "todo"
+            lit = cells[i - 1]["state"] not in ("todo",) and c["state"] not in ("todo",)
             tds.append(f'<td style="padding:0;" valign="top"><div style="height:3px;margin-top:15px;'
                        f'background:{"#10b981" if lit else "#e5e7eb"};min-width:18px;"></div></td>')
         if c["state"] == "done":
             dot = ('<div style="width:30px;height:30px;line-height:30px;border-radius:15px;background:#10b981;'
                    'color:#fff;font-size:15px;font-weight:700;margin:0 auto;">✓</div>')
             tone = "#047857"
+        elif c["state"] == "skipped":
+            dot = ('<div style="width:26px;height:26px;line-height:26px;border-radius:15px;background:#f3f4f6;'
+                   'border:2px dashed #d1d5db;color:#9ca3af;font-size:14px;margin:0 auto;">–</div>')
+            tone = "#9ca3af"
         elif c["state"] == "current":
             dot = ('<div style="width:26px;height:26px;line-height:26px;border-radius:15px;background:#2563eb;'
                    'border:2px solid #bfdbfe;color:#fff;font-size:13px;font-weight:700;margin:0 auto;">●</div>')
@@ -119,6 +123,8 @@ def _bar_html(cells: list[dict]) -> str:
                    'border:2px solid #d1d5db;color:#9ca3af;font-size:13px;margin:0 auto;">○</div>')
             tone = "#9ca3af"
         label = c["label"] + (f" ×{c['rounds']}" if c.get("rounds", 0) > 1 else "")
+        if c["state"] == "skipped":
+            c = dict(c, date="跳过")
         weight = "700" if c["state"] == "current" else "500"
         tds.append(f'<td align="center" valign="top" style="padding:0 2px;min-width:58px;">{dot}'
                    f'<div style="{FONT}font-size:12px;font-weight:{weight};color:{tone};margin-top:6px;'
@@ -177,11 +183,6 @@ def render_html(reports: list[dict], originator: str = "") -> str:
                 f'<td style="{FONT}font-size:12px;color:#111827;padding:7px 9px;border-bottom:1px solid #f0f0f0;'
                 f'white-space:nowrap;">{c}</td>' for c in cells) + "</tr>")
         dass = {True: "已提交", False: "未提交"}.get(rep["dass_submitted"], "-")
-        sentence = (f'<div style="{FONT}margin-top:10px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;'
-                    f'padding:9px 12px;font-size:13px;color:#065f46;">{_h(rep["sentence"])}</div>'
-                    if rep["sentence"] else "")
-        steps = "".join(f'<li>{"✓" if s["status"] == "ok" else "⚠" if s["status"] == "warn" else "✗" if s["status"] == "fail" else "·"} '
-                        f'{_h(s["name"])}{("：" + _h(s["detail"])) if s.get("detail") else ""}</li>' for s in rep["steps"])
         sections.append(f"""
   <tr><td style="padding:18px 26px 4px 26px;">
     <div style="{FONT}font-size:16px;font-weight:700;color:#111827;">{_h(rep["from"])} → {_h(rep["to"])}
@@ -196,8 +197,6 @@ def render_html(reports: list[dict], originator: str = "") -> str:
     <div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:8px;">
       <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
         <thead><tr>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>
-    {sentence}
-    <ul style="{FONT}font-size:12px;color:#4b5563;margin:10px 0 0 18px;padding:0;line-height:1.7;">{steps}</ul>
   </td></tr>""")
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -239,8 +238,6 @@ def text_for(reports: list[dict]) -> str:
         lines.append(f"{rep['from']} → {rep['to']}：{STATUS_TEXT[rep['status']]}，放开 {len(rep['done'])}/{len(rep['ids'])}")
         for r in rep["rows"]:
             lines.append(f"  {r['ruleid']}  {r['model']}  {r['src']} → {r['tgt']}  {r['rate'] or '-'}  {r['result']}")
-        if rep["sentence"]:
-            lines.append("  " + rep["sentence"])
     return "\n".join(lines)
 
 
@@ -321,8 +318,9 @@ def _selftest() -> int:
     os.environ["OTA_DEPLOY_DB_DIR"] = db
     try:
         h = render_html([rep], "康凯")
-        check("HTML：标题、进度、明细、同意语句、用户数", "OTA 灰度放开汇总" in h and "OTA5000 → OTA20000" in h
-              and "35,289" in h and "同意（OTA20000" in h and "失败：执行后累计检测数不对" in h and "康凯" in h)
+        check("HTML：标题、进度、明细、用户数", "OTA 灰度放开汇总" in h and "OTA5000 → OTA20000" in h
+              and "35,289" in h and "失败：执行后累计检测数不对" in h and "康凯" in h)
+        check("HTML：不含同意语句和操作步骤", "同意（" not in h and "<ul" not in h)
     finally:
         if old is None:
             os.environ.pop("OTA_DEPLOY_DB_DIR", None)

@@ -303,12 +303,21 @@ def progress_cells(s: dict | None, rounds: int = 0) -> list[dict]:
     stages = (s or {}).get("阶段", {})
     cur = (s or {}).get("当前阶段", "")
     ci = STAGES.index(cur) if cur in STAGES else -1
+    first = min((STAGES.index(k) for k in stages if k in STAGES), default=ci)
     out = []
     for i, k in enumerate(STAGES):
         t = str(stages.get(k, "") or "")
         date = f"{t[5:7]}/{t[8:10]}" if len(t) >= 10 else ""
-        # 当前阶段之前的都算走过了（早期批次没有记录的只是没有日期，不往库里补记录）
-        state = "current" if k == cur else ("done" if (k in stages or i < ci) else "todo")
+        # 比最早一条记录还早的：走过了（早期批次没有记录，只是没日期；不往库里补记录）；
+        # 夹在两条记录中间却没有记录的：跳过了（如 5K 直接完全开放，20K 没放过）。
+        if k == cur:
+            state = "current"
+        elif k in stages or i < first:
+            state = "done"
+        elif i < ci:
+            state = "skipped"
+        else:
+            state = "todo"
         out.append({"stage": k, "label": STAGE_DISPLAY[k], "state": state, "date": date,
                     "rounds": rounds if k == "20K" else 0})
     return out
@@ -318,7 +327,7 @@ def progress_line(s: dict | None, rounds: int = 0) -> str:
     """'场测 ✓11/05 → OTA50 ✓11/06 → … → OTA5000 ●11/17 → OTA20000 ○ → 完全开放 ○'；没有记录返回空串。"""
     if not s or not s.get("阶段"):
         return ""
-    mark = {"done": "✓", "current": "●", "todo": "○"}
+    mark = {"done": "✓", "current": "●", "todo": "○", "skipped": "–"}
     parts = []
     for c in progress_cells(s, rounds):
         x = f"{c['label']} {mark[c['state']]}{c['date']}"
@@ -428,6 +437,9 @@ def _selftest() -> int:
     _c = progress_cells(_s)
     check("进度：当前之前的都算走过（没记录的不写日期）",
           [c["state"] for c in _c] == ["done"] * 6 + ["current"] and _c[5]["date"] == "11/13" and _c[0]["date"] == "")
+    _k = progress_cells({"阶段": {"5K": "2026-11-16 10:00:00", "完全开放": "2026-11-18 10:30:00"}, "当前阶段": "完全开放"})
+    check("进度：5K 直接完全开放 → 20K 显示跳过，更早的算走过",
+          [c["state"] for c in _k] == ["done"] * 5 + ["skipped", "current"])
     check("进度条文字", progress_bar({"当前阶段": "5K"}) == "[■■■■■□□] 5K" and progress_bar(None) == "[□□□□□□□] -")
     check("进度行：20K 两轮", "OTA20000 ●11/13×2" in progress_line(
         {"阶段": {"5K": "2026-11-10 00:00:00", "20K": "2026-11-13 00:00:00"}, "当前阶段": "20K"}, 2))
