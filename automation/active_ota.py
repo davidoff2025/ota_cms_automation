@@ -1570,7 +1570,8 @@ deployota online [EXCEL | Rule ID...] [--device CODE] [--force-replace [--dry-ru
 强制替换（只用于按 Rule ID）：
   ./deployota online 65393,65400 --force-replace             冲突时旧规则 mac组 为空也替换
   ./deployota online 65393,65400 --force-replace --dry-run   只读：列出会被替换的旧规则和它们的 mac组
-  先照常上线；有冲突的列出『新 → 旧』和旧规则 mac组，你输入 yes 才强制替换，替换后回读确认。
+  ./deployota online 65393,65400 --force-replace --yes       跳过开始前的 yes 确认
+  开始前列出 Rule ID、你输入 yes（--yes 跳过）；上线时遇到冲突当场点『确定』替换，替换后回读确认。
   ⚠ 旧规则下线后，不在新规则 MAC 组里的设备在新规则放量前收不到升级，撤销不了。
 """,
     "publish": """\
@@ -1579,16 +1580,19 @@ deployota publish --file 原始输入 [prep 参数] [--no-dass] [--auto-approve]
 
   --file：先跑 prep 作为检查点 ⓪（生成 → 严格校验 → MAC 组 → 下载 / MD5 → 上传 S3 → 最终检查），
           通过后才登录 CMS 继续 ①~④。prep 参数照常可用：--device-code / --device-name / --feature-code /
-          --mac-group / --out-dir / --yes / --force / --no-mac / --mac-dry-run（不能用 --no-upload）。
+          --mac-group / --originator / --out-dir / --yes / --force / --no-mac / --mac-dry-run /
+          --default-messages（不能用 --no-upload）。
           ⓪ 失败退出码 10，CMS 和 DASS 都不会动。
   不带 --file：用 prep 最近生成的 Excel（或命令里给的 Excel），从 ① 开始。
 
   检查点 ① 导入成功  ② 得到 Rule ID（数量 = Excel 行数，回写并读回一致）
-         ③ 全部上线  ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
+         ③ 上线（冲突中止不算失败：标 ⚠、继续 ④，④ 只填已上线的）
+         ④ DASS init 填写完成（之后仍需你输入 approve 才提交；记录阶段『场测』）
+  最后：打印检查点报告，弹出收件人输入框，把 HTML 部署汇总一次发给所有人。
   任一检查点失败：红框提醒原因和下一步，后面不再执行。--no-dass 只做前 3 个。
   --auto-approve：DASS 全部填写成功时自动提交，不再等 approve（有行没成功仍要你确认）。
   --mail-to "王敏 <wangmin3@hisense.com>; …"：部署完的汇总邮件收件人（可直接贴 Outlook 收件人串）；
-          不给就在最后弹出输入框。固定抄送发件人和 devinw@hisense.com。
+          不给就在最后弹出输入框。固定抄送 数据统计报告 <sys.datareports@hisense.com>，密送 devinw@hisense.com。
   Excel 已含 Rule ID（导入过）时拒绝重复导入，只需上线请用 ./deployota online。
 """,
 }
@@ -1611,7 +1615,7 @@ EXIT_CP_FAIL = {0: 10, 1: 11, 2: 12, 3: 13, 4: 14}
 # publish --file：先跑 prep。这些参数原样转给 prep（其余留给 publish）。
 PREP_VALUE_FLAGS = ("--file", "--device-code", "--device-name", "--feature-code", "--mac-group", "--out-dir",
                     "--originator")
-PREP_BOOL_FLAGS = ("--yes", "-y", "--force", "--no-mac", "--mac-dry-run", "--no-upload")
+PREP_BOOL_FLAGS = ("--yes", "-y", "--force", "--no-mac", "--mac-dry-run", "--no-upload", "--default-messages")
 
 
 def split_prep_args(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -2052,34 +2056,24 @@ def _confirm_force(plan: list[dict]) -> bool:
         return False
 
 
-def _force_replace_round(page, final_all: list[dict], code_of: dict) -> list[dict]:
-    """第二轮：对冲突中止的 Rule ID，你确认后强制替换，回读后替换掉第一轮的结果。"""
-    from .active_offline import group_by_device
-    from . import action_summary as A
-    plan = force_replace_plan(final_all)
-    skipped = [r["ruleid"] for r in final_all if r.get("status") == STATUS_CONFLICT_ABORT and not r.get("conflict_ruleid")]
-    if skipped:
-        print(color(f"⚠ 这些冲突解析不出被冲突号，不强制替换：{', '.join(skipped)}", "yellow"))
-    if not plan:
-        print(color("（--force-replace：没有冲突中止的规则，不需要强制替换）", "dim"))
-        return final_all
-    if not _confirm_force(plan):
-        print("已取消强制替换，冲突的规则保持未上线，旧规则不变。")
-        A.step("强制替换", A.FAIL, f"你取消了，{len(plan)} 条保持冲突未上线、旧规则不变")
-        return final_all
-    redo = {r["ruleid"] for r in plan}
-    second: list[dict] = []
-    for dev, rids in group_by_device({r: code_of.get(r, "") for r in redo}).items():
-        print(color(f"\n======== 强制替换：设备类型 {dev}：{len(rids)} 个 Rule ID ========", "bold"))
-        res = run_online(page, rids, dev, force_ids=set(rids))
-        second += read_final_status(page, rids, res, dev)
-    by = {r["ruleid"]: r for r in second}
-    merged = [by.get(r["ruleid"], r) for r in final_all]
-    ok_ = [r for r in second if r.get("status") == STATUS_ONLINE]
-    A.step("强制替换", A.OK if len(ok_) == len(redo) else (A.WARN if ok_ else A.FAIL),
-           f"强制替换 {len(ok_)}/{len(redo)} 条：" + "、".join(f"{r['ruleid']}→替换{r.get('conflict_ruleid') or '?'}"
-                                                              for r in ok_))
-    return merged
+def _confirm_force_upfront(ids: list[str], assume_yes: bool) -> bool:
+    """--force-replace：打开浏览器之前确认一次。之后遇到冲突当场替换，不再中途停下来问。"""
+    from .rule_info import compress_ids
+    print(color("\n======== --force-replace：强制替换 ========", "bold"))
+    print(f"  Rule ID：{compress_ids(sorted(ids, key=lambda x: int(x) if x.isdigit() else 0))}（{len(ids)} 个）")
+    print(color("  上线时遇到冲突，即使旧规则 mac组 为空（= 已对所有人放开）也会点『确定』替换，旧规则会被下线。", "yellow"))
+    print(color("  ⚠ 旧规则下线后，不在新规则 MAC 组里的设备在新规则放量前收不到升级；撤销不了。"
+                "想先看会替换哪些旧规则：加 --dry-run。", "yellow"))
+    if assume_yes:
+        print("  已指定 --yes：不再确认。")
+        return True
+    if not sys.stdin.isatty():
+        print(color("✗ 非交互终端无法确认，什么都没做（需要无人值守请加 --yes）。", "red"))
+        return False
+    try:
+        return input("  输入 yes 开始（遇到冲突就强制替换），其它任意输入取消：").strip().lower() == "yes"
+    except EOFError:
+        return False
 
 
 def _force_replace_preview(specs: list[str], device_override: str = "") -> int:
@@ -2178,6 +2172,9 @@ def _online_by_rule_ids(specs: list[str], device_override: str = "", force: bool
     print(color(f"[online] 按 Rule ID 上线：{len(ids)} 个", "bold"))
     print_sources(code_of, src, missing, color, lambda t: color("⚠ " + t, "yellow"))
     no_dev: list[str] = []
+    if force and not _confirm_force_upfront(ids, "--yes" in sys.argv[1:]):
+        A.step("强制替换", A.FAIL, "你没有确认，什么都没做（CMS 未修改）")
+        return 2
 
     final_all: list[dict] = []
     with sync_playwright() as p:
@@ -2199,11 +2196,15 @@ def _online_by_rule_ids(specs: list[str], device_override: str = "", force: bool
             groups = group_by_device(code_of)
             for dev, rids in groups.items():
                 print(color(f"\n======== 设备类型 {dev}：{len(rids)} 个 Rule ID ========", "bold"))
-                results = run_online(page, rids, dev)
+                # --force-replace：遇到冲突当场替换（旧规则 mac组 为空也替换；开始前你已确认）。
+                results = run_online(page, rids, dev, force_ids=set(rids) if force else None)
                 # 回读要在切换设备类型之前做：已选区的搜索带着当前设备类型过滤。
                 final_all += read_final_status(page, rids, results, dev)
             if force:
-                final_all = _force_replace_round(page, final_all, code_of)
+                forced = [r for r in final_all if r.get("forced") and r.get("status") == STATUS_ONLINE]
+                if forced:
+                    A.step("强制替换", A.OK, f"强制替换 {len(forced)} 条：" + "、".join(
+                        f"{r['ruleid']}→替换{r.get('conflict_ruleid') or '?'}" for r in forced))
         except Exception as e:
             print(color(f"✗ 运行出错：{e}", "red"))
             _shot(page, "active_error")
@@ -2243,7 +2244,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"
-        elif arg in ("--selftest", "--no-dass", "--auto-approve", "--force-replace", "--dry-run"):
+        elif arg in ("--selftest", "--no-dass", "--auto-approve", "--force-replace", "--dry-run", "--yes"):
             continue  # --selftest 在 __main__ 处理；--no-dass / --auto-approve 在 main 里读（只对 publish 生效）
         elif arg in _SUBCOMMANDS:
             if mode is not None:

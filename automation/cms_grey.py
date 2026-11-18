@@ -57,6 +57,8 @@ CMS_STAGE = {
     "ota20k-again": {"label": "20000阶段(20000)", "step": 20000, "name": "20000阶段", "total": None,
                      "prev_name": "20000阶段", "prev_total": None},
 }
+# 最近一次 run_grey_release 的结果（update 结束后的汇总邮件用）。
+LAST_RUN: dict = {}
 CHUNK = 20          # 每次最多处理的 Rule ID 数（列表一页 20 行，保证搜索结果一屏核对完）
 BATCH_TYPE = "批量灰度"
 def parse_count(text) -> int | None:
@@ -361,6 +363,9 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
     before_cnt: dict[str, int | None] = {}
     tested: list[str] = []
     done, already, mismatch, failed = [], [], [], []
+    LAST_RUN.clear()
+    LAST_RUN.update(option=option, done=done, already=already, mismatch=mismatch, failed=failed,
+                    before=before_cnt, dry_run=dry_run)
     browser = p.chromium.launch(headless=not config.HEADED)
     context = browser.new_context(viewport={"width": 1600, "height": 900})
     page = context.new_page()
@@ -512,6 +517,50 @@ def run_grey_release(p, option: str, code_of: dict, assume_yes: bool = False,
         browser.close()
 
 
+# CMS『阶段名称』→ (本地阶段, 下一步的内部阶段键)。全量 = 已完全开放，没有下一步。
+CMS_NEXT = {"测试阶段": ("场测", "ota50"), "50阶段": ("50", "ota200"), "200阶段": ("200", "ota1k"),
+            "1000阶段": ("1K", "ota5k"), "5000阶段": ("5K", "ota20k"), "20000阶段": ("20K", "ota20k-again"),
+            "全量": ("完全开放", None)}
+_COUNT_STAGE = {5: "测试阶段", 55: "50阶段", 255: "200阶段", 1255: "1000阶段", 6255: "5000阶段", -1: "全量"}
+
+
+def stage_of_row(row: dict) -> str:
+    """CMS 一行 → 标准阶段名称（以『阶段名称』为准；为空时按累计检测数推断）。认不出返回空串。"""
+    n = _norm_name(row.get("阶段名称"))
+    if n in CMS_NEXT:
+        return n
+    if "全量" in n:
+        return "全量"
+    c = parse_count(row.get("累计检测数"))
+    if not n and c is not None:
+        return _COUNT_STAGE.get(c, "20000阶段" if c > 26255 and (c - 6255) % 20000 == 0 else "")
+    return ""
+
+
+def read_stages(p, code_of: dict) -> dict:
+    """只读：在『在线规则』页查每个 Rule ID 的阶段。返回 {rid: {"阶段名称","累计检测数","stage"}}；不在线的不在结果里。"""
+    from .active_offline import group_by_device
+    out: dict[str, dict] = {}
+    browser = p.chromium.launch(headless=not config.HEADED)
+    context = browser.new_context(viewport={"width": 1600, "height": 900})
+    page = context.new_page()
+    try:
+        login(page)
+        open_online_rules(page)
+        for dev, rids in group_by_device(code_of).items():
+            if not set_device_type(page, dev):
+                continue
+            for part in chunks(rids):
+                for r in search_ids(page, part):
+                    if r.get("规则ID") in part:
+                        out[r["规则ID"]] = {"阶段名称": r.get("阶段名称", ""), "累计检测数": r.get("累计检测数", ""),
+                                           "stage": stage_of_row(r)}
+    finally:
+        context.close()
+        browser.close()
+    return out
+
+
 def _cms_detail(st, done, already, mismatch, failed) -> str:
     parts = []
     if done:
@@ -585,6 +634,12 @@ def _selftest() -> int:
     check("分块", [len(x) for x in chunks(list(range(45)))] == [20, 20, 5])
     check("搜索结果核对", _check_exact([{"规则ID": "1"}], ["1"]) == ""
           and "多出" in _check_exact([{"规则ID": "1"}, {"规则ID": "2"}], ["1"]))
+    check("CMS 阶段：按阶段名称；名称空时按累计检测数",
+          stage_of_row({"阶段名称": "5000阶段", "累计检测数": "6255"}) == "5000阶段"
+          and stage_of_row({"阶段名称": "", "累计检测数": "1,255"}) == "1000阶段"
+          and stage_of_row({"阶段名称": "", "累计检测数": "46255"}) == "20000阶段"
+          and stage_of_row({"阶段名称": "全量", "累计检测数": "-1"}) == "全量"
+          and stage_of_row({"阶段名称": "怪", "累计检测数": "7"}) == "")
     print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
     return 0 if good else 1
 

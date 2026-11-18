@@ -279,6 +279,92 @@ def export_csv() -> str:
     return p
 
 
+# ----------------------------------------------------------------------
+# 灰度进度（进度条）与每次 update 的记录
+# ----------------------------------------------------------------------
+STAGE_DISPLAY = {"场测": "场测", "50": "OTA50", "200": "OTA200", "1K": "OTA1000", "5K": "OTA5000",
+                 "20K": "OTA20000", "完全开放": "完全开放"}
+RUNS_NAME = "update_runs.jsonl"
+AGAIN_NOTE = "20K 再放一轮"
+
+
+def rounds_20k(rid: str, s: dict | None, events: list[dict] | None = None) -> int:
+    """20K 一共放了几轮：第一次到 20K 算 1，之后每条『20K 再放一轮』CMS 备注 +1；没到 20K 返回 0。"""
+    if not s or "20K" not in s.get("阶段", {}):
+        return 0
+    events = load_events() if events is None else events
+    extra = sum(1 for e in events if str(e.get("Rule ID", "")) == rid and e.get("类型") == "CMS"
+                and str(e.get("备注", "")).startswith(AGAIN_NOTE))
+    return 1 + extra
+
+
+def progress_cells(s: dict | None, rounds: int = 0) -> list[dict]:
+    """进度条每一格：[{stage, label, state: done/current/todo, date('11/17' 或 ''), rounds}]。"""
+    stages = (s or {}).get("阶段", {})
+    cur = (s or {}).get("当前阶段", "")
+    ci = STAGES.index(cur) if cur in STAGES else -1
+    out = []
+    for i, k in enumerate(STAGES):
+        t = str(stages.get(k, "") or "")
+        date = f"{t[5:7]}/{t[8:10]}" if len(t) >= 10 else ""
+        # 当前阶段之前的都算走过了（早期批次没有记录的只是没有日期，不往库里补记录）
+        state = "current" if k == cur else ("done" if (k in stages or i < ci) else "todo")
+        out.append({"stage": k, "label": STAGE_DISPLAY[k], "state": state, "date": date,
+                    "rounds": rounds if k == "20K" else 0})
+    return out
+
+
+def progress_line(s: dict | None, rounds: int = 0) -> str:
+    """'场测 ✓11/05 → OTA50 ✓11/06 → … → OTA5000 ●11/17 → OTA20000 ○ → 完全开放 ○'；没有记录返回空串。"""
+    if not s or not s.get("阶段"):
+        return ""
+    mark = {"done": "✓", "current": "●", "todo": "○"}
+    parts = []
+    for c in progress_cells(s, rounds):
+        x = f"{c['label']} {mark[c['state']]}{c['date']}"
+        if c["rounds"] > 1:
+            x += f"×{c['rounds']}"
+        parts.append(x)
+    return " → ".join(parts)
+
+
+def progress_bar(s: dict | None) -> str:
+    """'[■■■■■□□] 5K'；没有记录返回 '[□□□□□□□] -'。"""
+    cur = (s or {}).get("当前阶段", "")
+    n = STAGES.index(cur) + 1 if cur in STAGES else 0
+    return f"[{'■' * n}{'□' * (len(STAGES) - n)}] {cur or '-'}"
+
+
+def append_run(rec: dict) -> None:
+    """记一次 update（时间、Rule ID、阶段变化、结果、邮件）。写失败只提示。"""
+    try:
+        with open(_path(RUNS_NAME), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"（update 记录写入跳过：{e}）")
+
+
+def load_runs() -> list[dict]:
+    p = _path(RUNS_NAME)
+    if not os.path.isfile(p):
+        return []
+    out = []
+    for ln in open(p, encoding="utf-8"):
+        ln = ln.strip()
+        if ln:
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    return out
+
+
+def last_run_for(rid: str, runs: list[dict] | None = None) -> dict | None:
+    runs = load_runs() if runs is None else runs
+    hit = [r for r in runs if rid in r.get("ids", [])]
+    return hit[-1] if hit else None
+
+
 def timeline(s: dict | None) -> str:
     """'场测 2026-11-10 → 50 2026-11-12'；没有记录返回空串。"""
     if not s:
@@ -338,6 +424,13 @@ def _selftest() -> int:
             os.environ.pop("OTA_DEPLOY_DB_DIR", None)
         else:
             os.environ["OTA_DEPLOY_DB_DIR"] = old
+    _s = {"阶段": {"20K": "2026-11-13 10:00:00", "完全开放": "2026-11-18 09:00:00"}, "当前阶段": "完全开放"}
+    _c = progress_cells(_s)
+    check("进度：当前之前的都算走过（没记录的不写日期）",
+          [c["state"] for c in _c] == ["done"] * 6 + ["current"] and _c[5]["date"] == "11/13" and _c[0]["date"] == "")
+    check("进度条文字", progress_bar({"当前阶段": "5K"}) == "[■■■■■□□] 5K" and progress_bar(None) == "[□□□□□□□] -")
+    check("进度行：20K 两轮", "OTA20000 ●11/13×2" in progress_line(
+        {"阶段": {"5K": "2026-11-10 00:00:00", "20K": "2026-11-13 00:00:00"}, "当前阶段": "20K"}, 2))
     print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
     return 0 if good else 1
 

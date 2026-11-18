@@ -50,7 +50,21 @@ from ._log import ok as _ok, warn as _warn, err as _err, color as _c
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deployota prep",
-        description="OTA 模板 prep CLI：生成 Excel → 严格校验 → 场测 MAC 组 → 上传 S3。",
+        description="OTA 模板 prep：生成标准 Excel → 字段特征检查 → 严格校验 → 场测 MAC 组 → "
+                    "FTP 下载 / MD5 核对 → 上传 S3 → 最终检查。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例：
+  ./deployota prep --file 申请模板.xlsx --originator 康凯(Corki)
+  ./deployota prep --file 文本.txt --no-upload            演练：不碰 FTP / S3，MAC 组只查不改
+  ./deployota prep --file 文本.txt --mac-dry-run          MAC 组填好后点取消（看 artifacts/*_mac_before_save.png）
+  ./deployota prep --file 文本.txt --device-code MT9655AMAndrGTV --force
+  cat 文本.txt | ./deployota prep --device-code MT9655AMAndrGTV
+
+输入能识别：竖排 / Tab 表格、设备类型代码和特征码写在表格内或表格外；提示语竖排（语种<Tab>描述）、
+横排（第一行全是语种，如『日文<Tab>英文（…）』）、『语种 内容』；MAC 写完整 12 位或后 8 位。
+最终检查（任一 ✗ → 不上传、不记为『最近 prep』）：场测 MAC 组 / 字段特征 / 升级提示语 / 升级包 S3 / 规则行数。
+退出码：0 完成；1 生成 / 校验 / MAC 组 / 上传 / 最终检查失败；2 参数问题或你取消。""",
     )
     p.add_argument("--file", dest="file", default=None,
                    help="输入文件：.txt（升级信息文本）或 .xlsx/.xlsm（OTA 申请模板 Excel，直接解析；旧版 .xls 需先另存为 .xlsx）；"

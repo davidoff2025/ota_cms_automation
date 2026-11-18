@@ -3,13 +3,18 @@
   ./deployota update ota50  65370-65372 65380      Rule ID：单个 / 区间 / 逗号，可混用
   ./deployota update ota50  65370 --dry-run        测试模式：只在 CMS 走一遍流程，什么都不改
   ./deployota update ota200 65370-65379 --yes      跳过 CMS 执行前的 yes 确认
+  ./deployota update 65370-65379                   不写阶段：按 CMS『阶段名称』自动进到下一阶段
+                                                   （一批里阶段不同就分组，开始前确认一次，逐组执行）
 
 OPTION（只前进）：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
 
 流程：
   1) 按 Rule ID 从部署库取方案号、目标完整版本、设备扩展信息（老批次没明细时读来源 Excel）。
-  2) 成功率闸门（ota200 起）：报表里每个 Rule ID 的成功率都 ≥ 50% 才放行，逐个显示成功率；
-     不达标时在终端原样输入 override 可人工批复继续（--strict 则不询问、直接中止）。
+  2) 两道闸门（ota200 起；ota50 不检查）：
+       成功率：报表里每个 Rule ID 的成功率都 > 50%（正好 50% 不算）；
+       间隔：距进入上一阶段 > 48 小时（本地阶段记录；没有记录就用报表开放日期 +2 天）。
+     两道都通过 → 全自动：不再问 yes、20K 判断直接执行、DASS 写完自动提交（加 --confirm 恢复逐步确认）。
+     任一不通过 → 停下列出原因，原样输入 override 放行整组（--strict 则不询问、直接中止）。
   2b) 放 20K（ota20k）时，再按『源版本用户数』（同一张报表、同一行）整批判断：
      当前 5K：有一条 > 20000 → 放 20K；全部 ≤ 20000 → 直接完全开放（CMS 全量，DASS 完全开放）。
      当前已 20K：有一条 > 20000 → 再放一轮 20K（CMS 累计检测数 +20000，DASS 保持 OTA20000 不改）；
@@ -23,12 +28,19 @@ OPTION（只前进）：ota50 / ota200 / ota1k / ota5k / ota20k / ota-all
 
 选项：
   --dry-run       测试模式（不做闸门、不执行批量操作、不改 DASS）
+  --confirm       每一步都要你确认（CMS 执行前 yes、20K 判断 yes、DASS approve）；默认闸门通过就全自动
   --yes           跳过 CMS 执行前的确认
   --auto-approve  跳过 DASS 提交前的 approve：全部写入成功才自动提交（含逐组提交）；有没成功的仍要你确认。
                   不会绕过成功率闸门（闸门不达标照样要 override 或中止）
   --no-cms        不动 CMS，只更新 DASS（以 DASS 更新成功记录阶段）
   --strict        闸门不达标直接中止，不询问人工批复
   --skip-missing  部署库里解析不出的 Rule ID 跳过，其余照常（默认整体中止）
+  --mail-to "…"   放量汇总邮件额外收件人（固定 To 数据统计报告、Bcc devinw）
+  --no-mail       不发放量汇总邮件（照样记录、照样存 HTML）
+
+结束后：放量汇总（带灰度进度条）存到 OTADATA/reports/，发邮件给 数据统计报告（Bcc devinw）；
+  有规则放开才发（失败的条目也写进去）；执行了但一条都没放开 → 发失败通知；测试模式 / 取消 / 无变化不发。
+  每次 update 记录到 OTADATA/update_runs.jsonl，query / history 能看到灰度进度。
 退出码：0 成功；1 出错；2 参数问题 / 闸门未通过 / 有解析不出的；4 CMS 一个都没放开。
 """
 from __future__ import annotations
@@ -129,6 +141,8 @@ def main() -> int:
     argv = sys.argv[1:]
     if "--selftest" in argv:
         return _selftest()
+    from .mailer import pop_mail_to
+    argv = pop_mail_to(argv)          # --mail-to "…"：放量汇总邮件额外收件人
     if not argv or any(a in ("-h", "--help") for a in argv):
         print(__doc__)
         return 0 if argv else 2
@@ -138,13 +152,23 @@ def main() -> int:
     no_cms = "--no-cms" in argv
     dry_run = "--dry-run" in argv
     assume_yes = "--yes" in argv
+    no_mail = "--no-mail" in argv
+    confirm = "--confirm" in argv
+    if not confirm and not dry_run:
+        # 全自动：两道闸门（成功率 > 50%、间隔 > 48 小时）都通过就不再问任何确认；不通过照样停下等 override。
+        assume_yes = True
+        from .dass_fill import enable_auto_approve
+        enable_auto_approve()
+        print(color("（全自动：成功率 > 50%、间隔 > 48 小时两道闸门都通过就直接执行 CMS 灰度和 DASS 更新并提交；"
+                    "不通过会停下等你 override。加 --confirm 每一步都要你确认。）", "dim"))
     if "--auto-approve" in argv:
         from .dass_fill import enable_auto_approve
         enable_auto_approve()
     option = None
     specs: list[str] = []
     for a in argv:
-        if a in ("--skip-missing", "--strict", "--no-cms", "--yes", "--dry-run", "--auto-approve"):
+        if a in ("--skip-missing", "--strict", "--no-cms", "--yes", "--dry-run", "--auto-approve", "--no-mail",
+                 "--confirm"):
             continue
         if a == "init":
             print(err("init 需要 Excel（要插入新行），请用：./deployota dass init"), file=sys.stderr)
@@ -159,10 +183,6 @@ def main() -> int:
             return 2
         else:
             specs.append(a)
-    if not option:
-        print(err(f"缺少阶段。用法：./deployota update <{'|'.join(OPTIONS)}> <Rule ID / 区间 / 逗号分隔>"),
-              file=sys.stderr)
-        return 2
     if not specs:
         print(err("缺少 Rule ID。例：./deployota update ota200 65370-65379"), file=sys.stderr)
         return 2
@@ -175,16 +195,129 @@ def main() -> int:
         print(err(f"Rule ID 参数有误：{e}"), file=sys.stderr)
         return 2
     ids = list(dict.fromkeys(ids))
+    if not option:
+        # 没写阶段：按 CMS『阶段名称』自动进到下一阶段（一批里阶段不同就按阶段分组，一次确认后逐组执行）。
+        if no_cms:
+            print(err("--no-cms 时必须写阶段（自动判断要读 CMS）。"), file=sys.stderr)
+            return 2
+        groups = auto_plan(ids, assume_yes, dry_run)
+        if groups is None:
+            return 2
+        reports, rc = [], 0
+        for opt, gids in groups:
+            r, report = _one(opt, gids, skip_missing, strict, no_cms, assume_yes, dry_run,
+                             cms_yes=True, auto=True, title=f"update {opt}（自动下一阶段）")
+            reports.append(report)
+            rc = rc or r
+        from .update_report import finalize
+        finalize(reports, send=not no_mail)
+        return rc
+    r, report = _one(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run)
+    from .update_report import finalize
+    finalize([report], send=not no_mail)
+    return r
 
+
+def _one(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run, cms_yes=None, auto=False,
+         title: str = "") -> tuple[int, dict | None]:
+    """跑一组（一个阶段），返回 (退出码, 放量汇总)。汇总要在操作总结打印（finish）之前收集。"""
     from . import action_summary as A
-    A.start(f"update {option}" + ("（测试模式）" if dry_run else ""), ids)
+    from . import cms_grey
+    from .dass_perf import LAST_USERS
+    from .update_report import collect
+    cms_grey.LAST_RUN.clear()
+    LAST_USERS.clear()
+    A.start((title or f"update {option}") + ("（测试模式）" if dry_run else ""), ids)
     try:
-        return _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run)
+        rc = _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run, cms_yes=cms_yes, auto=auto)
+        return rc, collect(option, ids, dry_run=dry_run, no_cms=no_cms)
     finally:
         A.finish()
 
 
-def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
+def auto_plan(ids: list[str], assume_yes: bool, dry_run: bool) -> list[tuple[str, list[str]]] | None:
+    """读 CMS 每条的阶段 → 决定下一阶段，按阶段分组；打印计划、确认一次。返回 [(内部阶段键, Rule IDs)]；None = 不执行。"""
+    from playwright.sync_api import sync_playwright
+    from .active_offline import device_codes_for
+    from .cms_grey import read_stages
+    batches = depdb.load_all()
+    code_of, _no = device_codes_for(ids, batches)
+    for rec, _ in resolve_rules(ids, batches)[0]:
+        code_of.setdefault(rec["ruleid"], rec.get("方案号", ""))
+    print(color(f"update（自动下一阶段）：{len(ids)} 个 Rule ID —— 先在 CMS『在线规则』读当前阶段（只读）", "bold"))
+    with sync_playwright() as p:
+        cms = read_stages(p, {r: c for r, c in code_of.items() if c})
+    from .stage_db import build_state, load_events
+    plan, lines, skipped = plan_next(ids, cms, code_of, build_state(load_events()))
+    for ln in lines:
+        print(ln)
+    if not plan:
+        print(color("\n没有要放量的 Rule ID。", "yellow"))
+        return None
+    from .update_report import TRANSITION
+    print(color("\n计划（按阶段分组，逐组执行；每组照常：成功率闸门 → CMS 灰度 → DASS）：", "bold"))
+    for k, g in plan:
+        frm, to = TRANSITION[k]
+        tgt = "20K / 完全开放（看源版本用户数）" if k in ("ota20k", "ota20k-again") else to
+        print(f"  · {k:13} {frm} → {tgt}：{', '.join(g)}")
+    if skipped:
+        print(color(f"  不处理：{', '.join(skipped)}", "yellow"))
+    if dry_run:
+        print(color("（测试模式：不需要确认，下面每组只在 CMS 走一遍流程）", "dim"))
+        return plan
+    if assume_yes:
+        return plan
+    if not sys.stdin.isatty():
+        print(err("非交互终端无法确认，什么都没做（需要无人值守请加 --yes）。"))
+        return None
+    try:
+        go = input(f"  输入 yes 按上面的计划执行（{sum(len(g) for _, g in plan)} 个 Rule ID，"
+                   f"{len(plan)} 组），其它任意输入取消：").strip().lower() == "yes"
+    except EOFError:
+        go = False
+    if not go:
+        print("已取消，什么都没改。")
+        return None
+    return plan
+
+
+def plan_next(ids, cms: dict, code_of: dict, local: dict):
+    """纯逻辑：CMS 阶段 → 下一阶段分组。返回 (plan=[(内部阶段键, ids)], 打印行, 不处理的 ids)。"""
+    from .cms_grey import CMS_NEXT
+    from .update_report import TRANSITION
+    order = ["ota50", "ota200", "ota1k", "ota5k", "ota20k", "ota20k-again"]
+    groups: dict[str, list[str]] = {}
+    lines = [f"\n  {'Rule ID':8} {'设备类型代码':20} {'CMS 阶段（累计检测数）':22} {'本地记录':8}  本次"]
+    skipped = []
+    for rid in ids:
+        row = cms.get(rid)
+        loc = local.get(rid, {}).get("当前阶段", "") or "-"
+        dev = code_of.get(rid) or "-"
+        if not row:
+            why = "查不到设备类型代码" if dev == "-" else "不在线（CMS『在线规则』里搜不到）"
+            skipped.append(rid)
+            lines.append(f"  {rid:8} {dev:20} {'-':22} {loc:8}  ✗ {why}，不处理")
+            continue
+        shown = f"{row.get('阶段名称') or '?'}（{row.get('累计检测数') or '?'}）"
+        stage = row.get("stage", "")
+        if stage not in CMS_NEXT:
+            skipped.append(rid)
+            lines.append(f"  {rid:8} {dev:20} {shown:22} {loc:8}  ✗ 看不出是哪个阶段，不处理")
+            continue
+        loc_std, nxt = CMS_NEXT[stage]
+        mark = "" if loc in (loc_std, "-") else f"   ⚠ 本地记录是 {loc}，以 CMS 为准"
+        if nxt is None:
+            skipped.append(rid)
+            lines.append(f"  {rid:8} {dev:20} {shown:22} {loc:8}  已完全开放，跳过{mark}")
+            continue
+        groups.setdefault(nxt, []).append(rid)
+        frm, to = TRANSITION[nxt]
+        tgt = "20K / 完全开放" if nxt in ("ota20k", "ota20k-again") else to
+        lines.append(f"  {rid:8} {dev:20} {shown:22} {loc:8}  → {tgt}{mark}")
+    return [(k, groups[k]) for k in order if k in groups], lines, skipped
+
+
+def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run, cms_yes=None, auto=False) -> int:
     from . import action_summary as A
     batches = depdb.load_all()
     resolved, problems = resolve_rules(ids, batches)
@@ -208,7 +341,7 @@ def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
            + (f"；跳过解析不出的 {len(problems)} 个（--skip-missing）" if problems else ""))
 
     records = [rec for rec, _ in resolved]
-    if option == "ota20k":
+    if option == "ota20k" and not auto:
         # 放 20K：整批都在 20K → 再放一轮 20K；都在 5K（或没有记录）→ 第一次。混着就停。
         from .big_stage import start_option
         from .stage_db import build_state, load_events
@@ -247,7 +380,8 @@ def _run(option, ids, skip_missing, strict, no_cms, assume_yes, dry_run) -> int:
         code_of, _no_dev = device_codes_for([r["ruleid"] for r in records], batches)
         for r in records:  # 明细里的方案号就是设备类型代码，部署库查不到时用它兜底
             code_of.setdefault(r["ruleid"], r.get("方案号", ""))
-        before = lambda p, opt: run_grey_release(p, opt, code_of, assume_yes=assume_yes)
+        _cy = assume_yes if cms_yes is None else cms_yes   # 自动模式：开始前已确认过，CMS 执行前不再问
+        before = lambda p, opt: run_grey_release(p, opt, code_of, assume_yes=_cy)
         print(color("（流程：成功率闸门 → CMS 在线规则灰度放开 → DASS 更新阶段；加 --no-cms 只更新 DASS）", "dim"))
     else:
         A.step("CMS 灰度放开", A.SKIP, "--no-cms：不动 CMS")
@@ -296,6 +430,20 @@ def _selftest() -> int:
     check("重叠批次：新批次无明细时回退到旧批次的 Excel", len(r5) == 3 and p5 == [] and all("old.xlsx" in x[1] for x in r5))
     r6, p6 = resolve_rules(["7"], overlap, read_excel=lambda path: None)
     check("重叠批次都没有明细 → 问题里列出全部尝试", r6 == [] and "NEW_CMS" in p6[0][1] and "OLD_XLS" in p6[0][1])
+    # —— 不写阶段：按 CMS 阶段自动进到下一阶段 ——
+    cms = {"1": {"阶段名称": "测试阶段", "累计检测数": "5", "stage": "测试阶段"},
+           "2": {"阶段名称": "5000阶段", "累计检测数": "6255", "stage": "5000阶段"},
+           "3": {"阶段名称": "20000阶段", "累计检测数": "26255", "stage": "20000阶段"},
+           "4": {"阶段名称": "全量", "累计检测数": "-1", "stage": "全量"},
+           "5": {"阶段名称": "5000阶段", "累计检测数": "6255", "stage": "5000阶段"},
+           "7": {"阶段名称": "奇怪", "累计检测数": "9", "stage": ""}}
+    plan, lines, skipped = plan_next(["1", "2", "3", "4", "5", "6", "7"], cms, {r: "DEV" for r in "1234567"},
+                                     {"2": {"当前阶段": "1K"}, "5": {"当前阶段": "5K"}})
+    check("自动下一阶段：按 CMS 阶段分组、按阶段顺序",
+          plan == [("ota50", ["1"]), ("ota20k", ["2", "5"]), ("ota20k-again", ["3"])])
+    check("已完全开放 / 不在线 / 看不出阶段 → 不处理", skipped == ["4", "6", "7"])
+    check("本地记录和 CMS 不一致 → 提醒（以 CMS 为准）", any("本地记录是 1K，以 CMS 为准" in l for l in lines)
+          and not any("本地记录是 5K" in l for l in lines))
     print("\n自测结果：", "全部通过 ✅" if good else "存在失败 ❌")
     return 0 if good else 1
 

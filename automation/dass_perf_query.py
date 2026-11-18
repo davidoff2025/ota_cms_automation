@@ -1,6 +1,6 @@
 """DASS 升级成功率『独立查询 CLI』：命令行传入 方案号 + 目标版本 + 一组 Rule ID，
 复用 dass_perf 的绩效页查询/解析逻辑，做【只读】的 Stage1 模糊查询，对每个目标 Rule ID
-打印成功率、是否 >= 50%、来源阶段，最后给出汇总。
+打印成功率、是否 > 50%、来源阶段，最后给出汇总。
 
 用法：
     cd ota_cms_automation
@@ -25,7 +25,7 @@ Rule ID 位置参数支持区间与逗号混合：
 不注册任何 prompt 应答。关键节点用 _shot 截图。
 
 返回码：
-    0  全部找到且全部通过（成功率 >= 50%）
+    0  全部找到且全部通过（成功率 > 50%）
     1  有不通过 / 未找到 / 成功率解析失败
     2  参数非法 / 绩效页列缺失（安全失败）
 """
@@ -45,6 +45,7 @@ from .dass_perf import (
     navigate_to_perf,
     query_rates_stage1,
     PASS_THRESHOLD,
+    rate_passes,
 )
 
 # 区间段：两端为纯数字、中间一个连字符（允许两侧空白）。
@@ -195,7 +196,7 @@ def _print_report(targets: list[str], rates: dict, pages: int = 1) -> tuple[list
 
     rates 为 query_rates_stage1 的返回 dict（键为 norm_ruleid）。pages 为跨页遍历
     实际翻过的页数，用于『未找到（Stage1，已遍历全部 N 页）』提示。
-    判定：命中且 rate >= PASS_THRESHOLD -> 通过；命中但 rate < 阈值 -> 不通过；
+    判定：命中且 rate > PASS_THRESHOLD -> 通过；命中但 rate ≤ 阈值 -> 不通过；
     命中但 rate 为 None（解析失败）-> 不通过（标成功率解析失败）；未命中 -> 未找到。
     """
     failed: list[str] = []
@@ -214,7 +215,7 @@ def _print_report(targets: list[str], rates: dict, pages: int = 1) -> tuple[list
                 "red"))
             failed.append(rid)
             continue
-        passed = rate >= PASS_THRESHOLD
+        passed = rate_passes(rate)
         mark = color("通过 ✅", "green") if passed else color("不通过 ❌", "red")
         print(f"  Rule ID={rid}  成功率={rate:.2f}%  {mark}  （Stage1）")
         if not passed:
@@ -247,7 +248,7 @@ def _print_all(rates: dict, pages: int = 1) -> None:
     """--all 模式：把 Stage1 查到的【每一行】都打印出来（不做任何过滤、不触发 abort）。
 
     rates 为 query_rates_stage1 的返回 dict（键为 norm_ruleid）。按 norm_ruleid 升序
-    （数字优先）逐行打印 raw_ruleid / norm_ruleid / 成功率文本 / 解析 float / 是否 >=50%，
+    （数字优先）逐行打印 raw_ruleid / norm_ruleid / 成功率文本 / 解析 float / 是否 >50%，
     末尾打印汇总：总行数、Rule ID 范围（最小 ~ 最大）。
     """
     print(f"\n======== 全部 Rule ID 及成功率（Stage1 模糊查询，已遍历全部 {pages} 页）========")
@@ -268,10 +269,10 @@ def _print_all(rates: dict, pages: int = 1) -> None:
             ge = "否"
         else:
             parsed = f"{rate:.2f}"
-            ge = "是" if rate >= PASS_THRESHOLD else "否"
+            ge = "是" if rate_passes(rate) else "否"
         print(
             f"  Rule ID 原始显示值={raw!r} 归一值={rid}  "
-            f"成功率={rate_text!r}（解析={parsed}）  >=50%? {ge}"
+            f"成功率={rate_text!r}（解析={parsed}）  >50%? {ge}"
         )
     print("\n======== 汇总 ========")
     print(f"  总行数：{len(keys)}")
@@ -511,8 +512,8 @@ def _selftest() -> int:
     check("_print_all 汇总总行数=3", "总行数：3" in out)
     check("_print_all 汇总范围=64807 ~ 64923", "Rule ID 范围：64807 ~ 64923" in out)
     check("_print_all 对解析失败行标注『解析失败』", "解析=解析失败" in out)
-    check("_print_all 对 >=50% 行标『是』", ">=50%? 是" in out)
-    check("_print_all 对 <50% 行标『否』", ">=50%? 否" in out)
+    check("_print_all 对 >50% 行标『是』", ">50%? 是" in out)
+    check("_print_all 对 ≤50% 行标『否』", ">50%? 否" in out)
 
     # 空 dict 不崩，且汇总显示 0 行。
     buf2 = io.StringIO()

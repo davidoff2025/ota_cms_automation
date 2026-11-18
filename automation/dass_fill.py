@@ -930,7 +930,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
                 "  --only 65394-65399,65401：只填这些 Rule ID（如 publish 有冲突未上线时补做 DASS）；\n"
                 "                其余行不填，汇总邮件里标『冲突未上线』。\n"
                 "  --mail-to \"王敏 <wangmin3@hisense.com>; …\"：最后汇总邮件的收件人（不给就弹出输入框）；\n"
-                "                固定抄送发件人和 devinw@hisense.com。\n"
+                "                固定抄送 数据统计报告 <sys.datareports@hisense.com>，密送 devinw@hisense.com。\n"
                 "  填写完成后记录阶段『场测』，并把本批写入部署库。publish 第 4 步就是它。\n\n"
                 "放量（ota50 起）请用 ./deployota update <ota50|ota200|ota1k|ota5k|ota20k|ota-all> <Rule ID>。\n"
                 "（旧用法 dass <otaXX> <Excel> 仍可用，但不经过 CMS 灰度，不推荐。）\n"
@@ -1140,8 +1140,9 @@ def main() -> int:
     return execute(option, records, excel, allow_gate_override="--strict" not in sys.argv[1:])
 
 
-def _gate_override(allow: bool) -> bool:
-    """成功率闸门未通过时，询问是否『人工批复』继续。只有终端里原样输入 override 才算批复。
+def _gate_override(allow: bool, reasons: list[str] | None = None) -> bool:
+    """闸门（成功率 / 间隔）未通过时，询问是否『人工批复』继续。只有终端里原样输入 override 才算批复。
+    一次 override 放行整组。
 
     allow=False（--strict）或非交互终端 → 不询问，直接 False（中止，保持原行为）。
     这是人工兜底：脚本绝不会自动绕过闸门；默认回答（直接回车）就是中止。
@@ -1151,14 +1152,16 @@ def _gate_override(allow: bool) -> bool:
     if not sys.stdin.isatty():
         print(color("（非交互终端，无法人工批复，按闸门结果中止。）", "dim"))
         return False
-    print(color("\n⚠ 成功率闸门未通过。上面的『逐条明细』列出了每个 Rule ID 的成功率。", "yellow"))
-    print(color("  如果你已评估风险并决定继续，可以人工批复：继续更新 DASS（之后仍需你核对并输入 approve 才提交）。", "yellow"))
+    print(color("\n⚠ 闸门未通过，需要你人工决定：", "yellow"))
+    for r in (reasons or ["成功率闸门未通过（见上面的逐条明细）"]):
+        print(color(f"  · {r}", "yellow"))
+    print(color("  如果你已评估风险并决定继续，可以人工批复（override）：整组继续执行 CMS 灰度和 DASS 更新。", "yellow"))
     try:
         ans = input("  输入 override 并回车 = 人工批复继续；其它任意输入（或直接回车）= 中止：").strip()
     except EOFError:
         ans = ""
     if ans == "override":
-        print(color("⚠ 已人工批复：成功率闸门未通过，仍继续更新 DASS。", "yellow"))
+        print(color("⚠ 已人工批复（override）：闸门未通过，整组继续执行。", "yellow"))
         return True
     return False
 
@@ -1213,7 +1216,8 @@ def execute(option: str, records: list[dict], excel: str | None = None,
             # 全部 >= 50% 才放行；任一 < 50% 或两阶段都查不到 -> abort（不 run_update、
             # 不进入人工提交环节）。ota50 / init 不校验。
             from . import action_summary as A
-            GATE = "成功率闸门（每个 Rule ID ≥ 50%）"
+            GATE = "成功率闸门（每个 Rule ID > 50%）"
+            GATE_T = "间隔闸门（距上一阶段 > 48 小时）"
             if option not in GATE_OPTIONS:
                 A.step(GATE, A.SKIP, f"{option} 不检查成功率")
                 if option != "init":
@@ -1238,16 +1242,37 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     _shot(page, "perf_no_frame")
                     A.step(GATE, A.FAIL, "打不开安卓升级展示报表，无法校验，已中止")
                     return 2
-                if not check_success_rate(fr_perf, page, records, option):
-                    if not _gate_override(allow_gate_override):
-                        print(color("\n⛔ 成功率闸门未通过：中止本次升级事务，"
-                                    "run_update 未执行，不进入人工提交环节。", "red"))
-                        A.step(GATE, A.FAIL, "有 Rule ID 成功率 < 50% 或查不到，已中止（CMS、DASS 都没动）")
+                rate_ok = check_success_rate(fr_perf, page, records, option)
+                # ———— 间隔闸门：距进入上一阶段 > 48 小时（本地阶段记录；没有就用报表开放日期 +2 天）————
+                from .dass_perf import LAST_OPEN
+                from .gates import check_interval, format_interval
+                from .stage_db import build_state, load_events
+                _ev = load_events()
+                _ids = list(dict.fromkeys(norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))))
+                _iv = check_interval(_ids, option, build_state(_ev), _ev, dict(LAST_OPEN))
+                for _ln in format_interval(_iv, PREV_STAGE.get(option, "上一阶段")):
+                    print(_ln)
+                int_bad = [x for x in _iv if not x["ok"]]
+                reasons = []
+                if not rate_ok:
+                    reasons.append("成功率：有 Rule ID ≤ 50% 或查不到（见上面的成功率逐条明细）")
+                if int_bad:
+                    def _why(x):
+                        return "不知道开放了多久" if x["need"] is None else f"还差 {x['need']:.1f} 小时"
+                    reasons.append("间隔：" + "、".join(f"{x['rid']}（{_why(x)}）" for x in int_bad))
+                A.step(GATE, A.OK if rate_ok else A.FAIL, "全部 > 50%，放行" if rate_ok else "有 Rule ID ≤ 50% 或查不到")
+                A.step(GATE_T, A.OK if not int_bad else A.FAIL,
+                       "全部 > 48 小时" if not int_bad else f"{len(int_bad)} 条不满足：" + "、".join(x["rid"] for x in int_bad))
+                if reasons:
+                    if not _gate_override(allow_gate_override, reasons):
+                        print(color("\n⛔ 闸门未通过：中止本次放量，CMS、DASS 都没动。", "red"))
                         return 2
-                    A.step(GATE, A.WARN, "未达标，你已人工批复（override）继续")
+                    if not rate_ok:
+                        A.step(GATE, A.WARN, "未达标，你已人工批复（override）继续")
+                    if int_bad:
+                        A.step(GATE_T, A.WARN, f"{len(int_bad)} 条不满足，你已人工批复（override）继续")
                 else:
-                    print(color("\n✅ 成功率闸门通过，继续执行升级 DASS。", "green"))
-                    A.step(GATE, A.OK, "全部 ≥ 50%，放行")
+                    print(color("\n✅ 成功率、间隔两道闸门都通过，继续执行。", "green"))
 
             # ———— 放 20K：按『源版本用户数』决定 20K / 再一轮 20K / 完全开放（整批一起）————
             if option in ("ota20k", "ota20k-again"):

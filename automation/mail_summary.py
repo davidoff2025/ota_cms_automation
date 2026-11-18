@@ -30,7 +30,19 @@ def find_batch(rule_id: str) -> tuple[dict | None, str]:
 
 def main() -> int:
     from .mailer import RECIPIENTS_ENV, SkipMail, approve_and_send, ask_recipients, plan_recipients
-    p = argparse.ArgumentParser(prog="deployota mail", description="给已经部署的批次补发 HTML 部署汇总邮件。")
+    p = argparse.ArgumentParser(
+        prog="deployota mail", description="给已经部署的批次补发 HTML 部署汇总邮件（不碰 CMS / DASS / S3）。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例：
+  ./deployota mail 65391
+  ./deployota mail 65391 --originator "康凯(Corki)"
+  ./deployota mail 65391 --mail-to "王敏 <wangmin3@hisense.com>; 于洪 <yuhong@hisense.com>"
+
+流程：打印汇总、生成 HTML（存到 Excel 旁边 <Excel 名>.summary.html）→ 收件人输入框（可粘贴 Outlook 收件人串，
+多行也行，粘贴完再按一次回车；回车 = 发送，r = 重新输入，n = 不发）→ 显示草稿 → 输入 approve 才发送。
+收件人 = 你粘贴的人（devinw / 数据统计报告会自动去掉）；抄送 数据统计报告 <sys.datareports@hisense.com>；
+密送 devinw@hisense.com。汇总里每条带上线状态（已上线 / 冲突未上线）。""")
     p.add_argument("rule_id", help="这批里的任意一个 Rule ID，如 65391")
     p.add_argument("--originator", default=None, help="发起人姓名（不给则用 prep 时记的 / 部署库里的）")
     p.add_argument("--mail-to", dest="mail_to", default=None, help="收件人（Outlook 收件人串）；不给就弹出输入框")

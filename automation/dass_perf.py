@@ -1,5 +1,5 @@
 """升级成功率闸门：在『升级 DASS』(run_update) 之前，对本批 Excel 每个 Rule ID 的
-升级成功率做校验。全部 >= 50% 才放行升级；任一 < 50%，或两阶段都查不到该 Rule ID，
+升级成功率做校验。全部 > 50% 才放行升级；任一 ≤ 50%，或两阶段都查不到该 Rule ID，
 则 abort 整个事务（run_update 不执行，也不进入人工提交环节）。
 
 用法（通常由 dass_fill.main() 在 option != 'init' 分支里、run_update 之前调用）：
@@ -18,7 +18,7 @@ ota50 / init 不校验（见 GATE_OPTIONS）。
 成功率来源：绩效页现成百分比列 **『升级成功率』**（列字母 Z），值形如 '28.26%'。
 直接解析该百分比文本（去 % 转 float），不自行用设备数计算。
 
-通过阈值：rate >= 50.0 判为通过（含等于，50.00% 放行）。
+通过阈值：rate > 50.0 判为通过（正好 50.00% 不通过）。
 
 两阶段匹配（与 run_update 同构）：
   Stage1（模糊/粗筛）：按 方案号 + 目标版本 查询（limit 100），结果里按 norm_ruleid 对齐，
@@ -34,7 +34,7 @@ ota50 / init 不校验（见 GATE_OPTIONS）。
     设备扩展信息过滤值取自该 Rule ID 对应 Excel 记录的『设备扩展信息』字段，与 run_update
     Stage2 的取值方式一致。『当前阶段』过滤值用该档位的上一阶段 PREV_STAGE[option]，与
     run_update Stage1 的递进逻辑一致（绩效页该列表头可能叫『当前策略』，但过滤框即 DEVICEMSG
-    旁的 CURRENTSTAGE 框）。闸门对外可见行为（全部 >=50% 放行、否则 abort）不变。
+    旁的 CURRENTSTAGE 框）。闸门对外可见行为（全部 > 50% 放行、否则 abort）不变。
 
 安全失败：成功率/ruleid 列字母解析不到、或成功率文本无法解析（空值/缺列）时，一律按
 『未找到/不通过』处理并 abort 升级，绝不默认放行。
@@ -57,6 +57,11 @@ GATE_OPTIONS = {"ota200", "ota1k", "ota5k", "ota20k", "ota-all", "ota5k-all", "o
 
 # 通过阈值（含等于）。
 PASS_THRESHOLD = 50.0
+
+
+def rate_passes(rate) -> bool:
+    """成功率闸门：必须【大于】50%（正好 50.00% 不算通过）；None（查不到 / 解析失败）不通过。"""
+    return rate is not None and rate > PASS_THRESHOLD
 
 # —— 绩效页顶部过滤框选择器（实测，见 perf-probe-findings.md 补探测）——
 # 方案号/目标版本/当前阶段 的 <input> 带 name 属性，直接用 input[name=...]。
@@ -106,6 +111,8 @@ PERF_USERS_HEADER = "源版本用户数"   # 放 20K 时按它决定 20K / 再�
 LAST_USERS: dict = {}
 # 用户数的来源说明：{norm_ruleid: '' （按上一阶段查到）或 '报表阶段 OTA1000，仅供参考'}。
 LAST_USERS_NOTE: dict = {}
+# 报表里按上一阶段查到的那一行的『当前阶段开放时间』（只有日期，如 20261106）：间隔闸门的兜底来源。
+LAST_OPEN: dict = {}
 
 # 绩效页菜单叶子（实测以『安卓升级展示报表』为准；任务原称『安卓升级展示绩效』）。
 PERF_MENU_LEAF_CANDIDATES = ["安卓升级展示报表", "安卓升级展示绩效"]
@@ -676,7 +683,7 @@ def _diagnose_missing(fr, page, missing: list[str], excel_by_ruleid: dict, want_
 
 
 def check_success_rate(fr, page, records, option: str) -> bool:
-    """成功率闸门：对本批每个 Rule ID 求成功率，全部 >= 50% 返回 True（放行升级），
+    """成功率闸门：对本批每个 Rule ID 求成功率，全部 > 50% 返回 True（放行升级），
     任一 < 50% 或两阶段都查不到 -> 打印逐条明细后返回 False（abort）。
 
     - option 不在 GATE_OPTIONS（即 ota50/init）时不应校验；此处若被误调用，直接放行 True
@@ -731,6 +738,7 @@ def check_success_rate(fr, page, records, option: str) -> bool:
                         "stage": "Stage1",
                         "rate_text": info["rate_text"],
                         "users_text": info.get("users_text", ""),
+                        "open_text": info.get("open_text", ""),
                     }
 
     # ———— Stage2：对 Stage1 未命中的 Rule ID 逐个精准查询 ————
@@ -761,6 +769,7 @@ def check_success_rate(fr, page, records, option: str) -> bool:
                 "stage": "Stage2",
                 "rate_text": matches[0].get("rate_text", ""),
                 "users_text": matches[0].get("users_text", ""),
+                "open_text": matches[0].get("open_text", ""),
             }
         else:
             found_rate[rid] = {"rate": None, "stage": "未找到", "rate_text": ""}
@@ -802,8 +811,11 @@ def check_success_rate(fr, page, records, option: str) -> bool:
     from .big_stage import parse_users
     LAST_USERS.clear()
     LAST_USERS_NOTE.clear()
+    LAST_OPEN.clear()
     for rid in excel_ruleids:
         info = found_rate.get(rid, {})
+        if info.get("stage") in ("Stage1", "Stage2") and info.get("open_text"):
+            LAST_OPEN[rid] = info["open_text"]
         if info.get("stage") in ("Stage1", "Stage2"):
             LAST_USERS[rid], LAST_USERS_NOTE[rid] = parse_users(info.get("users_text")), ""
         elif (info.get("fallback") or {}).get("users_text"):
@@ -842,12 +854,12 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
 
     - 逐条：对 sorted(excel_ruleids) 每个 Rule ID 打印一行，无论通过与否都打印，含
       Rule ID、升级成功率（命中可解析 -> '49.09%'；未找到 -> '未找到'；命中但解析失败 ->
-      '成功率解析失败（原文 ...）'）、是否 >=50%（'通过 ✅' / '不通过 ❌'）、来源阶段
+      '成功率解析失败（原文 ...）'）、是否 > 50%（'通过 ✅' / '不通过 ❌'）、来源阶段
       （Stage1 / Stage2 / 未找到）。
     - 汇总：总数 / 通过数 / 不通过数 / 未找到数。
     - 结论：无 failures -> 『放行 ✅』；有 failures -> 『abort ❌』。
 
-    判定（与原行为一致）：rate 为 None（未找到/解析失败）或 rate < PASS_THRESHOLD 记为失败。
+    判定（与原行为一致）：rate 为 None（未找到/解析失败）或 rate ≤ PASS_THRESHOLD 记为失败。
     """
     rids = sorted(excel_ruleids)
     lines: list[str] = []
@@ -879,7 +891,7 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
             failures.append(rid)
         else:
             rate_desc = f"升级成功率={rate:.2f}%"
-            if rate >= PASS_THRESHOLD:
+            if rate_passes(rate):
                 verdict = color("通过 ✅", "green")
                 pass_n += 1
             else:
@@ -895,13 +907,13 @@ def format_gate_report(excel_ruleids, found_rate: dict) -> tuple[str, bool]:
     if not failures:
         lines.append(color("\n======== 最终结论：放行 ✅ ========", "green"))
         lines.append(color(
-            f"  本批 {len(rids)} 个 Rule ID 成功率均 >= {PASS_THRESHOLD:.0f}%，放行升级。", "green"))
+            f"  本批 {len(rids)} 个 Rule ID 成功率均 > {PASS_THRESHOLD:.0f}%，放行升级。", "green"))
         return "\n".join(lines), True
 
     lines.append(color("\n======== 最终结论：abort ❌ 中止升级 ========", "red"))
     lines.append(color(
         f"  以下 {len(failures)} 个 Rule ID 未达标"
-        f"（< {PASS_THRESHOLD:.0f}% 或两阶段都查不到）：{failures}", "red"))
+        f"（≤ {PASS_THRESHOLD:.0f}% 或两阶段都查不到）：{failures}", "red"))
     lines.append(color("  run_update 不执行，也不进入人工提交环节。", "red"))
     return "\n".join(lines), False
 
@@ -945,8 +957,9 @@ def _selftest() -> int:
     check("非数字 '--' -> None", parse_percent("--") is None)
 
     # 阈值判定（含等于放行）
-    check("50.00% 放行 (>=50)", parse_percent("50.00%") >= PASS_THRESHOLD)
-    check("49.30% 不放行", not (parse_percent("49.30%") >= PASS_THRESHOLD))
+    check("50.00% 不放行（必须 > 50%）", not rate_passes(parse_percent("50.00%")))
+    check("50.01% 放行", rate_passes(parse_percent("50.01%")))
+    check("49.30% 不放行", not rate_passes(parse_percent("49.30%")))
 
     # norm_ruleid 对齐
     check("'65,196' 与 '65196' 对齐", norm_ruleid("65,196") == norm_ruleid("65196"))
@@ -961,7 +974,7 @@ def _selftest() -> int:
 
     # 查不到的 Rule ID 触发 abort 的判定逻辑（rate=None => 失败）
     none_rate = None
-    check("成功率 None 判为不通过", not (none_rate is not None and none_rate >= PASS_THRESHOLD))
+    check("成功率 None 判为不通过", not rate_passes(none_rate))
 
     # —— A：闸门 Stage1 三字段 filters 构造 ——
     f200 = build_gate_stage1_filters("P", "T", "ota200")
@@ -1002,11 +1015,13 @@ def _selftest() -> int:
 
     # 全部通过 -> 放行
     found_pass = {
-        "201": {"rate": 50.0, "stage": "Stage1", "rate_text": "50.00%"},  # 等于阈值放行
+        "201": {"rate": 50.01, "stage": "Stage1", "rate_text": "50.01%"},  # 刚好高于阈值放行
         "202": {"rate": 88.0, "stage": "Stage2", "rate_text": "88.00%"},
     }
     report2, passed2 = format_gate_report({"201", "202"}, found_pass)
-    check("全部 >=50% 放行", passed2 is True)
+    _r3, passed3 = format_gate_report({"203"}, {"203": {"rate": 50.0, "stage": "Stage1", "rate_text": "50.00%"}})
+    check("正好 50.00% → 不放行", passed3 is False)
+    check("全部 > 50% 放行", passed2 is True)
     check("放行结论含『放行』", "放行" in report2)
     check("放行汇总 通过：2 不通过：0 未找到：0",
           "通过：2" in report2 and "不通过：0" in report2 and "未找到：0" in report2)

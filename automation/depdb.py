@@ -317,6 +317,24 @@ def _print_history(limit: int | None, device: str | None,
     void_n = len(all_rows) - active_n
     print(color(f"========== OTA 部署历史（显示最近 {len(shown)} 条 / 共 {len(all_rows)} 条："
                 f"有效 {active_n} / 作废 {void_n}，存储：{db_dir()}）==========", "bold"))
+    from . import stage_db as _sd
+    _state = _sd.build_state(_sd.load_events())
+
+    def _progress(rec: dict) -> str:
+        """这一批的灰度进度：'[■■■■■□□] 5K'；一批里阶段不同时 '5K×4/完全开放×1'。"""
+        rids = [x.strip() for x in str(rec.get("Rule ID列表", "")).split(",") if x.strip()]
+        cur = [(_state.get(x) or {}).get("当前阶段", "") for x in rids]
+        known = [c for c in cur if c]
+        if not known:
+            return "[□□□□□□□] -"
+        if len(set(cur)) == 1:
+            return _sd.progress_bar(_state.get(rids[0]))
+        from collections import Counter
+        top = max(known, key=lambda c: _sd.STAGES.index(c))
+        cnt = Counter(c or "-" for c in cur)
+        order = sorted(cnt, key=lambda c: _sd.STAGES.index(c) if c in _sd.STAGES else -1)
+        return _sd.progress_bar({"当前阶段": top}).split(" ")[0] + " " + "/".join(f"{c}×{cnt[c]}" for c in order)
+
     for r in shown:
         status = str(r.get("状态", STATUS_ACTIVE))
         is_void = status == STATUS_VOID
@@ -327,7 +345,7 @@ def _print_history(limit: int | None, device: str | None,
         tgt = tgt if is_full else f"{tgt}（版本变化，无完整版本）"
         line = (f"· Rule ID {r.get('Rule ID范围',''):15}（{r.get('规则条数','')} 条）  {tag}  "
                 f"{r.get('设备类型代码',''):18} {r.get('源版本','')} → {tgt}  "
-                f"[{r.get('升级类型','')}]  发起人={who}  {r.get('部署时间','')}{extra}")
+                f"[{r.get('升级类型','')}]  {_progress(r)}  发起人={who}  {r.get('部署时间','')}{extra}")
         print(color(line, "dim") if is_void else line)
 
     # —— 总体统计 summary（基于 all_rows：过滤后的全部记录，不受 --limit 截断影响）——
@@ -462,7 +480,16 @@ def main() -> int:
     import argparse
     import sys
     p = argparse.ArgumentParser(prog="deployota history",
-                                description="查看 OTA 部署历史（JSONL 主存，CSV 可导出）。")
+                                description="查看 OTA 部署历史（最新的在最上面；同一天 Rule ID 大的在前）+ 全库统计。",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="""\
+示例：
+  ./deployota history                          最近 20 条
+  ./deployota history --limit 0                全部
+  ./deployota history --device MT9655 --limit 50
+  ./deployota history --originator 康凯         按发起人
+  ./deployota history --rule 65370             这个 Rule ID 属于哪一批
+  ./deployota history --export                 重新导出 CSV（OTADATA/deployments.csv）""")
     p.add_argument("--device", default=None, help="按设备类型代码过滤（子串匹配）。")
     p.add_argument("--originator", default=None, help="按发起人过滤（子串匹配）。")
     p.add_argument("--rule", default=None,

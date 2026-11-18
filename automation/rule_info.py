@@ -241,7 +241,9 @@ def _print_stage_lines(hit_ids: list[str]) -> None:
     from . import stage_db
     if _STAGE_STATE is None:
         _STAGE_STATE = stage_db.build_state(stage_db.load_events())
-    print("    灰度阶段：")
+    events = stage_db.load_events()
+    runs = stage_db.load_runs()
+    print("    灰度进度：")
     for rid in sorted(hit_ids, key=lambda x: int(x) if x.isdigit() else 0):
         st = _STAGE_STATE.get(rid)
         if not st:
@@ -249,7 +251,17 @@ def _print_stage_lines(hit_ids: list[str]) -> None:
             continue
         note = f"，{st['CMS备注']}" if st.get("CMS备注") else ""
         cms = f"  CMS={st['CMS状态']}（{st['CMS状态时间'][:16]}{note}）" if st["CMS状态"] else ""
-        print(f"      {rid}  当前={st['当前阶段'] or '-'}  {stage_db.timeline(st) or '-'}{cms}")
+        bar = stage_db.progress_bar(st)
+        print(f"      {rid}  {bar}{cms}")
+        line = stage_db.progress_line(st, stage_db.rounds_20k(rid, st, events))
+        if line:
+            print(color(f"             {line}", "dim"))
+        last = stage_db.last_run_for(rid, runs)
+        if last:
+            res = ("已放开" if rid in last.get("done", []) else
+                   "失败" if rid in [x[0] for x in last.get("failed", [])] else "未放开")
+            print(color(f"             最近一次 update：{last.get('time', '')[:16]}  {last.get('from', '')} → "
+                        f"{last.get('to', '')}  {res}", "dim"))
         for line in stage_db.conflict_lines(st):
             print(color(f"             冲突：{line}", "yellow"))
 
