@@ -18,7 +18,7 @@
 
 真实上传前置条件（仅在不带 --no-upload 时需要）：
   - FTP：config/.env 里的 OTA_FTP_PASS（及可选 OTA_FTP_USER）非占位值。
-  - AWS：区域/密钥不在 .env 里配置，走 boto3 默认链（~/.aws），region=us-west。
+  - AWS：密钥在 ~/.aws/credentials，用哪一组由 config/.env 的 AWS_PROFILE 指定（现为 s3-androidota），region=us-west-2。
 『真实 S3 上传 / FTP 下载』是不可逆的外部 I/O；要安全演练请始终带 --no-upload。
 
 返回码：

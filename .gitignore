@@ -14,3 +14,7 @@ automation/otagen/data/device_history.json
 .last_prep.json
 # editor
 .vscode/
+
+# 编辑器临时文件（vim 打开 .env 时的 .env.swp 可能含密码）
+*.swp
+*.swo

@@ -55,7 +55,8 @@ cp config/.env.example config/.env      # 然后编辑 config/.env 填入真实�
 | 部署汇总邮件（可选） | `OTA_SMTP_HOST`、`OTA_SMTP_PORT`、`OTA_SMTP_USER`、`OTA_SMTP_PASS`、`OTA_MAIL_CC` / `OTA_MAIL_BCC`（可选） |
 
 - 凭据只从 `config/.env` 读取，该文件已在 `.gitignore`，不会被提交。
-- AWS 区域和密钥不写在 `.env`，走 boto3 默认链（`~/.aws`、实例角色或环境变量）。
+- AWS 密钥不写在 `.env`：放在 `~/.aws/credentials`，用哪一组由 `config/.env` 的 `AWS_PROFILE` 指定（现为 `s3-androidota`，区域 us-west-2）。
+  换密钥：改 `~/.aws/credentials` 里 `[s3-androidota]` 的两行；换成另一组：改 `AWS_PROFILE`。
 - `CMS_HEADED=true`（默认）开可见浏览器；`false` 在后台运行、不显示页面，截图照常存到 `artifacts/`。
 
 ### 后台运行与跳过 DASS 确认
