@@ -1203,7 +1203,7 @@ def _click_replace_cancel(page) -> bool:
     return _click_button_in(modal, page, "取消", "规则替换-取消")
 
 
-def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
+def run_online(page, rule_ids: list[str], device_code: str = "", force_ids: set | None = None) -> list[dict]:
     """阶段2：逐条上线 + 冲突处理（D6/D7/D8）。返回每个 Rule ID 的处理 result 列表。
 
     D8：先打印待上线 Rule ID 清单。对每个 rule_id：待选区搜出→点上线→确认框点确定→轮询冲突弹窗：
@@ -1212,7 +1212,10 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
           非空 → 点『确定』替换 → 记 online；
           空/不确定(D-e) → 点『取消』中止该条、记冲突中止。
     所有写按钮点击经 D-f gate，条件不满足只打印不点。
+    force_ids：你已用 --force-replace 批准强制替换的 Rule ID —— 冲突时不管旧规则 mac组 是否为空都替换
+    （被冲突号解析不出来的仍然中止：不知道会替换掉谁）。
     """
+    force_ids = set(force_ids or ())
     print("\n======== 阶段2：待上线 Rule ID 清单（D8）========")
     for rid in rule_ids:
         print(f"  · {rid}")
@@ -1296,7 +1299,12 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
             # 判定原则：查被冲突 Rule ID 的 mac组；非空 → 替换；为空 → 中止该条。
             mac_text = _read_mac_group(page, modal, conflict_rid)
             res["mac_group"] = mac_text or ""
-            if mac_text is None:
+            forced = rid in force_ids and not mac_group_is_bound(mac_text or "")
+            if forced:
+                print(color(f"  --force-replace：被冲突号 {conflict_rid} 的 mac组 为空或读不到（{mac_text!r}）"
+                            "→ 你已批准，强制替换。", "yellow"))
+                res["forced"] = True
+            if mac_text is None and not forced:
                 print(color(f"  ⚠ mac组 读取不确定，保守中止该条。被冲突号={conflict_rid!r}", "yellow"))
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
@@ -1304,7 +1312,7 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 results.append(res)
                 continue
 
-            if not mac_group_is_bound(mac_text):
+            if not forced and not mac_group_is_bound(mac_text):
                 print(color(f"  被冲突号 {conflict_rid} 的 mac组 为空（{mac_text!r}）→ 中止该条并记录。", "red"))
                 res["status"] = STATUS_CONFLICT_ABORT
                 res["conflict_ruleid"] = conflict_rid
@@ -1312,10 +1320,11 @@ def run_online(page, rule_ids: list[str], device_code: str = "") -> list[dict]:
                 results.append(res)
                 continue
 
-            # mac组 非空 → 重新对这条点一次『上线』，第二次弹出冲突窗时点『确定』替换。
-            print(color(f"  被冲突号 {conflict_rid} 的 mac组 非空（{mac_text!r}）→ 重新上线并点『确定』替换。", "green"))
+            # mac组 非空（或已批准强制替换）→ 重新对这条点一次『上线』，第二次弹出冲突窗时点『确定』替换。
+            if not forced:
+                print(color(f"  被冲突号 {conflict_rid} 的 mac组 非空（{mac_text!r}）→ 重新上线并点『确定』替换。", "green"))
             res["conflict_ruleid"] = conflict_rid
-            res["mac_group_bound"] = True
+            res["mac_group_bound"] = not forced
             if not (_search_pending_rule(page, modal, rid)
                     and _click_online(page, modal, rid)
                     and _confirm_online(page)):
@@ -1388,8 +1397,10 @@ def read_final_status(page, rule_ids: list[str], prior_results: list[dict], devi
                 except Exception:
                     gone = None
             r["old_offline"] = gone
-            items.append({"new": r["ruleid"], "old": old, "result": "已替换", "mac": r.get("mac_group", ""),
-                          "old_offline": gone})
+            mac = r.get("mac_group", "")
+            if r.get("forced"):
+                mac = f"{mac or '（空）'}；--force-replace 强制替换"
+            items.append({"new": r["ruleid"], "old": old, "result": "已替换", "mac": mac, "old_offline": gone})
         elif r.get("status") == STATUS_CONFLICT_ABORT:
             items.append({"new": r["ruleid"], "old": old, "result": "冲突中止", "mac": r.get("mac_group", "")})
     _shot(page, "active_final_list")
@@ -1544,7 +1555,7 @@ active_ota collect [EXCEL] —— CMS 导入模板建规则，回收本批 Rule 
 要求：整表只有一个设备类型代码；目标版本可以有多个。之后用 ./deployota online 上线。
 """,
     "online": """\
-deployota online [EXCEL | Rule ID...] [--device CODE] —— CMS 上线
+deployota online [EXCEL | Rule ID...] [--device CODE] [--force-replace [--dry-run]] —— CMS 上线
 
   ./deployota online                      用 prep 最近生成的 Excel 里的 Rule ID 列
   ./deployota online 路径.xlsx            指定 Excel
@@ -1555,6 +1566,12 @@ deployota online [EXCEL | Rule ID...] [--device CODE] —— CMS 上线
 出现『规则替换』冲突：查被冲突规则的 mac 组，非空才替换，为空或读不到则中止该条。
 结束后回读状态，打印上线汇总和部署信息汇总表，并记录 CMS 状态『在线』。
 设备类型代码按 Rule ID 自动找：部署库 → prep Excel → CMS 在线规则页。
+
+强制替换（只用于按 Rule ID）：
+  ./deployota online 65393,65400 --force-replace             冲突时旧规则 mac组 为空也替换
+  ./deployota online 65393,65400 --force-replace --dry-run   只读：列出会被替换的旧规则和它们的 mac组
+  先照常上线；有冲突的列出『新 → 旧』和旧规则 mac组，你输入 yes 才强制替换，替换后回读确认。
+  ⚠ 旧规则下线后，不在新规则 MAC 组里的设备在新规则放量前收不到升级，撤销不了。
 """,
     "publish": """\
 deployota publish [EXCEL] [--no-dass] [--auto-approve] —— 一步完成：导入 → Rule ID → 上线 → DASS 场测
@@ -2013,16 +2030,130 @@ def online_action_steps(final: list[dict], not_handled: list[str] | None = None)
     A.step("DASS", A.SKIP, "online 只动 CMS；DASS 场测用 ./deployota dass init（publish 会自动做）")
 
 
-def online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
-    from . import action_summary as A
-    A.start("online（按 Rule ID）")
+def force_replace_plan(final: list[dict]) -> list[dict]:
+    """第一轮上线后，哪些冲突中止的可以强制替换（纯逻辑）：被冲突号解析出来了的才算（不知道替换谁的不动）。"""
+    return [r for r in final if r.get("status") == STATUS_CONFLICT_ABORT and r.get("conflict_ruleid")]
+
+
+def _confirm_force(plan: list[dict]) -> bool:
+    print(color("\n======== --force-replace：以下旧规则会被下线、由新规则替换 ========", "bold"))
+    for r in plan:
+        mac = r.get("mac_group", "")
+        tag = "mac组 为空（= 已对所有人放开）" if not mac_group_is_bound(mac) else f"mac组={mac}"
+        print(f"  新 {r['ruleid']}  →  替换旧 {r['conflict_ruleid']}   （旧规则 {tag}）")
+    print(color("  ⚠ 旧规则下线后，停在这个源版本、不在新规则 MAC 组里的设备，在新规则放量之前收不到升级；"
+                "这个操作撤销不了。", "yellow"))
+    if not sys.stdin.isatty():
+        print(color("✗ 非交互终端无法确认，未强制替换。", "red"))
+        return False
     try:
-        return _online_by_rule_ids(specs, device_override)
+        return input(f"  输入 yes 强制替换这 {len(plan)} 条，其它任意输入取消：").strip().lower() == "yes"
+    except EOFError:
+        return False
+
+
+def _force_replace_round(page, final_all: list[dict], code_of: dict) -> list[dict]:
+    """第二轮：对冲突中止的 Rule ID，你确认后强制替换，回读后替换掉第一轮的结果。"""
+    from .active_offline import group_by_device
+    from . import action_summary as A
+    plan = force_replace_plan(final_all)
+    skipped = [r["ruleid"] for r in final_all if r.get("status") == STATUS_CONFLICT_ABORT and not r.get("conflict_ruleid")]
+    if skipped:
+        print(color(f"⚠ 这些冲突解析不出被冲突号，不强制替换：{', '.join(skipped)}", "yellow"))
+    if not plan:
+        print(color("（--force-replace：没有冲突中止的规则，不需要强制替换）", "dim"))
+        return final_all
+    if not _confirm_force(plan):
+        print("已取消强制替换，冲突的规则保持未上线，旧规则不变。")
+        A.step("强制替换", A.FAIL, f"你取消了，{len(plan)} 条保持冲突未上线、旧规则不变")
+        return final_all
+    redo = {r["ruleid"] for r in plan}
+    second: list[dict] = []
+    for dev, rids in group_by_device({r: code_of.get(r, "") for r in redo}).items():
+        print(color(f"\n======== 强制替换：设备类型 {dev}：{len(rids)} 个 Rule ID ========", "bold"))
+        res = run_online(page, rids, dev, force_ids=set(rids))
+        second += read_final_status(page, rids, res, dev)
+    by = {r["ruleid"]: r for r in second}
+    merged = [by.get(r["ruleid"], r) for r in final_all]
+    ok_ = [r for r in second if r.get("status") == STATUS_ONLINE]
+    A.step("强制替换", A.OK if len(ok_) == len(redo) else (A.WARN if ok_ else A.FAIL),
+           f"强制替换 {len(ok_)}/{len(redo)} 条：" + "、".join(f"{r['ruleid']}→替换{r.get('conflict_ruleid') or '?'}"
+                                                              for r in ok_))
+    return merged
+
+
+def _force_replace_preview(specs: list[str], device_override: str = "") -> int:
+    """--force-replace --dry-run：只读。不点『上线』；按冲突记录找到会被替换的旧规则，在『已选规则』读它的 mac组。"""
+    from .dass_perf_query import parse_ruleid_args
+    from .active_offline import group_by_device
+    from .device_lookup import resolve_local
+    from .dass_fill import _old_conflict_ids
+    try:
+        ids = list(dict.fromkeys(parse_ruleid_args(specs)))
+    except ValueError as e:
+        print(color(f"✗ Rule ID 参数有误：{e}", "red"))
+        return 2
+    code_of, _src, missing = resolve_local(ids, device_override)
+    if missing:
+        print(color(f"⚠ 查不到设备类型代码，不预览：{', '.join(missing)}（可用 --device）", "yellow"))
+    olds = _old_conflict_ids(ids)
+    preview: list[str] = []
+    print(color(f"[online --force-replace 测试模式] {len(ids)} 个 Rule ID：只读，不点上线、不替换", "bold"))
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not config.HEADED)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            login(page)
+            for dev, rids in group_by_device(code_of).items():
+                print(color(f"\n======== 设备类型 {dev}：{len(rids)} 个 ========", "bold"))
+                modal = open_orchestration_modal(page)
+                if not _set_device_type_once(page, modal, dev):
+                    print(color(f"✗ 设备类型 {dev} 设置失败，跳过这一组", "red"))
+                    continue
+                for rid in rids:
+                    if _already_online(page, modal, rid):
+                        print(f"  {rid}：已在线，不用处理")
+                        continue
+                    old = olds.get(rid, "")
+                    if not old:
+                        print(f"  {rid}：没有冲突记录 → 正式运行时直接上线；如果出现冲突，会列出来等你 yes 再替换")
+                        continue
+                    on = _is_online(page, modal, old)
+                    if not on:
+                        print(f"  {rid}：记录里和 {old} 冲突，但 {old} 现在不在线 → 正式运行时应该能直接上线")
+                        continue
+                    mac = _read_mac_group(page, modal, old)
+                    tag = ("mac组 读不到" if mac is None else
+                           "mac组 为空（= 已对所有人放开）" if not mac_group_is_bound(mac) else f"mac组={mac}")
+                    print(color(f"  {rid}：会强制替换旧 {old}（{tag}）", "yellow"))
+                    preview.append(f"{rid}→替换{old}")
+        finally:
+            context.close()
+            browser.close()
+    print(color("\n（测试模式结束：没有点上线、没有替换，CMS 没有任何修改）", "dim"))
+    from . import action_summary as A
+    A.step("强制替换预览（测试模式）", A.OK,
+           (f"正式运行会强制替换 {len(preview)} 条：" + "、".join(preview)) if preview else "没有需要强制替换的")
+    return 0
+
+
+def online_by_rule_ids(specs: list[str], device_override: str = "", force: bool = False,
+                       dry_run: bool = False) -> int:
+    from . import action_summary as A
+    A.start("online（按 Rule ID）" + ("（--force-replace）" if force else "") + ("（测试模式）" if dry_run else ""))
+    try:
+        if dry_run:
+            if not force:
+                print(color("✗ --dry-run 只配合 --force-replace 用（看哪些旧规则会被强制替换）。", "red"))
+                return 2
+            return _force_replace_preview(specs, device_override)
+        return _online_by_rule_ids(specs, device_override, force=force)
     finally:
         A.finish()
 
 
-def _online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
+def _online_by_rule_ids(specs: list[str], device_override: str = "", force: bool = False) -> int:
     """`deployota online 50000-50005`：按 Rule ID 上线。
 
     设备类型代码取自部署库（--device 可覆盖；查不到的不处理）。按设备类型分组，每组走与 Excel 模式完全相同的
@@ -2071,6 +2202,8 @@ def _online_by_rule_ids(specs: list[str], device_override: str = "") -> int:
                 results = run_online(page, rids, dev)
                 # 回读要在切换设备类型之前做：已选区的搜索带着当前设备类型过滤。
                 final_all += read_final_status(page, rids, results, dev)
+            if force:
+                final_all = _force_replace_round(page, final_all, code_of)
         except Exception as e:
             print(color(f"✗ 运行出错：{e}", "red"))
             _shot(page, "active_error")
@@ -2110,7 +2243,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None]:
             raise SystemExit(0)
         if arg == "--probe-online":
             mode = "probe"
-        elif arg in ("--selftest", "--no-dass", "--auto-approve"):
+        elif arg in ("--selftest", "--no-dass", "--auto-approve", "--force-replace", "--dry-run"):
             continue  # --selftest 在 __main__ 处理；--no-dass / --auto-approve 在 main 里读（只对 publish 生效）
         elif arg in _SUBCOMMANDS:
             if mode is not None:
@@ -2140,6 +2273,9 @@ def main() -> int:
         prep_args, raw = split_prep_args(raw)
     argv, rule_specs, device_override = split_rule_args(raw)
     mode, excel = _parse_cli(argv)
+    if ("--force-replace" in sys.argv[1:] or "--dry-run" in sys.argv[1:]) and not (mode == "online" and rule_specs):
+        print(color("✗ --force-replace / --dry-run 只用于按 Rule ID 上线：./deployota online <Rule ID> --force-replace", "red"))
+        return 2
     prep_cp = None
     if prep_args:
         # —— publish --file：检查点0 先跑 prep（生成 → 校验 → MAC 组 → 上传 S3 → 最终检查），通过才登录 CMS ——
@@ -2162,7 +2298,8 @@ def main() -> int:
         if not rule_specs:
             print(color("✗ 给了 --device 但没有 Rule ID。例：./deployota online 50000-50005", "red"))
             return 2
-        return online_by_rule_ids(rule_specs, device_override)
+        return online_by_rule_ids(rule_specs, device_override, force="--force-replace" in sys.argv[1:],
+                                  dry_run="--dry-run" in sys.argv[1:])
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not config.HEADED)
@@ -2355,6 +2492,21 @@ def _selftest() -> int:
                                    {"n": 4, "status": "pass"}])
     check("检查点3 冲突（warn）→ 发布完成（有 ⚠），继续到 DASS", "发布完成（有 ⚠" in rw and "部分上线" in rw
           and "卡在" not in rw and "⚠ 检查点3" in rw)
+    _fin = [{"ruleid": "1", "status": STATUS_ONLINE},
+            {"ruleid": "2", "status": STATUS_CONFLICT_ABORT, "conflict_ruleid": "64622", "mac_group": ""},
+            {"ruleid": "3", "status": STATUS_CONFLICT_ABORT, "conflict_ruleid": ""},
+            {"ruleid": "4", "status": STATUS_FAILED}]
+    check("强制替换只针对冲突中止、且解析出被冲突号的", [r["ruleid"] for r in force_replace_plan(_fin)] == ["2"])
+    import contextlib as _cl2
+    import io as _io2
+    _tty = sys.stdin.isatty
+    sys.stdin.isatty = lambda: False
+    try:
+        with _cl2.redirect_stdout(_io2.StringIO()):
+            _c = _confirm_force(force_replace_plan(_fin))
+    finally:
+        sys.stdin.isatty = _tty
+    check("强制替换：非交互终端不执行", _c is False)
     # —— publish：检查点报告 ——
     rep_ok = format_checkpoint_report([{"n": n, "status": "pass", "detail": "x"} for n in (1, 2, 3)])
     check("publish 全通过含『全部检查点通过』", "全部检查点通过" in rep_ok and "✗" not in rep_ok)
