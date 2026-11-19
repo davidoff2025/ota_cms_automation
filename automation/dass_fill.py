@@ -1242,20 +1242,24 @@ def execute(option: str, records: list[dict], excel: str | None = None,
                     _shot(page, "perf_no_frame")
                     A.step(GATE, A.FAIL, "打不开安卓升级展示报表，无法校验，已中止")
                     return 2
-                rate_ok = check_success_rate(fr_perf, page, records, option)
+                rate_ok = check_success_rate(fr_perf, page, records, option, print_report=False)
                 # ———— 间隔闸门：距进入上一阶段 > 48 小时（本地阶段记录；没有就用报表开放日期 +2 天）————
-                from .dass_perf import LAST_OPEN
-                from .gates import check_interval, format_interval
+                from .dass_perf import LAST_OPEN, LAST_RATES, LAST_USERS, LAST_USERS_NOTE
+                from .gates import check_interval, format_combined
                 from .stage_db import build_state, load_events
                 _ev = load_events()
-                _ids = list(dict.fromkeys(norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))))
+                _ids = sorted(dict.fromkeys(norm_ruleid(r.get("ruleid", "")) for r in records if norm_ruleid(r.get("ruleid", ""))),
+                              key=lambda x: int(x) if x.isdigit() else 0)
                 _iv = check_interval(_ids, option, build_state(_ev), _ev, dict(LAST_OPEN))
-                for _ln in format_interval(_iv, PREV_STAGE.get(option, "上一阶段")):
-                    print(_ln)
+                # 一张表：进入时间（> 48h）· 升级成功率（> 50%）· 源版本用户数
+                _lines, _st = format_combined(_iv, dict(LAST_RATES), dict(LAST_USERS), dict(LAST_USERS_NOTE),
+                                              PREV_STAGE.get(option, "上一阶段"), option)
+                for _ln in _lines:
+                    print(color(_ln, "bold") if _ln.startswith("\n========") else _ln)
                 int_bad = [x for x in _iv if not x["ok"]]
                 reasons = []
                 if not rate_ok:
-                    reasons.append("成功率：有 Rule ID ≤ 50% 或查不到（见上面的成功率逐条明细）")
+                    reasons.append("成功率不满足（≤ 50% 或查不到）：" + "、".join(_st["rate_bad"]))
                 if int_bad:
                     def _why(x):
                         return "不知道开放了多久" if x["need"] is None else f"还差 {x['need']:.1f} 小时"

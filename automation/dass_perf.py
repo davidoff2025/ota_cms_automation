@@ -113,6 +113,8 @@ LAST_USERS: dict = {}
 LAST_USERS_NOTE: dict = {}
 # 报表里按上一阶段查到的那一行的『当前阶段开放时间』（只有日期，如 20261106）：间隔闸门的兜底来源。
 LAST_OPEN: dict = {}
+# 最近一次成功率闸门的逐条结果：{norm_ruleid: {"rate", "rate_text", "stage", "fallback"}}（合并闸门表用）。
+LAST_RATES: dict = {}
 
 # 绩效页菜单叶子（实测以『安卓升级展示报表』为准；任务原称『安卓升级展示绩效』）。
 PERF_MENU_LEAF_CANDIDATES = ["安卓升级展示报表", "安卓升级展示绩效"]
@@ -682,7 +684,7 @@ def _diagnose_missing(fr, page, missing: list[str], excel_by_ruleid: dict, want_
     return seen
 
 
-def check_success_rate(fr, page, records, option: str) -> bool:
+def check_success_rate(fr, page, records, option: str, print_report: bool = True) -> bool:
     """成功率闸门：对本批每个 Rule ID 求成功率，全部 > 50% 返回 True（放行升级），
     任一 < 50% 或两阶段都查不到 -> 打印逐条明细后返回 False（abort）。
 
@@ -790,7 +792,11 @@ def check_success_rate(fr, page, records, option: str) -> bool:
 
     # ———— 判定 + 逐条/汇总打印（B）————
     report, passed = format_gate_report(excel_ruleids, found_rate)
-    print(report)
+    LAST_RATES.clear()
+    LAST_RATES.update({rid: dict(found_rate.get(rid, {"rate": None, "stage": "未找到", "rate_text": ""}))
+                       for rid in excel_ruleids})
+    if print_report:   # update 的闸门改打一张合并表（间隔 + 成功率 + 源版本用户数），这里就不重复打印
+        print(report)
     if not passed:
         _shot(page, "perf_gate_abort")
     # 写进操作总结：每个 Rule ID 的成功率（按上一阶段查到的；查不到时用报表里的参考值并注明）。
